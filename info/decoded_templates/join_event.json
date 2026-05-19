@@ -1,0 +1,512 @@
+{
+  "blocks": [
+    {
+      "id": "block",
+      "block": "event",
+      "args": {
+        "items": []
+      },
+      "action": "Join"
+    },
+    {
+      "id": "block",
+      "block": "set_var",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "var",
+              "data": {
+                "name": "lineVariable",
+                "scope": "line"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "num",
+              "data": {
+                "name": "5"
+              }
+            },
+            "slot": 1
+          }
+        ]
+      },
+      "action": "="
+    },
+    {
+      "id": "block",
+      "block": "call_func",
+      "args": {
+        "items": []
+      },
+      "data": "Test"
+    },
+    {
+      "id": "block",
+      "block": "set_var",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "var",
+              "data": {
+                "name": "savedVariable",
+                "scope": "saved"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "txt",
+              "data": {
+                "name": "String"
+              }
+            },
+            "slot": 1
+          }
+        ]
+      },
+      "action": "="
+    },
+    {
+      "id": "block",
+      "block": "set_var",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "var",
+              "data": {
+                "name": "gameVariable",
+                "scope": "unsaved"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "comp",
+              "data": {
+                "name": "Styled Text (MiniMessage)"
+              }
+            },
+            "slot": 1
+          }
+        ]
+      },
+      "action": "="
+    },
+    {
+      "id": "block",
+      "block": "set_var",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "var",
+              "data": {
+                "name": "exampleValues",
+                "scope": "line"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "g_val",
+              "data": {
+                "type": "Absorption Health",
+                "target": "LastEntity"
+              }
+            },
+            "slot": 1
+          },
+          {
+            "item": {
+              "id": "g_val",
+              "data": {
+                "type": "Player Count",
+                "target": "Default"
+              }
+            },
+            "slot": 2
+          },
+          {
+            "item": {
+              "id": "loc",
+              "data": {
+                "isBlock": true,
+                "loc": {
+                  "x": 2.5,
+                  "y": 49.5,
+                  "z": 12.5,
+                  "pitch": 0.0,
+                  "yaw": 0.0
+                }
+              }
+            },
+            "slot": 3
+          },
+          {
+            "item": {
+              "id": "loc",
+              "data": {
+                "isBlock": false,
+                "loc": {
+                  "x": 3.4766217375445194,
+                  "y": 50.0,
+                  "z": 12.266706340480596,
+                  "pitch": -14.25008,
+                  "yaw": -169.79965
+                }
+              }
+            },
+            "slot": 4
+          },
+          {
+            "item": {
+              "id": "vec",
+              "data": {
+                "x": 1.0,
+                "y": 5.0,
+                "z": 2.0
+              }
+            },
+            "slot": 5
+          },
+          {
+            "item": {
+              "id": "snd",
+              "data": {
+                "pitch": 1.0,
+                "vol": 2.0,
+                "sound": "Pling"
+              }
+            },
+            "slot": 6
+          },
+          {
+            "item": {
+              "id": "pot",
+              "data": {
+                "pot": "Breath of the Nautilus",
+                "dur": 100,
+                "amp": 0
+              }
+            },
+            "slot": 7
+          },
+          {
+            "item": {
+              "id": "pot",
+              "data": {
+                "pot": "Invisibility",
+                "dur": 1000000,
+                "amp": 0
+              }
+            },
+            "slot": 8
+          }
+        ]
+      },
+      "action": "CreateList"
+    },
+    {
+      "id": "block",
+      "block": "player_action",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "comp",
+              "data": {
+                "name": "Hello World"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "bl_tag",
+              "data": {
+                "option": "True",
+                "tag": "Inherit Styles",
+                "action": "SendMessage",
+                "block": "player_action"
+              }
+            },
+            "slot": 24
+          },
+          {
+            "item": {
+              "id": "bl_tag",
+              "data": {
+                "option": "Add spaces",
+                "tag": "Text Value Merging",
+                "action": "SendMessage",
+                "block": "player_action"
+              }
+            },
+            "slot": 25
+          },
+          {
+            "item": {
+              "id": "bl_tag",
+              "data": {
+                "option": "Regular",
+                "tag": "Alignment Mode",
+                "action": "SendMessage",
+                "block": "player_action"
+              }
+            },
+            "slot": 26
+          }
+        ]
+      },
+      "action": "SendMessage"
+    },
+    {
+      "id": "block",
+      "block": "if_player",
+      "args": {
+        "items": []
+      },
+      "action": "IsSneaking"
+    },
+    {
+      "id": "bracket",
+      "direct": "open",
+      "type": "norm"
+    },
+    {
+      "id": "bracket",
+      "direct": "close",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "else"
+    },
+    {
+      "id": "bracket",
+      "direct": "open",
+      "type": "norm"
+    },
+    {
+      "id": "bracket",
+      "direct": "close",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "if_entity",
+      "args": {
+        "items": []
+      },
+      "action": "IsMob"
+    },
+    {
+      "id": "bracket",
+      "direct": "open",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "game_action",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "item",
+              "data": {
+                "item": "{DF_NBT:4671,count:1,id:\"minecraft:stripped_birch_log\"}"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "loc",
+              "data": {
+                "isBlock": true,
+                "loc": {
+                  "x": 2.5,
+                  "y": 49.5,
+                  "z": 23.5,
+                  "pitch": 0.0,
+                  "yaw": 0.0
+                }
+              }
+            },
+            "slot": 1
+          },
+          {
+            "item": {
+              "id": "loc",
+              "data": {
+                "isBlock": true,
+                "loc": {
+                  "x": 2.5,
+                  "y": 49.5,
+                  "z": 26.5,
+                  "pitch": 0.0,
+                  "yaw": 0.0
+                }
+              }
+            },
+            "slot": 2
+          }
+        ]
+      },
+      "action": "SetRegion"
+    },
+    {
+      "id": "bracket",
+      "direct": "close",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "if_game",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "loc",
+              "data": {
+                "isBlock": true,
+                "loc": {
+                  "x": 2.5,
+                  "y": 49.5,
+                  "z": 29.5,
+                  "pitch": 0.0,
+                  "yaw": 0.0
+                }
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "bl_tag",
+              "data": {
+                "option": "Direct power",
+                "tag": "Redstone Power Mode",
+                "action": "BlockPowered",
+                "block": "if_game"
+              }
+            },
+            "slot": 26
+          }
+        ]
+      },
+      "action": "BlockPowered"
+    },
+    {
+      "id": "bracket",
+      "direct": "open",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "select_obj",
+      "args": {
+        "items": []
+      },
+      "action": "PlayerName"
+    },
+    {
+      "id": "block",
+      "block": "select_obj",
+      "args": {
+        "items": []
+      },
+      "action": "Reset"
+    },
+    {
+      "id": "bracket",
+      "direct": "close",
+      "type": "norm"
+    },
+    {
+      "id": "block",
+      "block": "entity_action",
+      "args": {
+        "items": []
+      },
+      "action": "Heal"
+    },
+    {
+      "id": "block",
+      "block": "repeat",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "var",
+              "data": {
+                "name": "i",
+                "scope": "line"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "num",
+              "data": {
+                "name": "10"
+              }
+            },
+            "slot": 1
+          }
+        ]
+      },
+      "action": "Multiple"
+    },
+    {
+      "id": "bracket",
+      "direct": "open",
+      "type": "repeat"
+    },
+    {
+      "id": "block",
+      "block": "control",
+      "args": {
+        "items": [
+          {
+            "item": {
+              "id": "num",
+              "data": {
+                "name": "1"
+              }
+            },
+            "slot": 0
+          },
+          {
+            "item": {
+              "id": "bl_tag",
+              "data": {
+                "option": "Ticks",
+                "tag": "Time Unit",
+                "action": "Wait",
+                "block": "control"
+              }
+            },
+            "slot": 26
+          }
+        ]
+      },
+      "action": "Wait"
+    },
+    {
+      "id": "bracket",
+      "direct": "close",
+      "type": "repeat"
+    }
+  ]
+}
