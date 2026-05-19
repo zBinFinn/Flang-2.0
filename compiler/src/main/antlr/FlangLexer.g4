@@ -5,6 +5,8 @@ FN      : 'fn';
 EMIT    : 'emit';
 VAL     : 'val';
 VAR     : 'var';
+TRUE    : 'true';
+FALSE   : 'false';
 RETURN  : 'return';
 IF      : 'if';
 ELSE    : 'else';
@@ -22,6 +24,7 @@ EQ_EQ   : '==';
 NOT_EQ : '!=';
 AND_AND : '&&';
 OR_OR   : '||';
+AMP     : '&';
 
 PLUS    : '+';
 MINUS   : '-';
@@ -56,6 +59,10 @@ IntegerLiteral
 
 StringLiteral
   : '"' ( '\\' . | ~["\\] )* '"'
+  ;
+
+StyledStringLiteral
+  : 's' '"' ( '\\' . | ~["\\] )* '"'
   ;
 
 // whitespace + comments

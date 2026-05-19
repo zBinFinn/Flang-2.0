@@ -28,8 +28,6 @@ tasks.generateGrammarSource {
     maxHeapSize = "128m"
     arguments.addAll(
         listOf(
-            "-package",
-            "com.zbinfinn",
             "-visitor",
             "-no-listener",
         ),

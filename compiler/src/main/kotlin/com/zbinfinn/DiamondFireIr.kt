@@ -35,7 +35,7 @@ data class DfBlock(
     }
 
     private fun blockNeedsArgs(block: String): Boolean =
-        block in setOf("event", "func", "player_action", "game_action", "set_var", "select_obj")
+        block in setOf("event", "func", "player_action", "game_action", "set_var", "select_obj", "call_func")
 }
 
 data class DfBracket(val direct: String, val type: String) : DfEntry {
@@ -82,6 +82,12 @@ data class DfText(val value: String) : DfItem {
     }
 }
 
+data class DfComponent(val value: String) : DfItem {
+    override fun toJson(): JsonObject = dfItem("comp") {
+        put("name", value)
+    }
+}
+
 data class DfBlockTag(
     val block: String,
     val action: String,
@@ -93,6 +99,28 @@ data class DfBlockTag(
         put("tag", tag)
         put("action", action)
         put("block", block)
+    }
+}
+
+data class DfParameterElement(
+    val name: String,
+    val type: String,
+    val defaultValue: DfItem? = null,
+    val plural: Boolean = false,
+    val optional: Boolean = false,
+) : DfItem {
+    override fun toJson(): JsonObject = dfItem("pn_el") {
+        put("name", name)
+        put("type", type)
+        defaultValue?.let { put("default_value", it.toJson()) }
+        put("plural", plural)
+        put("optional", optional)
+    }
+}
+
+data class DfHint(val id: String) : DfItem {
+    override fun toJson(): JsonObject = dfItem("hint") {
+        put("id", id)
     }
 }
 

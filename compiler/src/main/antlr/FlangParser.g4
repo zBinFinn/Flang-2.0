@@ -31,7 +31,7 @@ paramList
   ;
 
 param
-  : (VAL | VAR) Identifier COLON typeRef
+  : VAR? Identifier COLON typeRef
   ;
 
 block
@@ -61,7 +61,7 @@ exprStmt
   ;
 
 emitStmt
-  : EMIT BACKTICK Identifier StringLiteral? emitClause*
+  : EMIT BACKTICK Identifier StringLiteral? emitClause* BACKTICK
   ;
 
 emitClause
@@ -78,6 +78,9 @@ emitArg
   | VAR LPAREN Identifier COMMA Identifier RPAREN
   | IntegerLiteral
   | StringLiteral
+  | StyledStringLiteral
+  | TRUE
+  | FALSE
   ;
 
 emitTagBody
@@ -162,20 +165,41 @@ postfix
 
 postfixPart
   : DOT Identifier
-  | DOT Identifier LPAREN argList? RPAREN
-  | LPAREN argList? RPAREN
+  | DOT Identifier LPAREN callArgList? RPAREN
+  | LPAREN callArgList? RPAREN
   ;
 
-argList
-  : expr (COMMA expr)*
+callArgList
+  : callArg (COMMA callArg)*
+  ;
+
+callArg
+  : AMP expr
+  | expr
   ;
 
 primary
   : IntegerLiteral
   | StringLiteral
+  | StyledStringLiteral
+  | TRUE
+  | FALSE
+  | structLiteral
   | Identifier
   | tupleLiteral
   | LPAREN expr RPAREN
+  ;
+
+structLiteral
+  : Identifier LBRACE structLiteralFieldList? RBRACE
+  ;
+
+structLiteralFieldList
+  : structLiteralField (COMMA structLiteralField)* COMMA?
+  ;
+
+structLiteralField
+  : Identifier COLON expr
   ;
 
 tupleLiteral
@@ -183,7 +207,9 @@ tupleLiteral
   ;
 
 // Stubs to fill later
-structDecl : STRUCT Identifier LBRACE RBRACE ;
+structDecl : STRUCT Identifier LBRACE structFieldList? RBRACE ;
+structFieldList : structField (COMMA structField)* COMMA? ;
+structField : Identifier COLON typeRef ;
 enumDecl   : ENUM Identifier LBRACE RBRACE ;
 implDecl   : IMPL Identifier (FOR Identifier)? LBRACE RBRACE ;
 objectDecl : OBJECT Identifier (SEMI | block) ;

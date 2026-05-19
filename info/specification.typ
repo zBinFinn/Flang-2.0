@@ -20,11 +20,11 @@ fn Join(event: PlayerJoinEvent) {
 === Defining an Event (Stdlib)
 ```rust
 interface CancellableEvent {
-  fn cancel(var self) {
+  fn cancel(var self: CancellableEvent) {
     emit `game_action "CancelEvent"`;
   }
 
-  fn uncancel(var self) {
+  fn uncancel(var self: CancellableEvent) {
     emit `game_action "UncancelEvent"`;
   }
 }
@@ -35,7 +35,7 @@ object PlayerTakeDamageEvent;
 impl CancellableEvent for PlayerTakeDamageEvent;
 
 impl PlayerTakeDamageEvent {
-  fn victim(val self) -> Player {
+  fn victim(self: PlayerTakeDamageEvent) -> Player {
     return gval("UUID", .Victim) as Player;
   }
 }
@@ -56,13 +56,148 @@ fn takeDamage(var event: PlayerTakeDamageEvent) {
 ```rust
 var x = 5; // Mutable
 val y = 6; // Immutable
+
+fn increment(var value: Num) {
+  value = value + 1;
+}
+
+fn addOne(value: Num) -> Num {
+  return value + 1;
+}
+
+fn test(arg: Num, var arg2: Num) -> Num {
+  arg2 = arg + 1;
+  return arg2;
+}
+
+fn print(value: Num) {
+  // Emits as DiamondFire function `print(Num)`
+}
+
+fn print(value: String) {
+  // Emits as DiamondFire function `print(String)`
+}
+
+fn example() {
+  var mutable = 1;
+  val immutable = 2;
+
+  increment(&mutable); // Required when passing to a var parameter
+  increment(mutable); // Error: mutable parameter requires &
+  increment(&immutable); // Error: vals cannot be passed as mutable references
+  increment(&someStruct.member); // Error: mutable references must be plain identifiers in V1
+
+  val result = test(1, &mutable); // Returning calls are expressions
+  print(1); // Calls `print(Num)`
+  print("hello"); // Calls `print(String)`
+}
 ```
 
 There will need to be consideration on how struct members are handled, will they always be cloned on intialization? Otherwise local variables could escape their context and that'd break things.
 
+Function parameters are immutable by default: `value: Num`. Mutable parameters
+are written as `var value: Num` and must be called with `&identifier`.
+The older `val value: Num` parameter syntax is not valid.
+
+Functions with `-> Type` get an implicit DiamondFire `$out` variable parameter.
+Returning from those functions assigns the returned value to `$out` and emits a
+DiamondFire `control "Return"` block. A typed function must contain at least one
+`return expr;`.
+
+Function DiamondFire identifiers include parameter types to support overloading.
+For example, `fn print(value: Num)` emits as `print(Num)`, while
+`fn print(value: String)` emits as `print(String)`. Calls are written with the
+source name, and the compiler resolves the overload from argument types.
+
+For now mutable references only work with plain local identifiers. Supporting
+`&someStruct.member` needs a separate design for member storage and escaping and
+is intentionally a future problem.
+
 Maybe you can only have references to GAME variables? idk man
 
 For functions it's easy, just use a Variable parameter, granted performance a valid optimization is probably making every parameter a Variable one to avoid unnecessary cloning on immutables aswell.
+
+#pagebreak()
+
+= Types and Literals
+```rust
+val balls: String = "hi";
+val styled: Text = s"<green>Hello World";
+val enabled: Boolean = true;
+val disabled = false; // inferred as Boolean
+val sum: Num = 1 + 2 * 3;
+val both: Boolean = enabled && disabled;
+val either: Boolean = enabled || disabled;
+```
+
+For now supported assignment expressions are numbers, strings, styled text components,
+booleans, identifiers, parentheses, numeric `+ - * / %`, and boolean `&& ||`.
+Booleans are represented as numbers on the DiamondFire side: `true` is `1` and
+`false` is `0`.
+
+#pagebreak()
+
+= Structs
+```rust
+struct PlayerData {
+  uuid: String,
+  money: Num,
+  displayName: Text,
+}
+
+fn example() {
+  val immutableData = PlayerData {
+    uuid: "player-uuid",
+    money: 5,
+    displayName: s"<green>Finn",
+  };
+
+  var mutableData = PlayerData {
+    uuid: "player-uuid",
+    money: 5,
+    displayName: s"<green>Finn",
+  };
+
+  val money = mutableData.money;
+  mutableData.money = money + 1; // OK, because mutableData is var
+  immutableData.money = 10; // Error, because immutableData is val
+
+  val kind = typeof(mutableData); // "PlayerData"
+  val primitiveKind = typeof(5); // "Num"
+}
+```
+
+Struct members do not currently carry their own `val` or `var` marker. Member
+assignment is controlled by the variable that stores the struct: a `val`
+struct disallows all member writes, while a `var` struct allows them.
+
+The default representation is a DiamondFire list:
+```
+["PlayerData", "player-uuid", 5, "<green>Finn"]
+```
+DiamondFire list indexes are 1-based, so the type name is at index `1`, and
+the first user field is at index `2`.
+Reads from list-backed primitive fields lower to compact value placeholders.
+For example, a `Num` field read like `mutableData.money` lowers as a `num`
+item with value `%index(mutableData,3)`. `String` fields use `txt` items and
+`Text` fields use `comp` items.
+
+The compiler can also use dictionary-backed structs with `--dictstructs` or
+`-ds`:
+```
+{"$type": "PlayerData", "uuid": "player-uuid", "money": 5, "displayName": "<green>Finn"}
+```
+The `$type` key is reserved for type metadata.
+Reads from dictionary-backed primitive fields use the same value-item style,
+for example a `txt` item with value `%entry(mutableData,uuid)`.
+
+Primitive values are not boxed as `[type, value]` in this pass. DiamondFire's
+native `num`, `txt`, `comp`, and Boolean-as-`num` values are shorter and avoid
+extra conversion blocks for arithmetic and text operations. For now,
+`typeof(...)` on primitive expressions uses the compiler-known static type
+(`Num`, `String`, `Text`, or `Boolean`). Runtime primitive inspection can be
+added later for erased or `Any`-typed values using DiamondFire variable type
+checks where needed.
 
 #pagebreak()
 
@@ -71,22 +206,22 @@ For functions it's easy, just use a Variable parameter, granted performance a va
 type Player = String;
 
 impl Player {
-  private fn select(val self) {
+  private fn select(self: Player) {
     emit `select_object "PlayerByName" args($self$)`;
   }
 
-  private fn deselect(val self) {
+  private fn deselect(self: Player) {
     emit `select_object "Reset"`;
   }
 
-  fn sendMessage(var self, val message: Text) {
+  fn sendMessage(var self: Player, message: Text) {
     // tags(..) is default, tags("TagA"="Value", ..) means everything default apart from TagA
     self.select();
     emit `player_action "SendMessage" args($message$) tags(..)`;
     self.deselect();
   }
 
-  fn health(val self) -> Num {
+  fn health(self: Player) -> Num {
     self.select();
     val health = gval("Health", .Selection);
     self.deselect();
@@ -138,7 +273,7 @@ enum SelectionType {
   Default, Selected, Victim, Attacker //...
 }
 
-fn doSomething(val thing: SelectionType) {
+fn doSomething(thing: SelectionType) {
   when(thing) {
     .Default -> // ...
     .Selected {
@@ -203,7 +338,7 @@ when (enumGuy) {
 
 = Tuples
 ```rust
-fn getHealthAndMaxHealth(val player: Player) -> (Num, Num) {
+fn getHealthAndMaxHealth(player: Player) -> (Num, Num) {
   return (player.health(), player.maxHealth());
 }
 
@@ -223,7 +358,7 @@ fn example() {
 
 = Function Literals
 ```rust
-fn mapNumToNum(val list: List<Num>, val map: fn(Num) -> Num) -> List<Num> {
+fn mapNumToNum(list: List<Num>, map: fn(Num) -> Num) -> List<Num> {
   var newList = List<Num>.new();
   for (element in list) {
     newList.append(map(element));
@@ -234,7 +369,7 @@ fn mapNumToNum(val list: List<Num>, val map: fn(Num) -> Num) -> List<Num> {
 
 = Generics
 ```rust
-fn <_From, _To> map(val list: List<_From>, val map: fn(_From) -> _To) -> List<_To> {
+fn <_From, _To> map(list: List<_From>, map: fn(_From) -> _To) -> List<_To> {
   var newList = List<_To>.new();
   for (element in list) {
     newList.append(map(element));
@@ -260,12 +395,12 @@ val to = map(from, mapper);
 = Saved Variables
 ```rust
 struct PlayerData {
-  val uuid: String,
-  var money: Num,
-  var level: Num
+  uuid: String,
+  money: Num,
+  level: Num
 }
 
-fn savePlayerData(val data: PlayerData) {
+fn savePlayerData(data: PlayerData) {
   val baseString = "S_" + data.uuid + "_";
 
   val vars = SavedVariables; // SavedVariables and the future Bucket abstraction will implement the same interface providing save(String, Any) and load(String) -> Any
@@ -298,8 +433,8 @@ This variable will look something like (it's a List):
 because
 ```rust
 struct Balls {
-  val x: Num,
-  val y: Num
+  x: Num,
+  y: Num
 }
 
 val x = Balls {
@@ -318,7 +453,7 @@ interface DoesSomething {
 }
 
 struct A {
-  val num: Num
+  num: Num
 }
 
 impl DoesSomething for A {
@@ -328,7 +463,7 @@ impl DoesSomething for A {
 }
 
 struct B {
-  val string: String
+  string: String
 }
 
 impl DoesSomething for B {
@@ -350,7 +485,7 @@ Another reason is
 ```
 val x = // ...
 
-fn typeName(val b: Any) -> String {
+fn typeName(b: Any) -> String {
   return typeof(b); // always return "Any"
 }
 

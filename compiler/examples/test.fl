@@ -1,0 +1,33 @@
+fn increment(var num: Num) {
+    num = num + 1;
+}
+
+fn sum(a: Num, b: Num) -> Num {
+    return a + b;
+}
+
+fn print(num: Num) {
+    emit `player_action "SendMessage" args($num$) tags(..)`;
+}
+
+fn test3() {
+    val num1 = 5;
+    var num2 = 3;
+    increment(&num2); // only works for var not val and requires '&' to make it clear that it is being mutated
+
+    print(sum(num1, num2));
+}
+
+struct PlayerData {
+    money: Num,
+    name: String
+}
+
+fn test2() {
+    val data = PlayerData {
+        money: 5,
+        name: "zBinFinn"
+    }
+
+    emit `player_action "SendMessage" args($data$) tags(..)`;
+}
