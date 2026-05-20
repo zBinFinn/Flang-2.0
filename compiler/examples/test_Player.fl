@@ -13,7 +13,7 @@ impl Player {
 
     fn getName(this) -> String {
         this.select();
-        val name = gval("Name", .Selected);
+        val name = gval("Name", .Selection);
         this.deselect();
         return name;
     }
@@ -41,4 +41,6 @@ fn testPlayer() {
     var player = defaultPlayer();
     player.damage(5);
     val name = player.getName();
+
+    emit `player_action "SendMessage" args($name$) tags(..)`;
 }

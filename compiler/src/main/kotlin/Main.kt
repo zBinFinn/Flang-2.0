@@ -3,19 +3,61 @@ package com.zbinfinn
 import java.nio.file.Files
 import java.nio.file.Path
 
+private const val USAGE = "Usage: flang [--dictstructs|-ds] [-Oall|-Oselect-reset] <source.fl>"
+
+internal data class CliOptions(
+    val sourcePath: String,
+    val compileOptions: CompileOptions,
+)
+
 fun main(args: Array<String>) {
-    val argList = args.toList()
-    if (argList.isEmpty() || argList.size > 2) {
-        error("Usage: flang [--dictstructs|-ds] <source.fl>")
+    val cliOptions = parseCliArgs(args)
+    val source = Files.readString(Path.of(cliOptions.sourcePath))
+    print(FlangCompiler.compile(source, cliOptions.compileOptions).templates.joinToString(System.lineSeparator()) { "/dfgive " + it.templateNbt })
+}
+
+internal fun parseCliArgs(args: Array<String>): CliOptions {
+    var structMode = StructMode.LIST
+    val optimizations = mutableSetOf<Optimization>()
+    var sourcePath: String? = null
+
+    args.forEach { arg ->
+        when (arg) {
+            "--dictstructs", "-ds" -> {
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                structMode = StructMode.DICT
+            }
+            "-Oall" -> {
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                optimizations += Optimization.entries
+            }
+            "-Oselect-reset" -> {
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                optimizations += Optimization.ELIDE_REDUNDANT_SELECT_RESET
+            }
+            else -> {
+                if (arg.startsWith("-")) {
+                    error(USAGE)
+                }
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                sourcePath = arg
+            }
+        }
     }
 
-    val structMode = if (argList.first() in setOf("--dictstructs", "-ds")) StructMode.DICT else StructMode.LIST
-    val sourcePath = if (structMode == StructMode.DICT) {
-        argList.getOrNull(1) ?: error("Usage: flang [--dictstructs|-ds] <source.fl>")
-    } else {
-        if (argList.size != 1) error("Usage: flang [--dictstructs|-ds] <source.fl>")
-        argList.first()
-    }
-    val source = Files.readString(Path.of(sourcePath))
-    print(FlangCompiler.compile(source, CompileOptions(structMode = structMode)).templates.joinToString(System.lineSeparator()) { it.templateNbt })
+    return CliOptions(
+        sourcePath = sourcePath ?: error(USAGE),
+        compileOptions = CompileOptions(
+            structMode = structMode,
+            optimizations = optimizations,
+        ),
+    )
 }

@@ -22,11 +22,16 @@ import java.util.zip.GZIPOutputStream
 data class CompileOptions(
     val templateNameOverride: String? = null,
     val structMode: StructMode = StructMode.LIST,
+    val optimizations: Set<Optimization> = emptySet(),
 )
 
 enum class StructMode {
     LIST,
     DICT,
+}
+
+enum class Optimization {
+    ELIDE_REDUNDANT_SELECT_RESET,
 }
 
 data class CompiledTemplate(
@@ -84,7 +89,8 @@ object FlangCompiler {
         }
 
         val templates = loweredFunctions.map { lowered ->
-            val template = DfTemplate(lowered.entries)
+            val optimizedEntries = optimize(lowered.entries, options.optimizations)
+            val template = DfTemplate(optimizedEntries)
             val templateJson = json.encodeToString(JsonElement.serializer(), template.toJson())
             val displayName = templateName(options, lowered.displayIdentifier, loweredFunctions.size)
             CompiledTemplate(
@@ -96,6 +102,30 @@ object FlangCompiler {
         }
         return CompileResult(templates)
     }
+
+    private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>): List<DfEntry> {
+        var optimized = entries
+        if (Optimization.ELIDE_REDUNDANT_SELECT_RESET in optimizations) {
+            optimized = elideRedundantSelectReset(optimized)
+        }
+        return optimized
+    }
+
+    private fun elideRedundantSelectReset(entries: List<DfEntry>): List<DfEntry> =
+        buildList {
+            entries.forEachIndexed { index, entry ->
+                if (entry.isSelectReset() && entries.getOrNull(index + 1).isSelectObject()) {
+                    return@forEachIndexed
+                }
+                add(entry)
+            }
+        }
+
+    private fun DfEntry?.isSelectReset(): Boolean =
+        this is DfBlock && block == "select_obj" && action == "Reset"
+
+    private fun DfEntry?.isSelectObject(): Boolean =
+        this is DfBlock && block == "select_obj"
 
     private fun templateName(
         options: CompileOptions,

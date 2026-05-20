@@ -1344,6 +1344,88 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun keepsRedundantSelectResetByDefault() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              emit `select_object "Reset"`;
+              emit `select_object "PlayerByName" args("Steve")`;
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSelectBlock(blocks[1].jsonObject, "Reset")
+        assertSelectBlock(blocks[2].jsonObject, "PlayerByName")
+    }
+
+    @Test
+    fun elidesRedundantSelectResetWhenOptimizationIsEnabled() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              emit `select_object "Reset"`;
+              emit `select_object "PlayerByName" args("Steve")`;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_SELECT_RESET)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals(2, blocks.size)
+        assertSelectBlock(blocks[1].jsonObject, "PlayerByName")
+    }
+
+    @Test
+    fun doesNotElideSelectResetWhenAnotherBlockIsBetweenSelections() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              emit `select_object "Reset"`;
+              emit `player_action "SendMessage" args("middle")`;
+              emit `select_object "PlayerByName" args("Steve")`;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_SELECT_RESET)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals(4, blocks.size)
+        assertSelectBlock(blocks[1].jsonObject, "Reset")
+        assertEquals("player_action", blocks[2].jsonObject["block"]!!.jsonPrimitive.content)
+        assertSelectBlock(blocks[3].jsonObject, "PlayerByName")
+    }
+
+    @Test
+    fun parsesOptimizationCliFlags() {
+        val cliOptions = parseCliArgs(arrayOf("-Oall", "-ds", "source.fl"))
+
+        assertEquals("source.fl", cliOptions.sourcePath)
+        assertEquals(StructMode.DICT, cliOptions.compileOptions.structMode)
+        assertEquals(Optimization.entries.toSet(), cliOptions.compileOptions.optimizations)
+    }
+
+    @Test
+    fun rejectsUnknownCliFlagsWithOptimizationUsage() {
+        val error = assertFailsWith<IllegalStateException> {
+            parseCliArgs(arrayOf("-Owat", "source.fl"))
+        }
+
+        assertTrue(error.message!!.contains("-Oall"))
+        assertTrue(error.message!!.contains("-Oselect-reset"))
+        assertTrue(error.message!!.contains("--dictstructs"))
+    }
+
+    @Test
+    fun rejectsCliFlagsAfterSourcePath() {
+        val error = assertFailsWith<IllegalStateException> {
+            parseCliArgs(arrayOf("source.fl", "-Oall"))
+        }
+
+        assertTrue(error.message!!.contains("-Oall"))
+    }
+
+    @Test
     fun writesTemplateNbtWithCompressedJsonAndMetadata() {
         val result = FlangCompiler.compile(
             """
@@ -1442,6 +1524,14 @@ class FlangCompilerTest {
         val zero = items[1].jsonObject["item"]!!.jsonObject
         assertEquals("num", zero["id"]!!.jsonPrimitive.content)
         assertEquals("0", zero["data"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+    }
+
+    private fun assertSelectBlock(
+        block: kotlinx.serialization.json.JsonObject,
+        action: String,
+    ) {
+        assertEquals("select_obj", block["block"]!!.jsonPrimitive.content)
+        assertEquals(action, block["action"]!!.jsonPrimitive.content)
     }
 
     private fun assertParameter(
