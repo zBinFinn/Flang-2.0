@@ -1,0 +1,34 @@
+package std;
+
+struct Player {
+    uuid: String
+}
+
+impl Player {
+    inline fn select(this) {
+        emit `select_object "PlayerName" args($this.uuid$)`;
+    }
+
+    inline fn deselect(this) {
+        emit `select_object "Reset"`;
+    }
+
+    inline fn damage(var this, amount: Num) {
+        this.select();
+        emit `player_action "Damage" args($amount$)`;
+        this.deselect();
+    }
+
+    inline fn getName(this) -> String {
+        this.select();
+        val name = gval("Name", .Selection);
+        this.deselect();
+        return name;
+    }
+
+    inline fn sendMessage(this, message: Text) {
+        this.select();
+        emit `player_action "SendMessage" args($message$) tags(..)`;
+        this.deselect();
+    }
+}

@@ -1,1 +1,3 @@
-package std.prelude;
+package std;
+
+import std.Player;

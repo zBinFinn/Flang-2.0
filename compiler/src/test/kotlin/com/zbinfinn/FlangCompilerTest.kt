@@ -607,7 +607,7 @@ class FlangCompilerTest {
         Files.writeString(
             root.resolve("lib/math.fl"),
             """
-            package lib.math;
+            package lib;
 
             fn add(x: Num, y: Num) -> Num {
               return x + y;
@@ -632,10 +632,10 @@ class FlangCompilerTest {
 
         val result = FlangCompiler.compileFile(main)
 
-        assertEquals(setOf("lib.math.add(Num,Num)", "Main()"), result.templates.map { it.displayIdentifier }.toSet())
+        assertEquals(setOf("lib.add(Num,Num)", "Main()"), result.templates.map { it.displayIdentifier }.toSet())
         val mainTemplate = result.templates.single { it.displayIdentifier == "Main()" }
         val mainBlocks = Json.parseToJsonElement(mainTemplate.templateJson).jsonObject["blocks"]!!.jsonArray
-        assertCallFunc(mainBlocks[1].jsonObject, "lib.math.add(Num,Num)")
+        assertCallFunc(mainBlocks[1].jsonObject, "lib.add(Num,Num)")
     }
 
     @Test
@@ -645,7 +645,7 @@ class FlangCompilerTest {
         Files.writeString(
             root.resolve("lib/box.fl"),
             """
-            package lib.box;
+            package lib;
 
             struct Box { value: Num }
 
@@ -677,8 +677,8 @@ class FlangCompilerTest {
 
         val mainTemplate = result.templates.single { it.displayIdentifier == "Main()" }
         val mainBlocks = Json.parseToJsonElement(mainTemplate.templateJson).jsonObject["blocks"]!!.jsonArray
-        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.box.makeBox(Num)" })
-        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.box.Box.get(Box)" })
+        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.makeBox(Num)" })
+        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.Box.get(Box)" })
     }
 
     @Test
@@ -689,7 +689,7 @@ class FlangCompilerTest {
         Files.writeString(
             root.resolve("lib/math.fl"),
             """
-            package lib.math;
+            package lib;
 
             fn two() -> Num {
               return 2;
@@ -697,10 +697,21 @@ class FlangCompilerTest {
             """.trimIndent(),
         )
         Files.writeString(
+            root.resolve("lib/more.fl"),
+            """
+            package lib;
+
+            fn three() -> Num {
+              return 3;
+            }
+            """.trimIndent(),
+        )
+        Files.writeString(
             root.resolve("pkg/all.fli"),
             """
-            package pkg.all;
+            package pkg;
             import lib.math;
+            import lib.more;
             """.trimIndent(),
         )
         val main = root.resolve("main.fl")
@@ -711,6 +722,7 @@ class FlangCompilerTest {
 
             fn Main() {
               val value = two();
+              val other = three();
             }
             """.trimIndent(),
         )
@@ -720,7 +732,7 @@ class FlangCompilerTest {
         Files.writeString(
             root.resolve("pkg/bad.fli"),
             """
-            package pkg.bad;
+            package pkg;
             fn Bad() {}
             """.trimIndent(),
         )
@@ -737,6 +749,28 @@ class FlangCompilerTest {
             FlangCompiler.compileFile(badMain)
         }
         assertTrue(error.message!!.contains("may only contain package and import declarations"))
+
+        Files.writeString(
+            root.resolve("lib/wrong.fl"),
+            """
+            package lib.wrong;
+
+            fn nope() {}
+            """.trimIndent(),
+        )
+        val mismatchMain = root.resolve("mismatchMain.fl")
+        Files.writeString(
+            mismatchMain,
+            """
+            import lib.wrong;
+            fn Main() {}
+            """.trimIndent(),
+        )
+
+        val mismatch = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compileFile(mismatchMain)
+        }
+        assertTrue(mismatch.message!!.contains("declares package 'lib.wrong' but import expected 'lib'"))
     }
 
     @Test
@@ -765,7 +799,7 @@ class FlangCompilerTest {
         Files.writeString(
             root.resolve("lib/secret.fl"),
             """
-            package lib.secret;
+            package lib;
 
             private fn hidden() -> Num {
               return 1;

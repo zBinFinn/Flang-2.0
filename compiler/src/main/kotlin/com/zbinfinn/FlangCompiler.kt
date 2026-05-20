@@ -68,6 +68,7 @@ private enum class SourceKind {
 
 private data class SourceUnit(
     val id: String,
+    val moduleName: String?,
     val packageName: String,
     val imports: List<String>,
     val file: FlangParser.FileContext,
@@ -82,15 +83,14 @@ object FlangCompiler {
 
     fun compile(source: String, options: CompileOptions = CompileOptions()): CompileResult {
         val file = parse(source)
-        val unit = sourceUnit("<source>", SourceKind.FL, file, expectedPackage = null)
-        return compileUnits(listOf(unit), entryPackage = unit.packageName, options)
+        val unit = sourceUnit("<source>", moduleName = null, SourceKind.FL, file, expectedPackage = null)
+        return compileUnits(listOf(unit), options)
     }
 
     fun compileFile(entryPath: Path, options: CompileOptions = CompileOptions()): CompileResult {
         val normalized = entryPath.toAbsolutePath().normalize()
         val units = loadSourceGraph(normalized)
-        val entryUnit = units.first()
-        return compileUnits(units, entryPackage = entryUnit.packageName, options)
+        return compileUnits(units, options)
     }
 
     fun compileFile(entryPath: String, options: CompileOptions = CompileOptions()): CompileResult =
@@ -98,7 +98,6 @@ object FlangCompiler {
 
     private fun compileUnits(
         units: List<SourceUnit>,
-        entryPackage: String,
         options: CompileOptions,
     ): CompileResult {
         val enums = buildEnumTable(units)
@@ -135,8 +134,7 @@ object FlangCompiler {
             enqueueCalls(lowered.entries)
         }
 
-        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
-            if (unit.packageName != entryPackage) return@forEach
+        units.firstOrNull()?.takeIf { it.kind == SourceKind.FL }?.let { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
                     lowerSignature(lowering.signatureForDeclaration(function, owner = null, packageName = unit.packageName))
@@ -187,27 +185,29 @@ object FlangCompiler {
         val result = mutableListOf<SourceUnit>()
         lateinit var loadImport: (String, List<Path>) -> SourceUnit
 
-        fun loadPath(path: Path, expectedPackage: String?): SourceUnit {
+        fun loadPath(path: Path, moduleName: String?, expectedPackage: String?): SourceUnit {
             val normalized = path.toAbsolutePath().normalize()
+            val key = moduleName ?: "file:${normalized}"
+            loaded[key]?.let { return it }
             val source = Files.readString(normalized)
             val kind = sourceKind(normalized.toString())
-            val unit = sourceUnit(normalized.toString(), kind, parse(source), expectedPackage)
-            val existing = loaded[unit.packageName]
+            val unit = sourceUnit(normalized.toString(), moduleName, kind, parse(source), expectedPackage)
+            val existing = loaded[key]
             if (existing != null) {
                 if (existing.id != unit.id) {
-                    throw FlangCompileException("Package '${unit.packageName}' is provided by both '${existing.id}' and '${unit.id}'.")
+                    throw FlangCompileException("Module '$key' is provided by both '${existing.id}' and '${unit.id}'.")
                 }
                 return existing
             }
-            if (!loading.add(unit.packageName)) {
-                throw FlangCompileException("Import cycle involving package '${unit.packageName}'.")
+            if (!loading.add(key)) {
+                throw FlangCompileException("Import cycle involving module '$key'.")
             }
-            loaded[unit.packageName] = unit
+            loaded[key] = unit
             result += unit
             unit.imports.forEach { importName ->
                 loadImport(importName, sourceRoots)
             }
-            loading.remove(unit.packageName)
+            loading.remove(key)
             return unit
         }
 
@@ -216,17 +216,18 @@ object FlangCompiler {
             listOf("$relative.fl", "$relative.fli").forEach { resourcePath ->
                 val stream = FlangCompiler::class.java.classLoader.getResourceAsStream(resourcePath)
                 if (stream != null) {
+                    loaded[importName]?.let { return it }
                     val source = stream.bufferedReader().use { it.readText() }
-                    val unit = sourceUnit("resource:$resourcePath", sourceKind(resourcePath), parse(source), importName)
-                    val existing = loaded[unit.packageName]
+                    val unit = sourceUnit("resource:$resourcePath", importName, sourceKind(resourcePath), parse(source), packageForImport(importName))
+                    val existing = loaded[importName]
                     if (existing != null) return existing
-                    if (!loading.add(unit.packageName)) {
-                        throw FlangCompileException("Import cycle involving package '${unit.packageName}'.")
+                    if (!loading.add(importName)) {
+                        throw FlangCompileException("Import cycle involving module '$importName'.")
                     }
-                    loaded[unit.packageName] = unit
+                    loaded[importName] = unit
                     result += unit
                     unit.imports.forEach { nested -> loadImport(nested, sourceRoots) }
-                    loading.remove(unit.packageName)
+                    loading.remove(importName)
                     return unit
                 }
             }
@@ -246,12 +247,12 @@ object FlangCompiler {
 
         loadImport = fun(importName: String, roots: List<Path>): SourceUnit {
             loaded[importName]?.let { return it }
-            findImportPath(importName, roots)?.let { return loadPath(it, importName) }
+            findImportPath(importName, roots)?.let { return loadPath(it, importName, packageForImport(importName)) }
             loadResource(importName)?.let { return it }
             throw FlangCompileException("Cannot resolve import '$importName'.")
         }
 
-        loadPath(entryPath, expectedPackage = null)
+        loadPath(entryPath, moduleName = null, expectedPackage = null)
         return result
     }
 
@@ -270,8 +271,12 @@ object FlangCompiler {
             else -> throw FlangCompileException("Source file '$path' must end with .fl or .fli.")
         }
 
+    private fun packageForImport(importName: String): String =
+        importName.substringBeforeLast('.', missingDelimiterValue = "")
+
     private fun sourceUnit(
         id: String,
+        moduleName: String?,
         kind: SourceKind,
         file: FlangParser.FileContext,
         expectedPackage: String?,
@@ -284,7 +289,7 @@ object FlangCompiler {
         if (kind == SourceKind.FLI && file.item().isNotEmpty()) {
             throw FlangCompileException("Import file '$id' may only contain package and import declarations.")
         }
-        return SourceUnit(id, packageName, imports, file, kind)
+        return SourceUnit(id, moduleName, packageName, imports, file, kind)
     }
 
     private fun functionIdentifier(packageName: String, sourceName: String, parameterTypes: String): String {
