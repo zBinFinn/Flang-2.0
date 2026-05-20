@@ -454,6 +454,152 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersInlineFunctionsAtCallSiteWithoutSeparateTemplate() {
+        val result = FlangCompiler.compile(
+            """
+            inline fn sum(x: Num, y: Num) -> Num {
+              return x + y;
+            }
+
+            fn Main() {
+              val result = sum(1, 2);
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("Main()"), result.templates.map { it.displayIdentifier })
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.none { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" })
+        assertSetVar(blocks[1].jsonObject, "${ '$' }flang_inline_0_sum_Num_Num__x", "num", "1")
+        assertSetVar(blocks[2].jsonObject, "${ '$' }flang_inline_0_sum_Num_Num__y", "num", "2")
+        assertSetVarAction(blocks[3].jsonObject, "${ '$' }flang_tmp_0", "+")
+        assertSlotItem(blocks[3].jsonObject, 1, "var", "${ '$' }flang_inline_0_sum_Num_Num__x")
+        assertSlotItem(blocks[3].jsonObject, 2, "var", "${ '$' }flang_inline_0_sum_Num_Num__y")
+        assertSetVar(blocks[4].jsonObject, "result", "var", "${ '$' }flang_tmp_0")
+    }
+
+    @Test
+    fun prefixesInlineLocalsForEachCallSite() {
+        val result = FlangCompiler.compile(
+            """
+            inline fn plusOne(x: Num) -> Num {
+              val local = x + 1;
+              return local;
+            }
+
+            fn Main() {
+              val local = 100;
+              val a = plusOne(1);
+              val b = plusOne(2);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        val setTargets = blocks.mapNotNull { block ->
+            val items = block.jsonObject["args"]?.jsonObject?.get("items")?.jsonArray ?: return@mapNotNull null
+            items.firstOrNull()?.jsonObject?.get("item")?.jsonObject
+                ?.takeIf { it["id"]?.jsonPrimitive?.content == "var" }
+                ?.get("data")?.jsonObject?.get("name")?.jsonPrimitive?.content
+        }
+        assertTrue("local" in setTargets)
+        assertTrue("${ '$' }flang_inline_0_plusOne_Num__local" in setTargets)
+        assertTrue("${ '$' }flang_inline_1_plusOne_Num__local" in setTargets)
+    }
+
+    @Test
+    fun aliasesInlineMutableParametersAndReceivers() {
+        val result = FlangCompiler.compile(
+            """
+            struct Box { value: Num }
+
+            impl Box {
+              inline fn add(var this, amount: Num) {
+                this.value = this.value + amount;
+              }
+            }
+
+            inline fn increment(var value: Num) {
+              value = value + 1;
+            }
+
+            fn Main() {
+              var number = 4;
+              increment(&number);
+              var box = Box { value: 5 };
+              box.add(3);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templates.single().templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[2].jsonObject, "number", "+")
+        assertSlotItem(blocks[2].jsonObject, 1, "var", "number")
+        assertSetVarAction(blocks.last().jsonObject, "box", "SetListValue")
+    }
+
+    @Test
+    fun wrapsInlineEarlyReturnsInSingleRepeat() {
+        val result = FlangCompiler.compile(
+            """
+            inline fn choose(flag: Boolean) -> Num {
+              if (flag) {
+                return 1;
+              }
+              return 2;
+            }
+
+            fn Main() {
+              val value = choose(true);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        val repeatIndex = blocks.indexOfFirst {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "repeat" &&
+                it.jsonObject["action"]?.jsonPrimitive?.content == "Multiple"
+        }
+        assertTrue(repeatIndex >= 0)
+        assertBracket(blocks[repeatIndex + 1].jsonObject, "open", "repeat")
+        assertTrue(blocks.any {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "control" &&
+                it.jsonObject["action"]?.jsonPrimitive?.content == "StopRepeat"
+        })
+        assertBracket(blocks[blocks.size - 2].jsonObject, "close", "repeat")
+        assertSetVar(blocks.last().jsonObject, "value", "var", "${ '$' }flang_tmp_0")
+    }
+
+    @Test
+    fun rejectsInlineRecursionAndInlineEvents() {
+        val recursive = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                inline fn recurse() {
+                  recurse();
+                }
+
+                fn Main() {
+                  recurse();
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(recursive.message!!.contains("Recursive inline function call cycle"))
+
+        val eventInline = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                @Event
+                inline fn Join() {
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(eventInline.message!!.contains("cannot be inline"))
+    }
+
+    @Test
     fun compilesAllTopLevelFunctionsAsSeparateTemplates() {
         val result = FlangCompiler.compile(
             """

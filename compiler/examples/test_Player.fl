@@ -3,28 +3,28 @@ struct Player {
 }
 
 impl Player {
-    fn select(this) {
-        emit `select_object "PlayerByName" args($this.uuid$)`;
+    inline fn select(this) {
+        emit `select_object "PlayerName" args($this.uuid$)`;
     }
 
-    fn deselect(this) {
+    inline fn deselect(this) {
         emit `select_object "Reset"`;
     }
 
-    fn getName(this) -> String {
+    inline fn damage(var this, amount: Num) {
+        this.select();
+        emit `player_action "Damage" args($amount$)`;
+        this.deselect();
+    }
+
+    inline fn getName(this) -> String {
         this.select();
         val name = gval("Name", .Selection);
         this.deselect();
         return name;
     }
 
-    fn damage(var this, amount: Num) {
-        this.select();
-        emit `player_action "Damage" args($amount$)`;
-        this.deselect();
-    }
-
-    fn sendMessage(this, message: Text) {
+    inline fn sendMessage(this, message: Text) {
         this.select();
         emit `player_action "SendMessage" args($message$) tags(..)`;
         this.deselect();

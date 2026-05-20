@@ -23,7 +23,7 @@ annotationArgs
   ;
 
 functionDecl
-  : FN Identifier LPAREN paramList? RPAREN (ARROW typeRef)? block
+  : INLINE? FN Identifier LPAREN paramList? RPAREN (ARROW typeRef)? block
   ;
 
 paramList

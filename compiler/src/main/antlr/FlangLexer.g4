@@ -1,6 +1,7 @@
 lexer grammar FlangLexer;
 
 AT      : '@';
+INLINE  : 'inline';
 FN      : 'fn';
 EMIT    : 'emit';
 VAL     : 'val';
