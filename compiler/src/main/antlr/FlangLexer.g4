@@ -2,6 +2,9 @@ lexer grammar FlangLexer;
 
 AT      : '@';
 INLINE  : 'inline';
+PACKAGE : 'package';
+IMPORT  : 'import';
+PRIVATE : 'private';
 FN      : 'fn';
 EMIT    : 'emit';
 VAL     : 'val';

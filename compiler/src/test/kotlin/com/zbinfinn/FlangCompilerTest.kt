@@ -9,6 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import java.io.ByteArrayInputStream
+import java.nio.file.Files
 import java.util.Base64
 import java.util.zip.GZIPInputStream
 
@@ -597,6 +598,243 @@ class FlangCompilerTest {
             )
         }
         assertTrue(eventInline.message!!.contains("cannot be inline"))
+    }
+
+    @Test
+    fun compilesImportedFunctionFromAnotherFile() {
+        val root = Files.createTempDirectory("flang-import")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/math.fl"),
+            """
+            package lib.math;
+
+            fn add(x: Num, y: Num) -> Num {
+              return x + y;
+            }
+
+            fn unused() -> Num {
+              return 0;
+            }
+            """.trimIndent(),
+        )
+        val main = root.resolve("main.fl")
+        Files.writeString(
+            main,
+            """
+            import lib.math;
+
+            fn Main() {
+              val value = add(1, 2);
+            }
+            """.trimIndent(),
+        )
+
+        val result = FlangCompiler.compileFile(main)
+
+        assertEquals(setOf("lib.math.add(Num,Num)", "Main()"), result.templates.map { it.displayIdentifier }.toSet())
+        val mainTemplate = result.templates.single { it.displayIdentifier == "Main()" }
+        val mainBlocks = Json.parseToJsonElement(mainTemplate.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(mainBlocks[1].jsonObject, "lib.math.add(Num,Num)")
+    }
+
+    @Test
+    fun importsStructWithImplFunctions() {
+        val root = Files.createTempDirectory("flang-struct-import")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/box.fl"),
+            """
+            package lib.box;
+
+            struct Box { value: Num }
+
+            fn makeBox(value: Num) -> Box {
+              return Box { value: value };
+            }
+
+            impl Box {
+              fn get(this) -> Num {
+                return this.value;
+              }
+            }
+            """.trimIndent(),
+        )
+        val main = root.resolve("main.fl")
+        Files.writeString(
+            main,
+            """
+            import lib.box;
+
+            fn Main() {
+              val box = makeBox(7);
+              val value = box.get();
+            }
+            """.trimIndent(),
+        )
+
+        val result = FlangCompiler.compileFile(main)
+
+        val mainTemplate = result.templates.single { it.displayIdentifier == "Main()" }
+        val mainBlocks = Json.parseToJsonElement(mainTemplate.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.box.makeBox(Num)" })
+        assertTrue(mainBlocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "call_func" && it.jsonObject["data"]?.jsonPrimitive?.content == "lib.box.Box.get(Box)" })
+    }
+
+    @Test
+    fun importFilesTransitivelyExposeImportsAndRejectDeclarations() {
+        val root = Files.createTempDirectory("flang-fli")
+        Files.createDirectories(root.resolve("lib"))
+        Files.createDirectories(root.resolve("pkg"))
+        Files.writeString(
+            root.resolve("lib/math.fl"),
+            """
+            package lib.math;
+
+            fn two() -> Num {
+              return 2;
+            }
+            """.trimIndent(),
+        )
+        Files.writeString(
+            root.resolve("pkg/all.fli"),
+            """
+            package pkg.all;
+            import lib.math;
+            """.trimIndent(),
+        )
+        val main = root.resolve("main.fl")
+        Files.writeString(
+            main,
+            """
+            import pkg.all;
+
+            fn Main() {
+              val value = two();
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(FlangCompiler.compileFile(main).templates.any { it.displayIdentifier == "Main()" })
+
+        Files.writeString(
+            root.resolve("pkg/bad.fli"),
+            """
+            package pkg.bad;
+            fn Bad() {}
+            """.trimIndent(),
+        )
+        val badMain = root.resolve("badMain.fl")
+        Files.writeString(
+            badMain,
+            """
+            import pkg.bad;
+            fn Main() {}
+            """.trimIndent(),
+        )
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compileFile(badMain)
+        }
+        assertTrue(error.message!!.contains("may only contain package and import declarations"))
+    }
+
+    @Test
+    fun importsBundledStdPreludeFromResources() {
+        val root = Files.createTempDirectory("flang-std")
+        val main = root.resolve("main.fl")
+        Files.writeString(
+            main,
+            """
+            import std.prelude;
+
+            fn Main() {
+            }
+            """.trimIndent(),
+        )
+
+        val result = FlangCompiler.compileFile(main)
+
+        assertEquals(listOf("Main()"), result.templates.map { it.displayIdentifier })
+    }
+
+    @Test
+    fun enforcesPrivateFunctionsAndStructFieldsAcrossPackages() {
+        val root = Files.createTempDirectory("flang-private")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/secret.fl"),
+            """
+            package lib.secret;
+
+            private fn hidden() -> Num {
+              return 1;
+            }
+
+            fn visible() -> Num {
+              return hidden();
+            }
+
+            struct SecretBox { private token: String, value: Num }
+
+            fn makeBox(value: Num) -> SecretBox {
+              return SecretBox { token: "ok", value: value };
+            }
+
+            impl SecretBox {
+              fn get(this) -> Num {
+                return this.value;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val okMain = root.resolve("ok.fl")
+        Files.writeString(
+            okMain,
+            """
+            import lib.secret;
+
+            fn Main() {
+              val a = visible();
+              val box = makeBox(5);
+              val value = box.get();
+            }
+            """.trimIndent(),
+        )
+        assertTrue(FlangCompiler.compileFile(okMain).templates.any { it.displayIdentifier == "Main()" })
+
+        val privateFunctionMain = root.resolve("privateFunction.fl")
+        Files.writeString(
+            privateFunctionMain,
+            """
+            import lib.secret;
+
+            fn Main() {
+              val a = hidden();
+            }
+            """.trimIndent(),
+        )
+        assertTrue(
+            assertFailsWith<FlangCompileException> { FlangCompiler.compileFile(privateFunctionMain) }
+                .message!!.contains("Unknown function 'hidden'"),
+        )
+
+        val privateFieldMain = root.resolve("privateField.fl")
+        Files.writeString(
+            privateFieldMain,
+            """
+            import lib.secret;
+
+            fn Main() {
+              val box = SecretBox { token: "bad", value: 5 };
+            }
+            """.trimIndent(),
+        )
+        assertTrue(
+            assertFailsWith<FlangCompileException> { FlangCompiler.compileFile(privateFieldMain) }
+                .message!!.contains("private fields"),
+        )
     }
 
     @Test

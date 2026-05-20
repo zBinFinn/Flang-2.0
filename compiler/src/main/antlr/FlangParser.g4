@@ -3,7 +3,19 @@ parser grammar FlangParser;
 options { tokenVocab=FlangLexer; }
 
 file
-  : item* EOF
+  : packageDecl? importDecl* item* EOF
+  ;
+
+packageDecl
+  : PACKAGE qualifiedName SEMI
+  ;
+
+importDecl
+  : IMPORT qualifiedName SEMI
+  ;
+
+qualifiedName
+  : Identifier (DOT Identifier)*
   ;
 
 item
@@ -23,7 +35,7 @@ annotationArgs
   ;
 
 functionDecl
-  : INLINE? FN Identifier LPAREN paramList? RPAREN (ARROW typeRef)? block
+  : PRIVATE? INLINE? FN Identifier LPAREN paramList? RPAREN (ARROW typeRef)? block
   ;
 
 paramList
@@ -248,7 +260,7 @@ tupleLiteral
 // Stubs to fill later
 structDecl : STRUCT Identifier LBRACE structFieldList? RBRACE ;
 structFieldList : structField (COMMA structField)* COMMA? ;
-structField : Identifier COLON typeRef ;
+structField : PRIVATE? Identifier COLON typeRef ;
 enumDecl   : ENUM Identifier LBRACE enumEntryList? RBRACE ;
 enumEntryList : Identifier (COMMA Identifier)* COMMA? ;
 implDecl   : IMPL Identifier LBRACE functionDecl* RBRACE ;

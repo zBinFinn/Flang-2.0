@@ -16,6 +16,8 @@ import org.antlr.v4.runtime.RecognitionException
 import org.antlr.v4.runtime.Recognizer
 import org.antlr.v4.runtime.tree.TerminalNode
 import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.Base64
 import java.util.zip.GZIPOutputStream
 
@@ -59,6 +61,19 @@ private const val INLINE_PREFIX = "$" + "flang_inline_"
 private const val RETURN_VARIABLE_NAME = "$" + "out"
 private const val SELECTION_TYPE_ENUM = "SelectionType"
 
+private enum class SourceKind {
+    FL,
+    FLI,
+}
+
+private data class SourceUnit(
+    val id: String,
+    val packageName: String,
+    val imports: List<String>,
+    val file: FlangParser.FileContext,
+    val kind: SourceKind,
+)
+
 object FlangCompiler {
     private val json = Json {
         prettyPrint = false
@@ -67,34 +82,81 @@ object FlangCompiler {
 
     fun compile(source: String, options: CompileOptions = CompileOptions()): CompileResult {
         val file = parse(source)
-        val enums = buildEnumTable(file)
-        val structs = buildStructTable(file, enums)
-        val objects = buildObjectTable(file)
-        val signatures = buildFunctionSignatures(file, structs, enums, objects)
-        val declarations = buildFunctionDeclarations(file, signatures)
+        val unit = sourceUnit("<source>", SourceKind.FL, file, expectedPackage = null)
+        return compileUnits(listOf(unit), entryPackage = unit.packageName, options)
+    }
+
+    fun compileFile(entryPath: Path, options: CompileOptions = CompileOptions()): CompileResult {
+        val normalized = entryPath.toAbsolutePath().normalize()
+        val units = loadSourceGraph(normalized)
+        val entryUnit = units.first()
+        return compileUnits(units, entryPackage = entryUnit.packageName, options)
+    }
+
+    fun compileFile(entryPath: String, options: CompileOptions = CompileOptions()): CompileResult =
+        compileFile(Path.of(entryPath), options)
+
+    private fun compileUnits(
+        units: List<SourceUnit>,
+        entryPackage: String,
+        options: CompileOptions,
+    ): CompileResult {
+        val enums = buildEnumTable(units)
+        val structs = buildStructTable(units, enums)
+        val objects = buildObjectTable(units)
+        val signatures = buildFunctionSignatures(units, structs, enums, objects)
+        val declarations = buildFunctionDeclarations(units, signatures)
         val lowering = FunctionLowering(ActionDump.loadFromResources(), signatures, declarations, structs, enums, options.structMode)
-        val loweredFunctions = buildList {
-            file.item().forEach { item ->
+        declarations.values.forEach { declaration ->
+            val signature = lowering.signatureForDeclaration(declaration.function, declaration.owner, declaration.packageName)
+            if (declaration.annotations.any { it.Identifier().text == "Event" } && signature.isInline) {
+                throw FlangCompileException("Event function '${signature.name}' cannot be inline.")
+            }
+        }
+
+        val loweredByIdentifier = linkedMapOf<String, LoweredFunction>()
+        val pendingCalls = ArrayDeque<String>()
+
+        fun enqueueCalls(entries: List<DfEntry>) {
+            entries.forEach { entry ->
+                val block = entry as? DfBlock ?: return@forEach
+                if (block.block == "call_func" && block.data != null) {
+                    pendingCalls += block.data
+                }
+            }
+        }
+
+        fun lowerSignature(signature: FunctionSignature) {
+            if (signature.isInline || loweredByIdentifier.containsKey(signature.fullIdentifier)) return
+            val declaration = declarations[signature.fullIdentifier]
+                ?: throw FlangCompileException("Function '${signature.fullIdentifier}' has no declaration.")
+            val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName)
+            loweredByIdentifier[signature.fullIdentifier] = lowered
+            enqueueCalls(lowered.entries)
+        }
+
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            if (unit.packageName != entryPackage) return@forEach
+            unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    val signature = lowering.signatureForDeclaration(function, owner = null)
-                    if (signature.isInline) {
-                        lowering.lowerFunction(item.annotation(), function)
-                    } else {
-                        add(lowering.lowerFunction(item.annotation(), function))
-                    }
+                    lowerSignature(lowering.signatureForDeclaration(function, owner = null, packageName = unit.packageName))
                 }
                 item.implDecl()?.let { impl ->
                     impl.functionDecl().forEach { function ->
-                        val signature = lowering.signatureForDeclaration(function, impl.Identifier().text)
-                        if (signature.isInline) {
-                            lowering.lowerFunction(emptyList(), function, impl.Identifier().text)
-                        } else {
-                            add(lowering.lowerFunction(emptyList(), function, impl.Identifier().text))
-                        }
+                        lowerSignature(lowering.signatureForDeclaration(function, impl.Identifier().text, packageName = unit.packageName))
                     }
                 }
             }
         }
+
+        while (pendingCalls.isNotEmpty()) {
+            val identifier = pendingCalls.removeFirst()
+            val signature = signatures[identifier]
+                ?: throw FlangCompileException("Unknown function template '$identifier'.")
+            lowerSignature(signature)
+        }
+
+        val loweredFunctions = loweredByIdentifier.values.toList()
 
         if (loweredFunctions.isEmpty()) {
             throw FlangCompileException("No functions found to compile.")
@@ -113,6 +175,121 @@ object FlangCompiler {
             )
         }
         return CompileResult(templates)
+    }
+
+    private fun loadSourceGraph(entryPath: Path): List<SourceUnit> {
+        if (!Files.exists(entryPath)) {
+            throw FlangCompileException("Source file '$entryPath' does not exist.")
+        }
+        val sourceRoots = listOfNotNull(entryPath.parent, resourcesDirectoryIfPresent()).distinct()
+        val loaded = linkedMapOf<String, SourceUnit>()
+        val loading = mutableSetOf<String>()
+        val result = mutableListOf<SourceUnit>()
+        lateinit var loadImport: (String, List<Path>) -> SourceUnit
+
+        fun loadPath(path: Path, expectedPackage: String?): SourceUnit {
+            val normalized = path.toAbsolutePath().normalize()
+            val source = Files.readString(normalized)
+            val kind = sourceKind(normalized.toString())
+            val unit = sourceUnit(normalized.toString(), kind, parse(source), expectedPackage)
+            val existing = loaded[unit.packageName]
+            if (existing != null) {
+                if (existing.id != unit.id) {
+                    throw FlangCompileException("Package '${unit.packageName}' is provided by both '${existing.id}' and '${unit.id}'.")
+                }
+                return existing
+            }
+            if (!loading.add(unit.packageName)) {
+                throw FlangCompileException("Import cycle involving package '${unit.packageName}'.")
+            }
+            loaded[unit.packageName] = unit
+            result += unit
+            unit.imports.forEach { importName ->
+                loadImport(importName, sourceRoots)
+            }
+            loading.remove(unit.packageName)
+            return unit
+        }
+
+        fun loadResource(importName: String): SourceUnit? {
+            val relative = importName.replace('.', '/')
+            listOf("$relative.fl", "$relative.fli").forEach { resourcePath ->
+                val stream = FlangCompiler::class.java.classLoader.getResourceAsStream(resourcePath)
+                if (stream != null) {
+                    val source = stream.bufferedReader().use { it.readText() }
+                    val unit = sourceUnit("resource:$resourcePath", sourceKind(resourcePath), parse(source), importName)
+                    val existing = loaded[unit.packageName]
+                    if (existing != null) return existing
+                    if (!loading.add(unit.packageName)) {
+                        throw FlangCompileException("Import cycle involving package '${unit.packageName}'.")
+                    }
+                    loaded[unit.packageName] = unit
+                    result += unit
+                    unit.imports.forEach { nested -> loadImport(nested, sourceRoots) }
+                    loading.remove(unit.packageName)
+                    return unit
+                }
+            }
+            return null
+        }
+
+        fun findImportPath(importName: String, roots: List<Path>): Path? {
+            val relative = importName.replace('.', java.io.File.separatorChar)
+            roots.forEach { root ->
+                val fl = root.resolve("$relative.fl").normalize()
+                if (Files.exists(fl)) return fl
+                val fli = root.resolve("$relative.fli").normalize()
+                if (Files.exists(fli)) return fli
+            }
+            return null
+        }
+
+        loadImport = fun(importName: String, roots: List<Path>): SourceUnit {
+            loaded[importName]?.let { return it }
+            findImportPath(importName, roots)?.let { return loadPath(it, importName) }
+            loadResource(importName)?.let { return it }
+            throw FlangCompileException("Cannot resolve import '$importName'.")
+        }
+
+        loadPath(entryPath, expectedPackage = null)
+        return result
+    }
+
+    private fun resourcesDirectoryIfPresent(): Path? {
+        val candidates = listOf(
+            Path.of("compiler", "src", "main", "resources"),
+            Path.of("src", "main", "resources"),
+        )
+        return candidates.map { it.toAbsolutePath().normalize() }.firstOrNull { Files.isDirectory(it) }
+    }
+
+    private fun sourceKind(path: String): SourceKind =
+        when {
+            path.endsWith(".fli") -> SourceKind.FLI
+            path.endsWith(".fl") -> SourceKind.FL
+            else -> throw FlangCompileException("Source file '$path' must end with .fl or .fli.")
+        }
+
+    private fun sourceUnit(
+        id: String,
+        kind: SourceKind,
+        file: FlangParser.FileContext,
+        expectedPackage: String?,
+    ): SourceUnit {
+        val packageName = file.packageDecl()?.qualifiedName()?.text ?: ""
+        if (expectedPackage != null && packageName != expectedPackage) {
+            throw FlangCompileException("File '$id' declares package '$packageName' but import expected '$expectedPackage'.")
+        }
+        val imports = file.importDecl().map { it.qualifiedName().text }
+        if (kind == SourceKind.FLI && file.item().isNotEmpty()) {
+            throw FlangCompileException("Import file '$id' may only contain package and import declarations.")
+        }
+        return SourceUnit(id, packageName, imports, file, kind)
+    }
+
+    private fun functionIdentifier(packageName: String, sourceName: String, parameterTypes: String): String {
+        val qualifiedName = if (packageName.isEmpty()) sourceName else "$packageName.$sourceName"
+        return "$qualifiedName($parameterTypes)"
     }
 
     private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>): List<DfEntry> {
@@ -153,23 +330,26 @@ object FlangCompiler {
         }
 
     private fun buildFunctionSignatures(
-        file: FlangParser.FileContext,
+        units: List<SourceUnit>,
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Set<String>,
     ): Map<String, FunctionSignature> {
         val signatures = linkedMapOf<String, FunctionSignature>()
-        file.item().forEach { item ->
-            item.functionDecl()?.let { function ->
-                registerFunctionSignature(signatures, function, owner = null, structs = structs, enums = enums)
-            }
-            item.implDecl()?.let { impl ->
-                val owner = impl.Identifier().text
-                if (owner !in structs && owner !in objects) {
-                    throw FlangCompileException("Impl target '$owner' is not a known struct or object.")
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            unit.file.item().forEach { item ->
+                item.functionDecl()?.let { function ->
+                    registerFunctionSignature(signatures, function, owner = null, packageName = unit.packageName, structs = structs, enums = enums)
                 }
-                impl.functionDecl().forEach { function ->
-                    registerFunctionSignature(signatures, function, owner = owner, structs = structs, enums = enums)
+                item.implDecl()?.let { impl ->
+                    val owner = impl.Identifier().text
+                    if (owner !in structs && owner !in objects) {
+                        throw FlangCompileException("Impl target '$owner' is not a known struct or object.")
+                    }
+                    val ownerPackage = structs[owner]?.packageName ?: unit.packageName
+                    impl.functionDecl().forEach { function ->
+                        registerFunctionSignature(signatures, function, owner = owner, packageName = ownerPackage, structs = structs, enums = enums)
+                    }
                 }
             }
         }
@@ -180,6 +360,7 @@ object FlangCompiler {
         signatures: MutableMap<String, FunctionSignature>,
         function: FlangParser.FunctionDeclContext,
         owner: String?,
+        packageName: String,
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
     ) {
@@ -191,10 +372,12 @@ object FlangCompiler {
         val signature = FunctionSignature(
             name = name,
             owner = owner,
+            packageName = packageName,
             params = params,
             returnType = function.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums) },
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
+            isPrivate = function.PRIVATE() != null,
         )
         if (signatures.containsKey(signature.fullIdentifier)) {
             throw FlangCompileException("Duplicate function signature '${signature.fullIdentifier}'.")
@@ -203,20 +386,22 @@ object FlangCompiler {
     }
 
     private fun buildFunctionDeclarations(
-        file: FlangParser.FileContext,
+        units: List<SourceUnit>,
         signatures: Map<String, FunctionSignature>,
     ): Map<String, FunctionDeclaration> {
         val declarations = linkedMapOf<String, FunctionDeclaration>()
-        file.item().forEach { item ->
-            item.functionDecl()?.let { function ->
-                val signature = signatureForFunctionDeclaration(function, owner = null, signatures)
-                declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function)
-            }
-            item.implDecl()?.let { impl ->
-                val owner = impl.Identifier().text
-                impl.functionDecl().forEach { function ->
-                    val signature = signatureForFunctionDeclaration(function, owner, signatures)
-                    declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function)
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            unit.file.item().forEach { item ->
+                item.functionDecl()?.let { function ->
+                    val signature = signatureForFunctionDeclaration(function, owner = null, packageName = unit.packageName, signatures)
+                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = null, packageName = unit.packageName)
+                }
+                item.implDecl()?.let { impl ->
+                    val owner = impl.Identifier().text
+                    impl.functionDecl().forEach { function ->
+                        val signature = signatureForFunctionDeclaration(function, owner, packageName = unit.packageName, signatures)
+                        declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName)
+                    }
                 }
             }
         }
@@ -226,6 +411,7 @@ object FlangCompiler {
     private fun signatureForFunctionDeclaration(
         function: FlangParser.FunctionDeclContext,
         owner: String?,
+        packageName: String,
         signatures: Map<String, FunctionSignature>,
     ): FunctionSignature {
         val name = function.Identifier().text
@@ -239,7 +425,7 @@ object FlangCompiler {
             }
             .joinToString(",")
         val sourceName = owner?.let { "$it.$name" } ?: name
-        val fullIdentifier = "$sourceName($parameterTypes)"
+        val fullIdentifier = functionIdentifier(packageName, sourceName, parameterTypes)
         return signatures[fullIdentifier] ?: throw FlangCompileException("Unknown function signature '$fullIdentifier'.")
     }
 
@@ -302,13 +488,15 @@ object FlangCompiler {
     }
 
     private fun buildStructTable(
-        file: FlangParser.FileContext,
+        units: List<SourceUnit>,
         enums: Map<String, EnumDefinition>,
     ): Map<String, StructDefinition> {
-        val declarations = file.item().mapNotNull { it.structDecl() }
-        val knownStructs = declarations.associate { it.Identifier().text to StructDefinition(it.Identifier().text, emptyList()) }
+        val declarations = units.filter { it.kind == SourceKind.FL }.flatMap { unit ->
+            unit.file.item().mapNotNull { it.structDecl()?.let { decl -> unit to decl } }
+        }
+        val knownStructs = declarations.associate { (_, decl) -> decl.Identifier().text to StructDefinition(decl.Identifier().text, "", emptyList()) }
         val structs = linkedMapOf<String, StructDefinition>()
-        declarations.forEach { decl ->
+        declarations.forEach { (unit, decl) ->
             val name = decl.Identifier().text
             if (enums.containsKey(name)) {
                 throw FlangCompileException("Type '$name' is already declared as an enum.")
@@ -329,16 +517,18 @@ object FlangCompiler {
                     name = fieldName,
                     type = FlangType.fromTypeRef(field.typeRef(), knownStructs, enums),
                     listIndex = index + 2,
+                    isPrivate = field.PRIVATE() != null,
                 )
             }
-            structs[name] = StructDefinition(name, fields)
+            structs[name] = StructDefinition(name, unit.packageName, fields)
         }
         return structs
     }
 
-    private fun buildEnumTable(file: FlangParser.FileContext): Map<String, EnumDefinition> {
+    private fun buildEnumTable(units: List<SourceUnit>): Map<String, EnumDefinition> {
         val enums = linkedMapOf<String, EnumDefinition>()
-        file.item().mapNotNull { it.enumDecl() }.forEach { decl ->
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            unit.file.item().mapNotNull { it.enumDecl() }.forEach { decl ->
             val name = decl.Identifier().text
             if (enums.containsKey(name)) {
                 throw FlangCompileException("Duplicate enum '$name'.")
@@ -351,11 +541,13 @@ object FlangCompiler {
                 }
                 EnumEntry(entryName, index)
             }
-            enums[name] = EnumDefinition(name, entries)
+            enums[name] = EnumDefinition(name, unit.packageName, entries)
+            }
         }
         if (!enums.containsKey(SELECTION_TYPE_ENUM)) {
             enums[SELECTION_TYPE_ENUM] = EnumDefinition(
                 SELECTION_TYPE_ENUM,
+                "",
                 listOf("Default", "Selection", "Victim", "Attacker").mapIndexed { index, name ->
                     EnumEntry(name, index)
                 },
@@ -364,8 +556,10 @@ object FlangCompiler {
         return enums
     }
 
-    private fun buildObjectTable(file: FlangParser.FileContext): Set<String> =
-        file.item().mapNotNull { it.objectDecl()?.Identifier()?.text }.toSet()
+    private fun buildObjectTable(units: List<SourceUnit>): Set<String> =
+        units.filter { it.kind == SourceKind.FL }.flatMap { unit ->
+            unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text }
+        }.toSet()
 }
 
 private data class LoweredFunction(val displayIdentifier: String, val entries: List<DfEntry>)
@@ -373,18 +567,22 @@ private data class LoweredFunction(val displayIdentifier: String, val entries: L
 private data class FunctionDeclaration(
     val annotations: List<FlangParser.AnnotationContext>,
     val function: FlangParser.FunctionDeclContext,
+    val owner: String?,
+    val packageName: String,
 )
 
 private data class FunctionSignature(
     val name: String,
     val owner: String? = null,
+    val packageName: String,
     val params: List<FunctionParameter>,
     val returnType: FlangType?,
     val hasReceiver: Boolean = false,
     val isInline: Boolean = false,
+    val isPrivate: Boolean = false,
 ) {
     val sourceName: String = owner?.let { "$it.$name" } ?: name
-    val fullIdentifier: String = "$sourceName(${params.joinToString(",") { it.type.sourceName }})"
+    val fullIdentifier: String = "${if (packageName.isEmpty()) sourceName else "$packageName.$sourceName"}(${params.joinToString(",") { it.type.sourceName }})"
 }
 
 private data class FunctionParameter(val name: String, val mutability: Mutability, val type: FlangType)
@@ -427,13 +625,13 @@ private sealed class FlangType(open val sourceName: String) {
     }
 }
 
-private data class StructDefinition(val name: String, val fields: List<StructField>) {
+private data class StructDefinition(val name: String, val packageName: String, val fields: List<StructField>) {
     val fieldsByName: Map<String, StructField> = fields.associateBy { it.name }
 }
 
-private data class StructField(val name: String, val type: FlangType, val listIndex: Int)
+private data class StructField(val name: String, val type: FlangType, val listIndex: Int, val isPrivate: Boolean = false)
 
-private data class EnumDefinition(val name: String, val entries: List<EnumEntry>) {
+private data class EnumDefinition(val name: String, val packageName: String, val entries: List<EnumEntry>) {
     val entriesByName: Map<String, EnumEntry> = entries.associateBy { it.name }
 }
 
@@ -493,6 +691,7 @@ private class FunctionLowering(
 ) {
     private var tempCounter = 0
     private var inlineCounter = 0
+    private var currentPackage = ""
     private val inlineCallStack = mutableListOf<String>()
     private val overloadsByName: Map<String, List<FunctionSignature>> =
         signatures.values.filter { it.owner == null }.groupBy { it.name }
@@ -533,10 +732,14 @@ private class FunctionLowering(
         annotations: List<FlangParser.AnnotationContext>,
         function: FlangParser.FunctionDeclContext,
         owner: String? = null,
+        packageName: String = "",
     ): LoweredFunction {
         tempCounter = 0
         val functionName = function.Identifier().text
-        val signature = signatureForDeclaration(function, owner)
+        val signature = signatureForDeclaration(function, owner, packageName)
+        val previousPackage = currentPackage
+        currentPackage = signature.packageName
+        try {
         val isEvent = annotations.any { it.Identifier().text == "Event" }
         if (isEvent && signature.isInline) {
             throw FlangCompileException("Event function '$functionName' cannot be inline.")
@@ -578,9 +781,12 @@ private class FunctionLowering(
             signature.fullIdentifier
         }
         return LoweredFunction(displayIdentifier, entries)
+        } finally {
+            currentPackage = previousPackage
+        }
     }
 
-    fun signatureForDeclaration(function: FlangParser.FunctionDeclContext, owner: String?): FunctionSignature {
+    fun signatureForDeclaration(function: FlangParser.FunctionDeclContext, owner: String?, packageName: String = ""): FunctionSignature {
         val name = function.Identifier().text
         val parameterTypes = function.paramList()?.param().orEmpty()
             .mapIndexed { index, param ->
@@ -592,7 +798,11 @@ private class FunctionLowering(
             }
             .joinToString(",")
         val sourceName = owner?.let { "$it.$name" } ?: name
-        val fullIdentifier = "$sourceName($parameterTypes)"
+        val fullIdentifier = if (packageName.isEmpty()) {
+            "$sourceName($parameterTypes)"
+        } else {
+            "$packageName.$sourceName($parameterTypes)"
+        }
         return signatures[fullIdentifier] ?: throw FlangCompileException("Unknown function signature '$fullIdentifier'.")
     }
 
@@ -837,6 +1047,9 @@ private class FunctionLowering(
                     ?: throw FlangCompileException("Local '${memberTarget.base}' is not a struct.")
                 val field = structs[structType.name]?.fieldsByName?.get(memberTarget.field)
                     ?: throw FlangCompileException("Struct '${structType.name}' has no field '${memberTarget.field}'.")
+                if (field.isPrivate && structs.getValue(structType.name).packageName != currentPackage) {
+                    throw FlangCompileException("Field '${memberTarget.field}' of struct '${structType.name}' is private.")
+                }
                 val value = lowerAssignmentToValue(assignment.assignment(), symbols, field.type)
                 if (value.type != field.type) {
                     throw FlangCompileException("Cannot assign ${value.type.sourceName} to '${memberTarget.base}.${field.name}' of type ${field.type.sourceName}.")
@@ -1191,6 +1404,9 @@ private class FunctionLowering(
     ): TargetExpression {
         val structName = literal.Identifier().text
         val struct = structs[structName] ?: throw FlangCompileException("Unknown struct '$structName'.")
+        if (struct.packageName != currentPackage && struct.fields.any { it.isPrivate }) {
+            throw FlangCompileException("Struct '$structName' has private fields and cannot be constructed outside package '${struct.packageName}'.")
+        }
         val provided = literal.structLiteralFieldList()?.structLiteralField().orEmpty()
         val providedByName = provided.associateBy { it.Identifier().text }
         if (providedByName.size != provided.size) {
@@ -1361,6 +1577,9 @@ private class FunctionLowering(
             ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
         val field = structs[structType.name]?.fieldsByName?.get(member.field)
             ?: throw FlangCompileException("Struct '${structType.name}' has no field '${member.field}'.")
+        if (field.isPrivate && structs.getValue(structType.name).packageName != currentPackage) {
+            throw FlangCompileException("Field '${member.field}' of struct '${structType.name}' is private.")
+        }
         return ExpressionValue(
             type = field.type,
             item = primitiveStructFieldPlaceholder(base.name, field)
@@ -1658,6 +1877,8 @@ private class FunctionLowering(
         val baseName = call.baseName
         if (baseName == null) {
             return overloadsByName[call.name]
+                ?.filter { canAccessSignature(it) }
+                ?.takeIf { it.isNotEmpty() }
                 ?: throw FlangCompileException("Unknown function '${call.name}'.")
         }
 
@@ -1667,6 +1888,7 @@ private class FunctionLowering(
                 ?: throw FlangCompileException("Local '$baseName' is not a struct.")
             val overloads = implOverloadsByOwnerAndName[structType.name to call.name]
                 ?.filter { it.hasReceiver }
+                ?.filter { canAccessSignature(it) }
                 .orEmpty()
             if (overloads.isEmpty()) {
                 throw FlangCompileException("Unknown member function '${structType.name}.${call.name}'.")
@@ -1676,12 +1898,16 @@ private class FunctionLowering(
 
         val overloads = implOverloadsByOwnerAndName[baseName to call.name]
             ?.filter { !it.hasReceiver }
+            ?.filter { canAccessSignature(it) }
             .orEmpty()
         if (overloads.isEmpty()) {
             throw FlangCompileException("Unknown static function '$baseName.${call.name}'.")
         }
         return overloads
     }
+
+    private fun canAccessSignature(signature: FunctionSignature): Boolean =
+        !signature.isPrivate || signature.packageName == currentPackage
 
     private fun callArgumentTypes(
         call: SimpleCall,
@@ -1829,6 +2055,8 @@ private class FunctionLowering(
         }
 
         inlineCallStack += signature.fullIdentifier
+        val previousPackage = currentPackage
+        currentPackage = signature.packageName
         try {
             val prefix = inlinePrefix(signature)
             val blocks = mutableListOf<DfEntry>()
@@ -1895,6 +2123,7 @@ private class FunctionLowering(
                 blocks
             }
         } finally {
+            currentPackage = previousPackage
             inlineCallStack.removeAt(inlineCallStack.lastIndex)
         }
     }
@@ -2379,7 +2608,7 @@ private object TemplateNbt {
             append("minecraft:lore=['")
             append(loreLine.escapeSnbtSingleQuoted())
             append("']")
-            append("]")
+            append("] 1")
         }
     }
 
