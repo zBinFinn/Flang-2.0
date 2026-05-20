@@ -19,23 +19,19 @@ fn Join(event: PlayerJoinEvent) {
 
 === Defining an Event (Stdlib)
 ```rust
-interface CancellableEvent {
-  fn cancel(var self: CancellableEvent) {
-    emit `game_action "CancelEvent"`;
-  }
-
-  fn uncancel(var self: CancellableEvent) {
-    emit `game_action "UncancelEvent"`;
-  }
-}
-
 @PlayerEventProvider("TakeDamage")
 object PlayerTakeDamageEvent;
 
-impl CancellableEvent for PlayerTakeDamageEvent;
-
 impl PlayerTakeDamageEvent {
-  fn victim(self: PlayerTakeDamageEvent) -> Player {
+  fn cancel(var this) {
+    emit `game_action "CancelEvent"`;
+  }
+
+  fn uncancel(var this) {
+    emit `game_action "UncancelEvent"`;
+  }
+
+  fn victim(this) -> Player {
     return gval("UUID", .Victim) as Player;
   }
 }
@@ -108,6 +104,11 @@ Function DiamondFire identifiers include parameter types to support overloading.
 For example, `fn print(value: Num)` emits as `print(Num)`, while
 `fn print(value: String)` emits as `print(String)`. Calls are written with the
 source name, and the compiler resolves the overload from argument types.
+Functions inside `impl Type { ... }` emit with qualified identifiers. A function
+without `this` is static and is called as `Type.name(...)`. A function whose
+first parameter is `this` is a member function and is called as
+`value.name(...)`; `var this` requires the receiver to be stored in a `var`.
+The receiver parameter is untyped because the impl target supplies the type.
 
 For now mutable references only work with plain local identifiers. Supporting
 `&someStruct.member` needs a separate design for member storage and escaping and
@@ -206,25 +207,25 @@ checks where needed.
 type Player = String;
 
 impl Player {
-  private fn select(self: Player) {
-    emit `select_object "PlayerByName" args($self$)`;
+  private fn select(this) {
+    emit `select_object "PlayerByName" args($this$)`;
   }
 
-  private fn deselect(self: Player) {
+  private fn deselect(this) {
     emit `select_object "Reset"`;
   }
 
-  fn sendMessage(var self: Player, message: Text) {
+  fn sendMessage(var this, message: Text) {
     // tags(..) is default, tags("TagA"="Value", ..) means everything default apart from TagA
-    self.select();
+    this.select();
     emit `player_action "SendMessage" args($message$) tags(..)`;
-    self.deselect();
+    this.deselect();
   }
 
-  fn health(self: Player) -> Num {
-    self.select();
+  fn health(this) -> Num {
+    this.select();
     val health = gval("Health", .Selection);
-    self.deselect();
+    this.deselect();
     return health;
   }
 }
@@ -270,7 +271,7 @@ fn Join(var event: PlayerJoinEvent) {
 = Enums
 ```rust
 enum SelectionType {
-  Default, Selected, Victim, Attacker //...
+  Default, Selection, Victim, Attacker //...
 }
 
 fn doSomething(thing: SelectionType) {
@@ -289,7 +290,19 @@ fn callingDoSomething() {
   doSomething(SelectionType.Attacker);
   doSomething(.Attacker); // same thing
 }
+
+fn readingEnum(thing: SelectionType) {
+  val ordinal: Num = thing.ordinal();
+  val name: String = thing.name();
+}
 ```
+
+Enum values are represented like structs using the configured backing mode. List mode stores
+`[EnumName, ordinal, name]`; dict mode stores `$type`, `$ordinal`, and `$name`.
+The `.Entry` shorthand is only valid when the compiler already knows the expected enum type.
+
+`gval(name: String, type: SelectionType)` emits a DiamondFire game value. The game value name is
+matched exactly; `"Name"` and `"Name "` are distinct legacy DiamondFire values.
 
 #pagebreak()
 
@@ -456,7 +469,7 @@ struct A {
   num: Num
 }
 
-impl DoesSomething for A {
+impl A {
   fn do(something: Num) {
     debug("A");
   }
@@ -466,7 +479,7 @@ struct B {
   string: String
 }
 
-impl DoesSomething for B {
+impl B {
   fn do(something: Num) {
     debug("B");
   }

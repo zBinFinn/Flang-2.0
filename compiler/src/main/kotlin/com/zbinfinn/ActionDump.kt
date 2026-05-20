@@ -9,12 +9,16 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 data class DfTagDefault(val name: String, val defaultOption: String, val slot: Int)
+data class DfGameValue(val name: String, val returnType: String)
 
 class ActionDump private constructor(
     private val codeblockNamesById: Map<String, String>,
     private val actionTags: Map<ActionKey, List<DfTagDefault>>,
+    private val gameValuesByName: Map<String, DfGameValue>,
 ) {
     fun codeblockName(blockId: String): String? = codeblockNamesById[blockId]
+
+    fun gameValue(name: String): DfGameValue? = gameValuesByName[name]
 
     fun defaultTags(blockId: String, action: String): List<DfTagDefault> {
         val codeblockName = codeblockName(blockId) ?: return emptyList()
@@ -49,7 +53,17 @@ class ActionDump private constructor(
                 }
                 key to tags
             }
-            return ActionDump(codeblocks, actionTags)
+            val gameValues = root.array("gameValues")
+                .flatMap { element ->
+                    val obj = element.jsonObject
+                    val icon = obj["icon"]?.jsonObject ?: return@flatMap emptyList()
+                    val name = icon.string("name")
+                    val value = DfGameValue(name = name, returnType = icon.string("returnType"))
+                    (listOf(name) + obj.array("aliases").mapNotNull { it.jsonPrimitive.content.takeIf(String::isNotEmpty) })
+                        .map { it to value }
+                }
+                .toMap()
+            return ActionDump(codeblocks, actionTags, gameValues)
         }
     }
 }

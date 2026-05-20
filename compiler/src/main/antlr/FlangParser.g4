@@ -31,7 +31,7 @@ paramList
   ;
 
 param
-  : VAR? Identifier COLON typeRef
+  : VAR? Identifier (COLON typeRef)?
   ;
 
 block
@@ -41,7 +41,7 @@ block
 stmt
   : emitStmt SEMI
   | varDecl SEMI?
-  | returnStmt SEMI
+  | returnStmt SEMI?
   | ifEmitStmt
   | ifStmt
   | forStmt
@@ -104,7 +104,7 @@ emitArgList
   ;
 
 emitArg
-  : DOLLAR Identifier DOLLAR
+  : DOLLAR expr DOLLAR
   | VAR LPAREN Identifier COMMA Identifier RPAREN
   | IntegerLiteral
   | StringLiteral
@@ -219,9 +219,14 @@ primary
   | TRUE
   | FALSE
   | structLiteral
+  | enumShorthand
   | Identifier
   | tupleLiteral
   | LPAREN expr RPAREN
+  ;
+
+enumShorthand
+  : DOT Identifier
   ;
 
 structLiteral
@@ -244,6 +249,7 @@ tupleLiteral
 structDecl : STRUCT Identifier LBRACE structFieldList? RBRACE ;
 structFieldList : structField (COMMA structField)* COMMA? ;
 structField : Identifier COLON typeRef ;
-enumDecl   : ENUM Identifier LBRACE RBRACE ;
-implDecl   : IMPL Identifier (FOR Identifier)? LBRACE RBRACE ;
+enumDecl   : ENUM Identifier LBRACE enumEntryList? RBRACE ;
+enumEntryList : Identifier (COMMA Identifier)* COMMA? ;
+implDecl   : IMPL Identifier LBRACE functionDecl* RBRACE ;
 objectDecl : OBJECT Identifier (SEMI | block) ;

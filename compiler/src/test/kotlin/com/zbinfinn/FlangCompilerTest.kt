@@ -38,6 +38,47 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersEmitInterpolationExpressions() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val a = 1;
+              val b = 2;
+              emit `player_action "SendMessage" args(${ '$' }a + b${ '$' }) tags(..)`;
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[3].jsonObject, "${ '$' }flang_tmp_0", "+")
+        val emitBlock = blocks[4].jsonObject
+        assertEquals("player_action", emitBlock["block"]!!.jsonPrimitive.content)
+        assertSlotItem(emitBlock, 0, "var", "${ '$' }flang_tmp_0")
+    }
+
+    @Test
+    fun lowersEmitInterpolationMemberExpressionsInImpls() {
+        val result = FlangCompiler.compile(
+            """
+            struct Player {
+              uuid: String
+            }
+
+            impl Player {
+              fn select(this) {
+                emit `select_object "PlayerByName" args(${ '$' }this.uuid${ '$' })`;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("select_obj", blocks[1].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("PlayerByName", blocks[1].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSlotItem(blocks[1].jsonObject, 0, "txt", "%index(this,2)")
+    }
+
+    @Test
     fun lowersValVarDeclarationsAndReassignment() {
         val result = FlangCompiler.compile(
             """
@@ -483,6 +524,192 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersStaticImplFunctionsAndCalls() {
+        val result = FlangCompiler.compile(
+            """
+            struct Bla { value: Num }
+
+            impl Bla {
+              fn staticFunction() {
+              }
+            }
+
+            fn Main() {
+              Bla.staticFunction();
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("Bla.staticFunction()", "Main()"), result.templates.map { it.displayIdentifier })
+        val mainBlocks = Json.parseToJsonElement(result.templates[1].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(mainBlocks[1].jsonObject, "Bla.staticFunction()")
+    }
+
+    @Test
+    fun lowersImplMemberFunctionsAndCalls() {
+        val result = FlangCompiler.compile(
+            """
+            struct Bla { value: Num }
+
+            impl Bla {
+              fn memberFunction(this) -> Num {
+                return this.value;
+              }
+            }
+
+            fn Main() {
+              val data = Bla { value: 5 };
+              val out = data.memberFunction();
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("Bla.memberFunction(Bla)", "Main()"), result.templates.map { it.displayIdentifier })
+        val memberBlocks = Json.parseToJsonElement(result.templates[0].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertParameter(memberBlocks[0].jsonObject, 1, "this", "var")
+        val mainBlocks = Json.parseToJsonElement(result.templates[1].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(mainBlocks[2].jsonObject, "Bla.memberFunction(Bla)")
+        assertSlotItem(mainBlocks[2].jsonObject, 0, "var", "${ '$' }flang_tmp_0")
+        assertSlotItem(mainBlocks[2].jsonObject, 1, "var", "data")
+        assertSetVar(mainBlocks[3].jsonObject, "out", "var", "${ '$' }flang_tmp_0")
+    }
+
+    @Test
+    fun checksMutableImplReceiverCalls() {
+        FlangCompiler.compile(
+            """
+            struct Counter { value: Num }
+
+            impl Counter {
+              fn bump(var this) {
+                this.value = this.value + 1;
+              }
+            }
+
+            fn Main() {
+              var counter = Counter { value: 1 };
+              counter.bump();
+            }
+            """.trimIndent(),
+        )
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                struct Counter { value: Num }
+
+                impl Counter {
+                  fn bump(var this) {
+                  }
+                }
+
+                fn Main() {
+                  val counter = Counter { value: 1 };
+                  counter.bump();
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("mutable member function 'Counter.bump' on immutable val 'counter'"))
+    }
+
+    @Test
+    fun resolvesImplOverloadsSeparatelyFromFreeFunctions() {
+        val result = FlangCompiler.compile(
+            """
+            struct Bla { value: Num }
+
+            fn build() -> Num {
+              return 1;
+            }
+
+            impl Bla {
+              fn build() -> Num {
+                return 2;
+              }
+
+              fn build(this) -> Num {
+                return this.value;
+              }
+            }
+
+            fn Main() {
+              val data = Bla { value: 5 };
+              val a = build();
+              val b = Bla.build();
+              val c = data.build();
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("build()", "Bla.build()", "Bla.build(Bla)", "Main()"), result.templates.map { it.displayIdentifier })
+        val mainBlocks = Json.parseToJsonElement(result.templates[3].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(mainBlocks[2].jsonObject, "build()")
+        assertCallFunc(mainBlocks[4].jsonObject, "Bla.build()")
+        assertCallFunc(mainBlocks[6].jsonObject, "Bla.build(Bla)")
+    }
+
+    @Test
+    fun validatesImplDeclarationsAndCallShapes() {
+        val duplicate = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                struct Bla { value: Num }
+                impl Bla {
+                  fn same(this) {}
+                  fn same(other: Bla) {}
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(duplicate.message!!.contains("Duplicate function signature 'Bla.same(Bla)'"))
+
+        val invalidReceiver = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                struct Bla { value: Num }
+                impl Bla {
+                  fn bad(value: Num, this) {}
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(invalidReceiver.message!!.contains("Receiver parameter 'this' must be the first parameter"))
+
+        val memberAsStatic = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                struct Bla { value: Num }
+                impl Bla {
+                  fn member(this) {}
+                }
+                fn Main() {
+                  Bla.member();
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(memberAsStatic.message!!.contains("Unknown static function 'Bla.member'"))
+
+        val staticAsMember = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                struct Bla { value: Num }
+                impl Bla {
+                  fn staticFunction() {}
+                }
+                fn Main() {
+                  val data = Bla { value: 1 };
+                  data.staticFunction();
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(staticAsMember.message!!.contains("Unknown member function 'Bla.staticFunction'"))
+    }
+
+    @Test
     fun lowersVoidFunctionCallsAndRejectsVoidCallsAsValues() {
         val result = FlangCompiler.compile(
             """
@@ -722,6 +949,170 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersEnumLiteralsAndHelpers() {
+        val result = FlangCompiler.compile(
+            """
+            enum Mode { Default, Selection, }
+
+            fn takes(mode: Mode) -> Num {
+              return mode.ordinal();
+            }
+
+            fn Test() {
+              val qualified = Mode.Default;
+              val contextual: Mode = .Selection;
+              var mutable: Mode = .Default;
+              mutable = .Selection;
+              val ordinal = contextual.ordinal();
+              val name = contextual.name();
+              val out = takes(.Default);
+            }
+            """.trimIndent(),
+        )
+
+        val testBlocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier.startsWith("Test(") }.templateJson)
+            .jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(testBlocks[1].jsonObject, "qualified", "CreateList")
+        assertSlotItem(testBlocks[1].jsonObject, 1, "txt", "Mode")
+        assertSlotItem(testBlocks[1].jsonObject, 2, "num", "0")
+        assertSlotItem(testBlocks[1].jsonObject, 3, "txt", "Default")
+        assertSetVarAction(testBlocks[2].jsonObject, "contextual", "CreateList")
+        assertSlotItem(testBlocks[2].jsonObject, 2, "num", "1")
+        assertSlotItem(testBlocks[2].jsonObject, 3, "txt", "Selection")
+        assertSetVar(testBlocks[5].jsonObject, "ordinal", "num", "%index(contextual,2)")
+        assertSetVar(testBlocks[6].jsonObject, "name", "txt", "%index(contextual,3)")
+        assertCallFunc(testBlocks[8].jsonObject, "takes(Mode)")
+    }
+
+    @Test
+    fun lowersDictBackedEnumLiteralsAndHelpers() {
+        val result = FlangCompiler.compile(
+            """
+            enum Mode { Default, Selection }
+
+            fn Test() {
+              val contextual: Mode = .Selection;
+              val ordinal = contextual.ordinal();
+              val name = contextual.name();
+            }
+            """.trimIndent(),
+            CompileOptions(structMode = StructMode.DICT),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[1].jsonObject, "${ '$' }flang_tmp_0", "CreateList")
+        assertSlotItem(blocks[1].jsonObject, 1, "txt", "${ '$' }type")
+        assertSlotItem(blocks[1].jsonObject, 2, "txt", "${ '$' }ordinal")
+        assertSlotItem(blocks[1].jsonObject, 3, "txt", "${ '$' }name")
+        assertSetVarAction(blocks[3].jsonObject, "contextual", "CreateDict")
+        assertSetVar(blocks[4].jsonObject, "ordinal", "num", "%entry(contextual,${ '$' }ordinal)")
+        assertSetVar(blocks[5].jsonObject, "name", "txt", "%entry(contextual,${ '$' }name)")
+    }
+
+    @Test
+    fun rejectsContextFreeEnumShorthand() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                enum Mode { Default }
+
+                fn Test() {
+                  val mode = .Default;
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("requires an expected enum type"))
+    }
+
+    @Test
+    fun lowersGvalWithExactNameDistinction() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val uuid = gval("UUID", .Default);
+              val name = gval("Name", .Selection);
+              val styled: Text = gval("Name ", .Selection);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarGval(blocks[1].jsonObject, "uuid", "UUID", "Default")
+        assertSetVarGval(blocks[2].jsonObject, "name", "Name", "Selection")
+        assertSetVarGval(blocks[3].jsonObject, "styled", "Name ", "Selection")
+    }
+
+    @Test
+    fun rejectsInvalidGvalCalls() {
+        assertTrue(
+            assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(
+                    """
+                    fn Test() {
+                      val bad = gval("Selection Target UUIDs", .Selection);
+                    }
+                    """.trimIndent(),
+                )
+            }.message!!.contains("unsupported DiamondFire type 'LIST'"),
+        )
+
+        assertTrue(
+            assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(
+                    """
+                    fn Test() {
+                      val target: SelectionType = .Default;
+                      val bad = gval("UUID", target);
+                    }
+                    """.trimIndent(),
+                )
+            }.message!!.contains("compile-time SelectionType enum literal"),
+        )
+    }
+
+    @Test
+    fun compilesPlayerSampleWithGvalAndSelectionType() {
+        FlangCompiler.compile(
+            """
+            struct Player {
+                uuid: String
+            }
+
+            impl Player {
+                fn select(this) {
+                    emit `select_object "PlayerByName" args(${ '$' }this.uuid${ '$' })`;
+                }
+
+                fn deselect(this) {
+                    emit `select_object "Reset"`;
+                }
+
+                fn getName(this) -> String {
+                    this.select();
+                    val name = gval("Name", .Selection);
+                    this.deselect();
+                    return name;
+                }
+
+                fn damage(var this, amount: Num) {
+                    this.select();
+                    emit `player_action "Damage" args(${ '$' }amount${ '$' })`;
+                    this.deselect();
+                }
+            }
+
+            fn defaultPlayer() -> Player {
+                return Player {
+                    uuid: gval("UUID", .Default)
+                }
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
     fun rejectsMemberAssignmentOnImmutableStructs() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
@@ -868,18 +1259,19 @@ class FlangCompilerTest {
     }
 
     @Test
-    fun rejectsEmitActionWithTagsWhenTagsClauseIsMissing() {
-        val error = assertFailsWith<FlangCompileException> {
-            FlangCompiler.compile(
-                """
-                fn Test() {
-                  emit `player_action "SendMessage" args("Hello")`;
-                }
-                """.trimIndent(),
-            )
-        }
+    fun fillsDefaultTagsWhenTagsClauseIsMissing() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              emit `player_action "SendMessage" args("Hello")`;
+            }
+            """.trimIndent(),
+        )
 
-        assertTrue(error.message!!.contains("must include a tags(...) clause"))
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertBlockTag(blocks[1].jsonObject, 24, "Inherit Styles", "True")
+        assertBlockTag(blocks[1].jsonObject, 25, "Text Value Merging", "Add spaces")
+        assertBlockTag(blocks[1].jsonObject, 26, "Alignment Mode", "Regular")
     }
 
     @Test
@@ -988,6 +1380,23 @@ class FlangCompilerTest {
         val value = items[1].jsonObject["item"]!!.jsonObject
         assertEquals(valueItemId, value["id"]!!.jsonPrimitive.content)
         assertEquals(valueName, value["data"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+    }
+
+    private fun assertSetVarGval(
+        block: kotlinx.serialization.json.JsonObject,
+        targetName: String,
+        gameValueName: String,
+        target: String,
+    ) {
+        assertEquals("set_var", block["block"]!!.jsonPrimitive.content)
+        assertEquals("=", block["action"]!!.jsonPrimitive.content)
+        val items = block["args"]!!.jsonObject["items"]!!.jsonArray
+        assertVariable(items[0].jsonObject, targetName, "line")
+        val value = items[1].jsonObject["item"]!!.jsonObject
+        assertEquals("g_val", value["id"]!!.jsonPrimitive.content)
+        val data = value["data"]!!.jsonObject
+        assertEquals(gameValueName, data["type"]!!.jsonPrimitive.content)
+        assertEquals(target, data["target"]!!.jsonPrimitive.content)
     }
 
     private fun assertSetVarAction(

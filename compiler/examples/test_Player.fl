@@ -1,0 +1,44 @@
+struct Player {
+    uuid: String
+}
+
+impl Player {
+    fn select(this) {
+        emit `select_object "PlayerByName" args($this.uuid$)`;
+    }
+
+    fn deselect(this) {
+        emit `select_object "Reset"`;
+    }
+
+    fn getName(this) -> String {
+        this.select();
+        val name = gval("Name", .Selected);
+        this.deselect();
+        return name;
+    }
+
+    fn damage(var this, amount: Num) {
+        this.select();
+        emit `player_action "Damage" args($amount$)`;
+        this.deselect();
+    }
+
+    fn sendMessage(this, message: Text) {
+        this.select();
+        emit `player_action "SendMessage" args($message$) tags(..)`;
+        this.deselect();
+    }
+}
+
+fn defaultPlayer() -> Player {
+    return Player {
+        uuid: gval("UUID", .Default)
+    }
+}
+
+fn testPlayer() {
+    var player = defaultPlayer();
+    player.damage(5);
+    val name = player.getName();
+}
