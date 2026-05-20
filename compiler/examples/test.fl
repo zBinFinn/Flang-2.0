@@ -1,13 +1,28 @@
+fn playerNameEquals(name: String) -> Boolean {
+    if emit `if_player "NameEquals" args($name$)` {
+        return true;
+    }
+    return false;
+}
+
+fn test4() {
+    if (playerNameEquals("zBinFinn")) {
+        print(5);
+    } else {
+        print(6);
+    }
+}
+
+fn print(num: Num) {
+    emit `player_action "SendMessage" args($num$) tags(..)`;
+}
+
 fn increment(var num: Num) {
     num = num + 1;
 }
 
 fn sum(a: Num, b: Num) -> Num {
     return a + b;
-}
-
-fn print(num: Num) {
-    emit `player_action "SendMessage" args($num$) tags(..)`;
 }
 
 fn test3() {

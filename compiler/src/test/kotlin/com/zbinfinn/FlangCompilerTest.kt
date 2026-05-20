@@ -132,6 +132,251 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersBooleanIfStatementsWithElse() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val flag = true;
+              if (flag) {
+                val yes = 1;
+              } else {
+                val no = 0;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVar(blocks[1].jsonObject, "flag", "num", "1")
+        assertIfVarTruthy(blocks[2].jsonObject, "flag", "var")
+        assertBracket(blocks[3].jsonObject, "open", "norm")
+        assertSetVar(blocks[4].jsonObject, "yes", "num", "1")
+        assertBracket(blocks[5].jsonObject, "close", "norm")
+        assertBlock(blocks[6].jsonObject, "else")
+        assertBracket(blocks[7].jsonObject, "open", "norm")
+        assertSetVar(blocks[8].jsonObject, "no", "num", "0")
+        assertBracket(blocks[9].jsonObject, "close", "norm")
+    }
+
+    @Test
+    fun lowersNestedElseIfAndConditionPreludes() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val a = true;
+              val b = false;
+              if (a && b) {
+                val both = 1;
+              } else if (a) {
+                val justA = 2;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[3].jsonObject, "${ '$' }flang_tmp_0", "Bitwise")
+        assertIfVarTruthy(blocks[4].jsonObject, "${ '$' }flang_tmp_0", "var")
+        assertBlock(blocks[8].jsonObject, "else")
+        assertIfVarTruthy(blocks[10].jsonObject, "a", "var")
+    }
+
+    @Test
+    fun rejectsNonBooleanIfConditions() {
+        listOf(
+            """
+            fn Test() {
+              if (1) {}
+            }
+            """.trimIndent(),
+            """
+            fn Test() {
+              if ("x") {}
+            }
+            """.trimIndent(),
+            """
+            struct Data { value: Num }
+            fn Test() {
+              val data = Data { value: 1 };
+              if (data) {}
+            }
+            """.trimIndent(),
+        ).forEach { source ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+            assertTrue(error.message!!.contains("if condition must be Boolean"))
+        }
+    }
+
+    @Test
+    fun keepsIfBranchDeclarationsLocal() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  if (true) {
+                    val inside = 1;
+                  }
+                  val outside = inside;
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("Unknown local 'inside'"))
+    }
+
+    @Test
+    fun validatesReturnsAcrossIfBranches() {
+        FlangCompiler.compile(
+            """
+            fn Test(flag: Boolean) -> Num {
+              if (flag) {
+                return 1;
+              } else {
+                return 0;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test(flag: Boolean) -> Num {
+                  if (flag) {
+                    return 1;
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("has no return statement"))
+    }
+
+    @Test
+    fun lowersIfEmitWithElse() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test(name: String) {
+              var out: Boolean = false;
+              if emit `if_player "NameEquals" args(${ '$' }name${ '$' })` {
+                out = true;
+              } else {
+                out = false;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVar(blocks[1].jsonObject, "out", "num", "0")
+        assertBlock(blocks[2].jsonObject, "if_player")
+        assertEquals("NameEquals", blocks[2].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSlotItem(blocks[2].jsonObject, 0, "var", "name")
+        assertBracket(blocks[3].jsonObject, "open", "norm")
+        assertSetVar(blocks[4].jsonObject, "out", "num", "1")
+        assertBracket(blocks[5].jsonObject, "close", "norm")
+        assertBlock(blocks[6].jsonObject, "else")
+        assertBracket(blocks[7].jsonObject, "open", "norm")
+        assertSetVar(blocks[8].jsonObject, "out", "num", "0")
+        assertBracket(blocks[9].jsonObject, "close", "norm")
+    }
+
+    @Test
+    fun lowersNestedElseIfEmitAndIfVariablePublicId() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test(flag: Boolean) {
+              if emit `if_variable "=" args(${ '$' }flag${ '$' }, true)` {
+                val yes = 1;
+              } else if emit `if_game "EventBlock"` {
+                val game = 2;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertBlock(blocks[1].jsonObject, "if_var")
+        assertEquals("=", blocks[1].jsonObject["action"]!!.jsonPrimitive.content)
+        assertBracket(blocks[2].jsonObject, "open", "norm")
+        assertBlock(blocks[5].jsonObject, "else")
+        assertBracket(blocks[6].jsonObject, "open", "norm")
+        assertBlock(blocks[7].jsonObject, "if_game")
+        assertEquals("EventBlock", blocks[7].jsonObject["action"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun keepsIfEmitBranchDeclarationsLocal() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test(name: String) {
+                  if emit `if_player "NameEquals" args(${ '$' }name${ '$' })` {
+                    val inside = 1;
+                  }
+                  val outside = inside;
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("Unknown local 'inside'"))
+    }
+
+    @Test
+    fun validatesReturnsAcrossIfEmitBranches() {
+        FlangCompiler.compile(
+            """
+            fn Test(flag: Boolean) -> Num {
+              if emit `if_variable "=" args(${ '$' }flag${ '$' }, true)` {
+                return 1;
+              } else {
+                return 0;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test(flag: Boolean) -> Num {
+                  if emit `if_variable "=" args(${ '$' }flag${ '$' }, true)` {
+                    return 1;
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+
+        assertTrue(error.message!!.contains("has no return statement"))
+    }
+
+    @Test
+    fun rejectsNonConditionIfEmitBlocks() {
+        listOf(
+            "if emit `player_action \"SendMessage\" args(\"x\") tags(..)` {}",
+            "if emit `bracket if open` {}",
+            "if emit `else` {}",
+        ).forEach { statement ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(
+                    """
+                    fn Test() {
+                      $statement
+                    }
+                    """.trimIndent(),
+                )
+            }
+            assertTrue(error.message!!.contains("if emit requires an if_player, if_entity, if_game, or if_variable emit block"))
+        }
+    }
+
+    @Test
     fun lowersFunctionParametersReturnsAndExpressionCalls() {
         val result = FlangCompiler.compile(
             """
@@ -415,6 +660,24 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun allowsStructLiteralDeclarationBeforeEmitWithoutSemicolon() {
+        FlangCompiler.compile(
+            """
+            struct PlayerData { money: Num, name: String }
+
+            fn Test() {
+              val data = PlayerData {
+                money: 5,
+                name: "zBinFinn"
+              }
+
+              emit `player_action "SendMessage" args(${ '$' }data${ '$' }) tags(..)`;
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
     fun lowersStringAndTextStructReadsAsValuePlaceholders() {
         val result = FlangCompiler.compile(
             """
@@ -631,6 +894,49 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersRawElseAndBracketEmits() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              emit `bracket if open`;
+              emit `bracket if close`;
+              emit `else`;
+              emit `bracket repeat open`;
+              emit `bracket repeat close`;
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertBracket(blocks[1].jsonObject, "open", "norm")
+        assertBracket(blocks[2].jsonObject, "close", "norm")
+        assertBlock(blocks[3].jsonObject, "else")
+        assertBracket(blocks[4].jsonObject, "open", "repeat")
+        assertBracket(blocks[5].jsonObject, "close", "repeat")
+    }
+
+    @Test
+    fun rejectsUnsupportedBracketEmitSyntaxWithExplicitMessage() {
+        listOf(
+            "emit `bracket if closed`;",
+            "emit `bracket norm open`;",
+            "emit `bracket if open args()`;",
+            "emit `bracket \"open\" args(\"norm\")`;",
+        ).forEach { emit ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(
+                    """
+                    fn Test() {
+                      $emit
+                    }
+                    """.trimIndent(),
+                )
+            }
+            assertTrue(error.message!!.contains("Bracket emit syntax is emit `bracket if open`"))
+        }
+    }
+
+    @Test
     fun rejectsInternalBlockIdentifiers() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
@@ -693,6 +999,40 @@ class FlangCompilerTest {
         assertEquals(action, block["action"]!!.jsonPrimitive.content)
         val items = block["args"]!!.jsonObject["items"]!!.jsonArray
         assertVariable(items[0].jsonObject, targetName, "line")
+    }
+
+    private fun assertBlock(
+        block: kotlinx.serialization.json.JsonObject,
+        blockName: String,
+    ) {
+        assertEquals("block", block["id"]!!.jsonPrimitive.content)
+        assertEquals(blockName, block["block"]!!.jsonPrimitive.content)
+    }
+
+    private fun assertBracket(
+        block: kotlinx.serialization.json.JsonObject,
+        direct: String,
+        type: String,
+    ) {
+        assertEquals("bracket", block["id"]!!.jsonPrimitive.content)
+        assertEquals(direct, block["direct"]!!.jsonPrimitive.content)
+        assertEquals(type, block["type"]!!.jsonPrimitive.content)
+    }
+
+    private fun assertIfVarTruthy(
+        block: kotlinx.serialization.json.JsonObject,
+        conditionName: String,
+        conditionItemId: String,
+    ) {
+        assertBlock(block, "if_var")
+        assertEquals("!=", block["action"]!!.jsonPrimitive.content)
+        val items = block["args"]!!.jsonObject["items"]!!.jsonArray
+        val condition = items[0].jsonObject["item"]!!.jsonObject
+        assertEquals(conditionItemId, condition["id"]!!.jsonPrimitive.content)
+        assertEquals(conditionName, condition["data"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+        val zero = items[1].jsonObject["item"]!!.jsonObject
+        assertEquals("num", zero["id"]!!.jsonPrimitive.content)
+        assertEquals("0", zero["data"]!!.jsonObject["name"]!!.jsonPrimitive.content)
     }
 
     private fun assertParameter(

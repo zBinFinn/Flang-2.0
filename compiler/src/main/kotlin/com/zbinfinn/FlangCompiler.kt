@@ -244,6 +244,11 @@ private data class FunctionContext(
     var sawReturn: Boolean = false,
 )
 
+private data class LoweredBranch(
+    val entries: List<DfEntry>,
+    val definitelyReturns: Boolean,
+)
+
 private class FunctionLowering(
     private val actionDump: ActionDump,
     private val signatures: Map<String, FunctionSignature>,
@@ -281,6 +286,7 @@ private class FunctionLowering(
         "if_variable" to "if_var",
     )
     private val disallowedInternalIds = setOf("func", "select_obj", "set_var", "call_func", "if_var")
+    private val conditionBlockIds = setOf("if_player", "if_entity", "if_game", "if_var")
 
     fun lowerFunction(
         annotations: List<FlangParser.AnnotationContext>,
@@ -398,8 +404,125 @@ private class FunctionLowering(
             stmt.emitStmt() != null -> listOf(lowerEmit(stmt.emitStmt(), symbols))
             stmt.varDecl() != null -> lowerVarDecl(stmt.varDecl(), symbols)
             stmt.returnStmt() != null -> lowerReturn(stmt.returnStmt(), symbols, context)
+            stmt.ifEmitStmt() != null -> lowerIfEmit(stmt.ifEmitStmt(), symbols, context)
+            stmt.ifStmt() != null -> lowerIf(stmt.ifStmt(), symbols, context)
             stmt.exprStmt() != null -> lowerExprStmt(stmt.exprStmt(), symbols)
-            else -> throw FlangCompileException("Raw Emit V1 only supports emit, val/var, reassignment, return, and function calls inside functions.")
+            else -> throw FlangCompileException("Raw Emit V1 only supports emit, if, val/var, reassignment, return, and function calls inside functions.")
+        }
+
+    private fun lowerBlock(
+        block: FlangParser.BlockContext,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): LoweredBranch {
+        val branchSymbols = LinkedHashMap(symbols)
+        val branchContext = FunctionContext(
+            signature = context.signature,
+            isEvent = context.isEvent,
+        )
+        val entries = mutableListOf<DfEntry>()
+        block.stmt().forEach { stmt ->
+            entries += lowerStatement(stmt, branchSymbols, branchContext)
+        }
+        return LoweredBranch(entries, branchContext.sawReturn)
+    }
+
+    private fun lowerIf(
+        ifStmt: FlangParser.IfStmtContext,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val condition = lowerAssignmentToValue(ifStmt.expr().assignment(), symbols)
+        condition.requireType(FlangType.BOOLEAN, "if condition must be Boolean")
+
+        val thenBranch = lowerBlock(ifStmt.block(0), symbols, context)
+        val elseBranch = lowerElseBranch(
+            elseIfEmit = ifStmt.ifEmitStmt(),
+            elseIf = ifStmt.ifStmt(),
+            elseBlock = ifStmt.block().getOrNull(1),
+            symbols = symbols,
+            context = context,
+        )
+
+        if (thenBranch.definitelyReturns && elseBranch?.definitelyReturns == true) {
+            context.sawReturn = true
+        }
+
+        return buildConditionalEntries(
+            condition = condition.prelude + ifVariableTruthyBlock(condition.item),
+            thenBranch = thenBranch,
+            elseBranch = elseBranch,
+        )
+    }
+
+    private fun lowerIfEmit(
+        ifEmitStmt: FlangParser.IfEmitStmtContext,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val condition = lowerConditionEmit(ifEmitStmt.emitBody(), symbols)
+        val thenBranch = lowerBlock(ifEmitStmt.block(0), symbols, context)
+        val elseBranch = lowerElseBranch(
+            elseIfEmit = ifEmitStmt.ifEmitStmt(),
+            elseIf = ifEmitStmt.ifStmt(),
+            elseBlock = ifEmitStmt.block().getOrNull(1),
+            symbols = symbols,
+            context = context,
+        )
+
+        if (thenBranch.definitelyReturns && elseBranch?.definitelyReturns == true) {
+            context.sawReturn = true
+        }
+
+        return buildConditionalEntries(
+            condition = listOf(condition),
+            thenBranch = thenBranch,
+            elseBranch = elseBranch,
+        )
+    }
+
+    private fun lowerElseBranch(
+        elseIfEmit: FlangParser.IfEmitStmtContext?,
+        elseIf: FlangParser.IfStmtContext?,
+        elseBlock: FlangParser.BlockContext?,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): LoweredBranch? =
+        when {
+            elseIfEmit != null -> {
+                val elseContext = FunctionContext(
+                    signature = context.signature,
+                    isEvent = context.isEvent,
+                )
+                LoweredBranch(lowerIfEmit(elseIfEmit, LinkedHashMap(symbols), elseContext), elseContext.sawReturn)
+            }
+            elseIf != null -> {
+                val elseContext = FunctionContext(
+                    signature = context.signature,
+                    isEvent = context.isEvent,
+                )
+                LoweredBranch(lowerIf(elseIf, LinkedHashMap(symbols), elseContext), elseContext.sawReturn)
+            }
+            elseBlock != null -> lowerBlock(elseBlock, symbols, context)
+            else -> null
+        }
+
+    private fun buildConditionalEntries(
+        condition: List<DfEntry>,
+        thenBranch: LoweredBranch,
+        elseBranch: LoweredBranch?,
+    ): List<DfEntry> =
+        buildList {
+            addAll(condition)
+            add(DfBracket(direct = "open", type = "norm"))
+            addAll(thenBranch.entries)
+            add(DfBracket(direct = "close", type = "norm"))
+            if (elseBranch != null) {
+                add(DfBlock(block = "else"))
+                add(DfBracket(direct = "open", type = "norm"))
+                addAll(elseBranch.entries)
+                add(DfBracket(direct = "close", type = "norm"))
+            }
         }
 
     private fun lowerVarDecl(
@@ -1002,9 +1125,9 @@ private class FunctionLowering(
         }
     }
 
-    private fun ExpressionValue.requireType(expected: FlangType) {
+    private fun ExpressionValue.requireType(expected: FlangType, message: String? = null) {
         if (type != expected) {
-            throw FlangCompileException("Expected ${expected.sourceName} expression but got ${type.sourceName}.")
+            throw FlangCompileException(message ?: "Expected ${expected.sourceName} expression but got ${type.sourceName}.")
         }
     }
 
@@ -1119,6 +1242,18 @@ private class FunctionLowering(
     private fun returnBlock(): DfBlock =
         DfBlock(block = "control", action = "Return")
 
+    private fun ifVariableTruthyBlock(condition: DfItem): DfBlock =
+        DfBlock(
+            block = "if_var",
+            action = "!=",
+            args = DfArgs(
+                listOf(
+                    DfSlot(slot = 0, item = condition),
+                    DfSlot(slot = 1, item = DfNumber("0")),
+                ),
+            ),
+        )
+
     private fun setVariableActionBlock(name: String, action: String, values: List<DfItem>, tags: List<DfSlot> = emptyList()): DfBlock =
         DfBlock(
             block = "set_var",
@@ -1195,14 +1330,41 @@ private class FunctionLowering(
     private fun lowerEmit(
         emit: FlangParser.EmitStmtContext,
         symbols: Map<String, Symbol>,
+    ): DfEntry = lowerEmitBody(emit.emitBody(), symbols)
+
+    private fun lowerConditionEmit(
+        body: FlangParser.EmitBodyContext,
+        symbols: Map<String, Symbol>,
     ): DfBlock {
-        val publicBlockId = emit.Identifier().text
+        val entry = lowerEmitBody(body, symbols)
+        val block = entry as? DfBlock ?: throw ifEmitConditionException()
+        if (block.block !in conditionBlockIds) {
+            throw ifEmitConditionException()
+        }
+        return block
+    }
+
+    private fun lowerEmitBody(
+        body: FlangParser.EmitBodyContext,
+        symbols: Map<String, Symbol>,
+    ): DfEntry {
+        body.bracketEmit()?.let { return lowerBracketEmit(it) }
+        body.elseEmit()?.let { return DfBlock(block = "else") }
+
+        val regular = body.regularEmit()
+        val publicBlockId = regular.emitBlockId().text
+        if (publicBlockId == "bracket") {
+            throw bracketEmitSyntaxException()
+        }
+        if (publicBlockId == "else") {
+            throw FlangCompileException("Else emit syntax is emit `else`.")
+        }
         val blockId = resolveBlockId(publicBlockId)
-        val action = emit.StringLiteral()?.text?.decodeStringLiteral()
+        val action = regular.StringLiteral()?.text?.decodeStringLiteral()
         val args = mutableListOf<DfSlot>()
         var hasTagsClause = false
 
-        emit.emitClause().forEach { clause ->
+        regular.emitClause().forEach { clause ->
             clause.ARGS()?.let {
                 val emitArgs = clause.emitArgList()?.emitArg().orEmpty()
                 emitArgs.forEachIndexed { index, arg ->
@@ -1224,6 +1386,35 @@ private class FunctionLowering(
 
         return DfBlock(block = blockId, action = action, args = DfArgs(args.sortedBy { it.slot }))
     }
+
+    private fun ifEmitConditionException(): FlangCompileException =
+        FlangCompileException("if emit requires an if_player, if_entity, if_game, or if_variable emit block.")
+
+    private fun lowerBracketEmit(bracketEmit: FlangParser.BracketEmitContext): DfBracket {
+        if (bracketEmit.Identifier().text != "bracket") {
+            throw FlangCompileException("Unknown emit block '${bracketEmit.Identifier().text}'.")
+        }
+        if (bracketEmit.emitWord().size != 2 || bracketEmit.StringLiteral().isNotEmpty() || bracketEmit.emitClause().isNotEmpty()) {
+            throw bracketEmitSyntaxException()
+        }
+        val type = when (bracketEmit.emitWord(0).text) {
+            "if" -> "norm"
+            "repeat" -> "repeat"
+            else -> throw bracketEmitSyntaxException()
+        }
+        val direct = when (bracketEmit.emitWord(1).text) {
+            "open" -> "open"
+            "close" -> "close"
+            else -> throw bracketEmitSyntaxException()
+        }
+        return DfBracket(direct = direct, type = type)
+    }
+
+    private fun bracketEmitSyntaxException(): FlangCompileException =
+        FlangCompileException(
+            "Bracket emit syntax is emit `bracket if open`, emit `bracket if close`, " +
+                "emit `bracket repeat open`, or emit `bracket repeat close`.",
+        )
 
     private fun resolveBlockId(sourceId: String): String {
         if (sourceId in disallowedInternalIds) {

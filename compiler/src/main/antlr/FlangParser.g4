@@ -40,8 +40,9 @@ block
 
 stmt
   : emitStmt SEMI
-  | varDecl SEMI
+  | varDecl SEMI?
   | returnStmt SEMI
+  | ifEmitStmt
   | ifStmt
   | forStmt
   | whenStmt
@@ -61,7 +62,36 @@ exprStmt
   ;
 
 emitStmt
-  : EMIT BACKTICK Identifier StringLiteral? emitClause* BACKTICK
+  : EMIT BACKTICK emitBody BACKTICK
+  ;
+
+emitBody
+  : bracketEmit
+  | elseEmit
+  | regularEmit
+  ;
+
+regularEmit
+  : emitBlockId StringLiteral? emitClause*
+  ;
+
+elseEmit
+  : ELSE
+  ;
+
+bracketEmit
+  : Identifier emitWord emitWord (emitWord | StringLiteral | emitClause)*
+  ;
+
+emitBlockId
+  : Identifier
+  | ELSE
+  ;
+
+emitWord
+  : Identifier
+  | IF
+  | ELSE
   ;
 
 emitClause
@@ -97,7 +127,11 @@ emitTagOverride
   ;
 
 ifStmt
-  : IF LPAREN expr RPAREN block (ELSE (ifStmt | block))?
+  : IF LPAREN expr RPAREN block (ELSE (ifEmitStmt | ifStmt | block))?
+  ;
+
+ifEmitStmt
+  : IF EMIT BACKTICK emitBody BACKTICK block (ELSE (ifEmitStmt | ifStmt | block))?
   ;
 
 forStmt
