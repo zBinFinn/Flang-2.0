@@ -1633,14 +1633,28 @@ class FlangCompilerTest {
     }
 
     @Test
-    fun acceptsListGvalAsListAnyAndRejectsInvalidGvalCalls() {
+    fun appliesGameValueTypeOverridesAndRejectsInvalidGvalCalls() {
         FlangCompiler.compile(
             """
             fn Test() {
-              val bad: List<Any> = gval("Selection Target UUIDs", .Selection);
+              val selectionUuids: List<String> = gval("Selection Target UUIDs");
+              val plotUuids: List<String> = gval("Plot Player UUIDs");
+              val stillAssignableToAny: List<Any> = gval("Selection Target UUIDs");
+              val unlistedList: List<Any> = gval("Inventory Items", .Selection);
             }
             """.trimIndent(),
         )
+
+        val typeError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  val bad: List<Num> = gval("Selection Target UUIDs");
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(typeError.message!!.contains("Cannot assign List<String>"))
 
         assertTrue(
             assertFailsWith<FlangCompileException> {
@@ -1654,6 +1668,77 @@ class FlangCompilerTest {
                 )
             }.message!!.contains("compile-time SelectionType enum literal"),
         )
+    }
+
+    @Test
+    fun enforcesTargetlessPlotGameValueSyntax() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val uuids: List<String> = gval("Plot Player UUIDs");
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarGval(blocks[1].jsonObject, "uuids", "Plot Player UUIDs", "Default")
+
+        val unnecessaryTarget = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  val uuids = gval("Plot Player UUIDs", .Default);
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(unnecessaryTarget.message!!.contains("does not accept a SelectionType target"))
+
+        val missingTarget = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  val name = gval("Name");
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(missingTarget.message!!.contains("requires a SelectionType target"))
+    }
+
+    @Test
+    fun gameValueTypeOverridesAreExactNameOnlyAndValidated() {
+        val actionDump = ActionDump.parse(
+            text = """
+            {
+              "codeblocks": [],
+              "actions": [],
+              "gameValues": [
+                {
+                  "aliases": ["Alias List"],
+                  "category": "Entity Values",
+                  "icon": {
+                    "name": "Canonical List",
+                    "returnType": "LIST"
+                  }
+                }
+              ]
+            }
+            """.trimIndent(),
+            gameValueTypeOverridesText = """{"Canonical List":"List<String>"}""",
+        )
+
+        assertEquals("List<String>", actionDump.gameValueTypeOverride("Canonical List"))
+        assertEquals(null, actionDump.gameValueTypeOverride("Alias List"))
+        assertEquals("LIST", actionDump.gameValue("Alias List")!!.returnType)
+
+        val error = assertFailsWith<FlangCompileException> {
+            ActionDump.parse(
+                text = """{"codeblocks":[],"actions":[],"gameValues":[]}""",
+                gameValueTypeOverridesText = """{"Bad":"List<Player>"}""",
+            )
+        }
+        assertTrue(error.message!!.contains("Invalid game value type override for 'Bad'"))
     }
 
     @Test

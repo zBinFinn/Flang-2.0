@@ -792,6 +792,12 @@ private class FunctionLowering(
     private val implOverloadsByOwnerAndName: Map<Pair<String, String>, List<FunctionSignature>> =
         signatures.values.filter { it.owner != null }.groupBy { it.owner!! to it.name }
 
+    init {
+        actionDump.gameValueTypeOverrides().forEach { (name, type) ->
+            parseGameValueOverrideType(type, name)
+        }
+    }
+
     private val publicBlockIds = setOf(
         "event",
         "entity_event",
@@ -2104,7 +2110,7 @@ private class FunctionLowering(
                 "g_val",
                 buildJsonObject {
                     put("type", parsed.requestedName)
-                    put("target", parsed.selection.entry.name)
+                    put("target", parsed.target)
                 },
             ),
         )
@@ -2114,25 +2120,44 @@ private class FunctionLowering(
         if (call.baseName != null) {
             throw FlangCompileException("Built-in function 'gval' cannot be called as a member function.")
         }
-        if (call.args.size != 2) {
-            throw FlangCompileException("Built-in function 'gval' expects arguments (String, SelectionType).")
+        if (call.args.size !in 1..2) {
+            throw FlangCompileException("Built-in function 'gval' expects arguments (String) or (String, SelectionType).")
         }
         if (call.args.any { it.isMutableReference }) {
             throw FlangCompileException("Built-in function 'gval' does not accept mutable reference arguments.")
         }
         val requestedName = call.args[0].expr.compileTimeStringLiteral()
             ?: throw FlangCompileException("First argument of 'gval' must be a string literal game value name.")
-        val selection = call.args[1].expr.assignment().enumLiteralOrNull(FlangType.ENUM(SELECTION_TYPE_ENUM))
-            ?: throw FlangCompileException("Second argument of 'gval' must be a compile-time SelectionType enum literal.")
-        if (selection.enumName != SELECTION_TYPE_ENUM) {
-            throw FlangCompileException("Second argument of 'gval' must be a SelectionType enum literal.")
+        val gameValue = actionDump.gameValue(requestedName)
+        if (gameValue == null && requestedName != "Name") {
+            throw FlangCompileException("Unknown game value '$requestedName'.")
         }
-        val returnType = when (requestedName) {
-            "Name" -> FlangType.STRING
-            else -> actionDump.gameValue(requestedName)?.returnType?.toFlangGameValueType(requestedName)
-                ?: throw FlangCompileException("Unknown game value '$requestedName'.")
+        val isTargetless = gameValue?.category == "Plot Values"
+        if (isTargetless && call.args.size == 2) {
+            throw FlangCompileException("Game value '$requestedName' does not accept a SelectionType target.")
         }
-        return ParsedGvalCall(requestedName, selection, returnType)
+        if (!isTargetless && call.args.size == 1) {
+            throw FlangCompileException("Game value '$requestedName' requires a SelectionType target.")
+        }
+        val target = if (isTargetless) {
+            "Default"
+        } else {
+            val selection = call.args[1].expr.assignment().enumLiteralOrNull(FlangType.ENUM(SELECTION_TYPE_ENUM))
+                ?: throw FlangCompileException("Second argument of 'gval' must be a compile-time SelectionType enum literal.")
+            if (selection.enumName != SELECTION_TYPE_ENUM) {
+                throw FlangCompileException("Second argument of 'gval' must be a SelectionType enum literal.")
+            }
+            selection.entry.name
+        }
+        val overrideType = actionDump.gameValueTypeOverride(requestedName)
+        val returnType = if (overrideType != null) {
+            parseGameValueOverrideType(overrideType, requestedName)
+        } else if (requestedName == "Name") {
+            FlangType.STRING
+        } else {
+            gameValue!!.returnType.toFlangGameValueType(requestedName)
+        }
+        return ParsedGvalCall(requestedName, target, returnType)
     }
 
     private fun lowerFunctionCallToValue(
@@ -2851,7 +2876,7 @@ private data class SimpleCall(
 
 private data class ParsedGvalCall(
     val requestedName: String,
-    val selection: EnumValueRef,
+    val target: String,
     val returnType: FlangType,
 )
 
@@ -2908,6 +2933,37 @@ private fun parseSignatureType(text: String): FlangType =
         else -> FlangType.STRUCT(text)
     }
 
+private fun parseGameValueOverrideType(text: String, gameValueName: String): FlangType {
+    fun invalid(): Nothing =
+        throw FlangCompileException(
+            "Invalid game value type override for '$gameValueName': '$text'. " +
+                "Expected Any, Num, String, Text, Boolean, List<T>, or Dict<T>.",
+        )
+
+    fun parse(value: String): FlangType {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) invalid()
+        return when {
+            trimmed == "Any" -> FlangType.ANY
+            trimmed == "Num" -> FlangType.NUM
+            trimmed == "String" -> FlangType.STRING
+            trimmed == "Text" -> FlangType.TEXT
+            trimmed == "Boolean" -> FlangType.BOOLEAN
+            trimmed.startsWith("List<") && trimmed.endsWith(">") -> {
+                val inner = trimmed.substring("List<".length, trimmed.length - 1)
+                FlangType.LIST(parse(inner))
+            }
+            trimmed.startsWith("Dict<") && trimmed.endsWith(">") -> {
+                val inner = trimmed.substring("Dict<".length, trimmed.length - 1)
+                FlangType.DICT(parse(inner))
+            }
+            else -> invalid()
+        }
+    }
+
+    return parse(text)
+}
+
 private fun FlangType.isAssignableTo(expected: FlangType): Boolean =
     expected == FlangType.ANY ||
         this == expected ||
@@ -2943,6 +2999,7 @@ private fun String.toFlangGameValueType(gameValueName: String): FlangType =
         "TEXT" -> FlangType.STRING
         "COMPONENT" -> FlangType.TEXT
         "LIST" -> FlangType.LIST(FlangType.ANY)
+        "DICT" -> FlangType.DICT(FlangType.ANY)
         else -> throw FlangCompileException("Game value '$gameValueName' returns unsupported DiamondFire type '$this'.")
     }
 

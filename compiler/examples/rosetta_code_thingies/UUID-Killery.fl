@@ -1,0 +1,14 @@
+package main;
+
+import std.prelude;
+
+@Event
+fn join(var event: PlayerJoinEvent) {
+    val players = Plot.getAllPlayers();
+    for (var player in players) {
+        if (player.getUuid().endsWith("a")) {
+            player.damage(100000000);
+        }
+    }
+}
+

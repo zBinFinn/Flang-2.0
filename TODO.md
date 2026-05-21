@@ -1,7 +1,5 @@
 - Verify that importing specific functions works properly
 - Auto-completion for import pathing
 - Auto-completion for functions on structs
-- While, For and Foreach Loop
 - Interfaces
-- "Objects" basically just a collection of static functions, could be passed around as a dict that's literally just a $type for interface compat
 - Stdlib work -> interface that both Player and Entity implement called EntityOrPlayer or sm...

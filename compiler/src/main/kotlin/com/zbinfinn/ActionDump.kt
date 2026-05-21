@@ -9,16 +9,21 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 data class DfTagDefault(val name: String, val defaultOption: String, val slot: Int)
-data class DfGameValue(val name: String, val returnType: String)
+data class DfGameValue(val name: String, val returnType: String, val category: String)
 
 class ActionDump private constructor(
     private val codeblockNamesById: Map<String, String>,
     private val actionTags: Map<ActionKey, List<DfTagDefault>>,
     private val gameValuesByName: Map<String, DfGameValue>,
+    private val gameValueTypeOverrides: Map<String, String>,
 ) {
     fun codeblockName(blockId: String): String? = codeblockNamesById[blockId]
 
     fun gameValue(name: String): DfGameValue? = gameValuesByName[name]
+
+    fun gameValueTypeOverride(name: String): String? = gameValueTypeOverrides[name]
+
+    fun gameValueTypeOverrides(): Map<String, String> = gameValueTypeOverrides
 
     fun defaultTags(blockId: String, action: String): List<DfTagDefault> {
         val codeblockName = codeblockName(blockId) ?: return emptyList()
@@ -29,10 +34,15 @@ class ActionDump private constructor(
         fun loadFromResources(): ActionDump {
             val stream = ActionDump::class.java.classLoader.getResourceAsStream("action_dump.json")
                 ?: throw FlangCompileException("Missing action_dump.json resource.")
-            return stream.bufferedReader().use { parse(it.readText()) }
+            val overrides = ActionDump::class.java.classLoader.getResourceAsStream("game_value_type_overrides.json")
+                ?: throw FlangCompileException("Missing game_value_type_overrides.json resource.")
+            return parse(
+                text = stream.bufferedReader().use { it.readText() },
+                gameValueTypeOverridesText = overrides.bufferedReader().use { it.readText() },
+            )
         }
 
-        fun parse(text: String): ActionDump {
+        fun parse(text: String, gameValueTypeOverridesText: String? = null): ActionDump {
             val root = Json.parseToJsonElement(text).jsonObject
             val codeblocks = root.array("codeblocks")
                 .mapNotNull { element ->
@@ -58,12 +68,46 @@ class ActionDump private constructor(
                     val obj = element.jsonObject
                     val icon = obj["icon"]?.jsonObject ?: return@flatMap emptyList()
                     val name = icon.string("name")
-                    val value = DfGameValue(name = name, returnType = icon.string("returnType"))
+                    val value = DfGameValue(name = name, returnType = icon.string("returnType"), category = obj.string("category"))
                     (listOf(name) + obj.array("aliases").mapNotNull { it.jsonPrimitive.content.takeIf(String::isNotEmpty) })
                         .map { it to value }
                 }
                 .toMap()
-            return ActionDump(codeblocks, actionTags, gameValues)
+            return ActionDump(codeblocks, actionTags, gameValues, parseGameValueTypeOverrides(gameValueTypeOverridesText))
+        }
+
+        private fun parseGameValueTypeOverrides(text: String?): Map<String, String> {
+            if (text == null) return emptyMap()
+            val root = Json.parseToJsonElement(text).jsonObject
+            return root.mapValues { (name, value) ->
+                val primitive = value as? JsonPrimitive
+                    ?: throw FlangCompileException("Game value type override for '$name' must be a string.")
+                primitive.content
+            }.onEach { (name, type) ->
+                validateGameValueTypeOverride(name, type)
+            }
+        }
+
+        private fun validateGameValueTypeOverride(name: String, type: String) {
+            fun invalid(): Nothing =
+                throw FlangCompileException(
+                    "Invalid game value type override for '$name': '$type'. " +
+                        "Expected Any, Num, String, Text, Boolean, List<T>, or Dict<T>.",
+                )
+
+            fun validate(value: String) {
+                val trimmed = value.trim()
+                when {
+                    trimmed in setOf("Any", "Num", "String", "Text", "Boolean") -> return
+                    trimmed.startsWith("List<") && trimmed.endsWith(">") ->
+                        validate(trimmed.substring("List<".length, trimmed.length - 1))
+                    trimmed.startsWith("Dict<") && trimmed.endsWith(">") ->
+                        validate(trimmed.substring("Dict<".length, trimmed.length - 1))
+                    else -> invalid()
+                }
+            }
+
+            validate(type)
         }
     }
 }

@@ -1,0 +1,4 @@
+{
+  "Plot Player UUIDs": "List<String>",
+  "Selection Target UUIDs": "List<String>"
+}

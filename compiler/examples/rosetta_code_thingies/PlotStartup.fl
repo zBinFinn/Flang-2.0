@@ -1,0 +1,12 @@
+package main;
+
+import std.prelude;
+
+fn loadConstants() {
+
+}
+
+@Event
+fn startup(var event: PlotStartupEvent) {
+
+}
