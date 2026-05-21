@@ -713,7 +713,7 @@ object FlangCompiler {
             enums[SELECTION_TYPE_ENUM] = EnumDefinition(
                 SELECTION_TYPE_ENUM,
                 "",
-                listOf("Default", "Selection", "Victim", "Attacker").mapIndexed { index, name ->
+                listOf("Default", "Selection", "Victim", "Attacker", "LastEntity").mapIndexed { index, name ->
                     EnumEntry(name, index)
                 },
             )
@@ -981,6 +981,7 @@ private sealed class FlangType(open val sourceName: String) {
     data object STRING : FlangType("String")
     data object TEXT : FlangType("Text")
     data object BOOLEAN : FlangType("Boolean")
+    data object ITEM : FlangType("Item")
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
@@ -1030,6 +1031,10 @@ private sealed class FlangType(open val sourceName: String) {
                 BOOLEAN.sourceName -> {
                     if (args.isNotEmpty()) throw FlangCompileException("Type 'Boolean' does not accept type arguments.")
                     BOOLEAN
+                }
+                ITEM.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Item' does not accept type arguments.")
+                    ITEM
                 }
                 "List" -> {
                     if (args.size != 1) throw FlangCompileException("Type 'List' expects exactly one type argument.")
@@ -1296,10 +1301,11 @@ private class FunctionLowering(
             "var"
         } else {
             when (param.type) {
-                FlangType.ANY -> "var"
-                FlangType.NUM, FlangType.BOOLEAN -> "num"
-                FlangType.STRING -> "txt"
-                FlangType.TEXT -> "comp"
+                is FlangType.ANY -> "var"
+                is FlangType.NUM, FlangType.BOOLEAN -> "num"
+                is FlangType.STRING -> "txt"
+                is FlangType.TEXT -> "comp"
+                is FlangType.ITEM -> "item"
                 is FlangType.TYPE_PARAMETER -> "var"
                 is FlangType.LIST -> "var"
                 is FlangType.DICT -> "var"
@@ -3088,11 +3094,12 @@ private class FunctionLowering(
     private fun primitiveStructFieldPlaceholder(structName: String, field: StructField): DfItem? {
         val placeholder = structFieldPlaceholder(structName, field)
         return when (field.type) {
-            FlangType.ANY -> null
-            FlangType.NUM -> DfNumber(placeholder)
-            FlangType.STRING -> DfText(placeholder)
-            FlangType.TEXT -> DfComponent(placeholder)
-            FlangType.BOOLEAN -> DfNumber(placeholder)
+            is FlangType.ANY -> null
+            is FlangType.NUM -> DfNumber(placeholder)
+            is FlangType.STRING -> DfText(placeholder)
+            is FlangType.TEXT -> DfComponent(placeholder)
+            is FlangType.BOOLEAN -> DfNumber(placeholder)
+            is FlangType.ITEM -> null
             is FlangType.TYPE_PARAMETER -> null
             is FlangType.LIST -> null
             is FlangType.DICT -> null

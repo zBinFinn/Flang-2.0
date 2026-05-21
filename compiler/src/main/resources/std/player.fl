@@ -11,11 +11,11 @@ impl Player {
         }
     }
 
-    inline fn select(this) {
+    private inline fn select(this) {
         emit `select_object "PlayerName" args($this.uuid$)`;
     }
 
-    inline fn deselect(this) {
+    private inline fn deselect(this) {
         emit `select_object "Reset"`;
     }
 
@@ -35,6 +35,12 @@ impl Player {
     inline fn sendMessage(this, message: Text) {
         this.select();
         emit `player_action "SendMessage" args($message$) tags(..)`;
+        this.deselect();
+    }
+
+    inline fn giveItem(var this, item: Item) {
+        this.select();
+        emit `player_action "GiveItems" args($item$)`;
         this.deselect();
     }
 }

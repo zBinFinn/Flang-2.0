@@ -1,5 +1,6 @@
 package std;
 
 import std.Player;
+import std.Entity;
 import std.Collections;
 import std.events.PlayerEvents;

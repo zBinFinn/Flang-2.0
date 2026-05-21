@@ -365,7 +365,7 @@ object FlangFrontend {
             FlangEnumDefinition(
                 SELECTION_TYPE_ENUM,
                 "",
-                listOf("Default", "Selection", "Victim", "Attacker").mapIndexed { index, name -> FlangEnumEntry(name, index) },
+                listOf("Default", "Selection", "Victim", "Attacker", "LastEntity").mapIndexed { index, name -> FlangEnumEntry(name, index) },
             ),
         )
         return enums
