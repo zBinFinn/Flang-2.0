@@ -36,3 +36,4 @@ plugins {
 rootProject.name = "Flang2.0"
 include("compiler")
 include("FlangMod")
+include("intellij-plugin")

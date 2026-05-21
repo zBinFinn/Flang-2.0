@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>com.zbinfinn.flang</id>
+    <name>Flang</name>
+    <vendor>zBinFinn</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileType
+            name="Flang"
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangFileType"
+            fieldName="INSTANCE"
+            extensions="fl;fli"/>
+        <lang.parserDefinition
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangParserDefinition"/>
+        <lang.syntaxHighlighterFactory
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangSyntaxHighlighterFactory"/>
+        <lang.braceMatcher
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangBraceMatcher"/>
+        <annotator
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangSemanticAnnotator"/>
+        <completion.contributor
+            language="Flang"
+            implementationClass="com.zbinfinn.flangidea.FlangCompletionContributor"/>
+    </extensions>
+</idea-plugin>

@@ -5,6 +5,12 @@ struct Player {
 }
 
 impl Player {
+    inline fn default() -> Player {
+        return Player {
+            uuid: gval("UUID", .Default)
+        }
+    }
+
     inline fn select(this) {
         emit `select_object "PlayerName" args($this.uuid$)`;
     }

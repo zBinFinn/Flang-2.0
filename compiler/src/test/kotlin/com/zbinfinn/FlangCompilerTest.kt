@@ -270,6 +270,176 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersWhileAsForeverLoopWithFalseConditionGuard() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              var i = 0;
+              while (i < 3) {
+                i = i + 1;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertRepeat(blocks[2].jsonObject, "Forever")
+        assertBracket(blocks[3].jsonObject, "open", "repeat")
+        assertSetVar(blocks[4].jsonObject, "${ '$' }flang_tmp_0", "num", "0")
+        assertBlock(blocks[5].jsonObject, "if_var")
+        assertEquals("<", blocks[5].jsonObject["action"]!!.jsonPrimitive.content)
+        assertBlock(blocks[9].jsonObject, "if_var")
+        assertEquals("=", blocks[9].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSlotItem(blocks[9].jsonObject, 0, "var", "${ '$' }flang_tmp_0")
+        assertSlotItem(blocks[9].jsonObject, 1, "num", "0")
+        assertEquals("StopRepeat", blocks[11].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSetVarAction(blocks[13].jsonObject, "i", "+")
+        assertBracket(blocks[14].jsonObject, "close", "repeat")
+    }
+
+    @Test
+    fun lowersTraditionalForAsForeverLoopWithInitGuardBodyAndUpdate() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              for (var i = 0; i < 3; i = i + 1) {
+                val copy = i;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVar(blocks[1].jsonObject, "i", "num", "0")
+        assertRepeat(blocks[2].jsonObject, "Forever")
+        assertBlock(blocks[5].jsonObject, "if_var")
+        assertEquals("<", blocks[5].jsonObject["action"]!!.jsonPrimitive.content)
+        assertEquals("StopRepeat", blocks[11].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSetVar(blocks[13].jsonObject, "copy", "var", "i")
+        assertSetVarAction(blocks[14].jsonObject, "i", "+")
+        assertBracket(blocks[15].jsonObject, "close", "repeat")
+    }
+
+    @Test
+    fun lowersInfiniteForWithoutCondition() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              for (;;) {
+                val x = 1;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertRepeat(blocks[1].jsonObject, "Forever")
+        assertBracket(blocks[2].jsonObject, "open", "repeat")
+        assertSetVar(blocks[3].jsonObject, "x", "num", "1")
+        assertBracket(blocks[4].jsonObject, "close", "repeat")
+    }
+
+    @Test
+    fun lowersForeachAndScopesLoopVariable() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              var nums: List<Num>;
+              for (val x in nums) {
+                val copy = x;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertRepeat(blocks[1].jsonObject, "ForEach")
+        assertSlotItem(blocks[1].jsonObject, 0, "var", "x")
+        assertSlotItem(blocks[1].jsonObject, 1, "var", "nums")
+        assertSetVar(blocks[3].jsonObject, "copy", "var", "x")
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  var nums: List<Num>;
+                  for (val x in nums) {
+                  }
+                  val outside = x;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(error.message!!.contains("Unknown local 'x'"))
+    }
+
+    @Test
+    fun validatesForeachTypesAndMutability() {
+        FlangCompiler.compile(
+            """
+            fn Test() {
+              var nums: List<Num>;
+              for (var x: Num in nums) {
+                x = x + 1;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val immutableError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  var nums: List<Num>;
+                  for (val x in nums) {
+                    x = 1;
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(immutableError.message!!.contains("immutable val 'x'"))
+
+        val typeError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  var nums: List<Num>;
+                  for (val x: String in nums) {
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(typeError.message!!.contains("Cannot iterate List<Num>"))
+    }
+
+    @Test
+    fun lowersComparisonsAsBooleanValues() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val ok = 1 <= 2;
+              if (ok != false) {
+                val yes = true;
+              }
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVar(blocks[1].jsonObject, "ok", "num", "0")
+        assertBlock(blocks[2].jsonObject, "if_var")
+        assertEquals("<=", blocks[2].jsonObject["action"]!!.jsonPrimitive.content)
+        assertSetVar(blocks[4].jsonObject, "ok", "num", "1")
+        assertSetVar(blocks[6].jsonObject, "${ '$' }flang_tmp_0", "num", "0")
+        assertBlock(blocks[7].jsonObject, "if_var")
+        assertEquals("!=", blocks[7].jsonObject["action"]!!.jsonPrimitive.content)
+        assertBlock(blocks[11].jsonObject, "if_var")
+        assertSlotItem(blocks[11].jsonObject, 0, "var", "${ '$' }flang_tmp_0")
+    }
+
+    @Test
     fun validatesReturnsAcrossIfBranches() {
         FlangCompiler.compile(
             """
@@ -1463,17 +1633,13 @@ class FlangCompilerTest {
     }
 
     @Test
-    fun rejectsInvalidGvalCalls() {
-        assertTrue(
-            assertFailsWith<FlangCompileException> {
-                FlangCompiler.compile(
-                    """
-                    fn Test() {
-                      val bad = gval("Selection Target UUIDs", .Selection);
-                    }
-                    """.trimIndent(),
-                )
-            }.message!!.contains("unsupported DiamondFire type 'LIST'"),
+    fun acceptsListGvalAsListAnyAndRejectsInvalidGvalCalls() {
+        FlangCompiler.compile(
+            """
+            fn Test() {
+              val bad: List<Any> = gval("Selection Target UUIDs", .Selection);
+            }
+            """.trimIndent(),
         )
 
         assertTrue(
@@ -1488,6 +1654,73 @@ class FlangCompilerTest {
                 )
             }.message!!.contains("compile-time SelectionType enum literal"),
         )
+    }
+
+    @Test
+    fun lowersGenericIdentityAndListStdlibMethods() {
+        val result = FlangCompiler.compileFile(writeTempSource(
+            """
+            package main;
+            import std.prelude;
+
+            inline fn <T> id(value: T) -> T {
+              return value;
+            }
+
+            fn Main() {
+              val empty: List<Num> = List.of();
+              var nums = List.of(1, 2, 3);
+              nums.append(id(4));
+              val first: Num = nums.get(1);
+              nums.set(2, first);
+              val length: Num = nums.length();
+              val anyList: List<Any> = nums;
+            }
+            """.trimIndent(),
+        ))
+
+        val blocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "main.Main()" }.templateJson)
+            .jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "CreateList" })
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "AppendValue" })
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "GetListValue" })
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "SetListValue" })
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "ListLength" })
+    }
+
+    @Test
+    fun lowersDictStdlibMethodsAndRejectsBadCollectionTypes() {
+        FlangCompiler.compileFile(writeTempSource(
+            """
+            package main;
+            import std.prelude;
+
+            fn Main() {
+              var dict = Dict<Num>.new();
+              dict.set("a", 1);
+              val value: Num = dict.get("a");
+              val keys: List<String> = dict.keys();
+              val values: List<Num> = dict.values();
+              val size: Num = dict.size();
+              val anyDict: Dict<Any> = dict;
+            }
+            """.trimIndent(),
+        ))
+
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compileFile(writeTempSource(
+                """
+                package main;
+                import std.prelude;
+
+                fn Main() {
+                  var nums = List.of(1);
+                  nums.append("bad");
+                }
+                """.trimIndent(),
+            ))
+        }
+        assertTrue(error.message!!.contains("No overload") || error.message!!.contains("Cannot pass"))
     }
 
     @Test
@@ -1918,6 +2151,14 @@ class FlangCompilerTest {
         assertEquals(blockName, block["block"]!!.jsonPrimitive.content)
     }
 
+    private fun assertRepeat(
+        block: kotlinx.serialization.json.JsonObject,
+        action: String,
+    ) {
+        assertBlock(block, "repeat")
+        assertEquals(action, block["action"]!!.jsonPrimitive.content)
+    }
+
     private fun assertBracket(
         block: kotlinx.serialization.json.JsonObject,
         direct: String,
@@ -2001,6 +2242,13 @@ class FlangCompilerTest {
         assertEquals("bl_tag", item["id"]!!.jsonPrimitive.content)
         assertEquals(tag, data["tag"]!!.jsonPrimitive.content)
         assertEquals(option, data["option"]!!.jsonPrimitive.content)
+    }
+
+    private fun writeTempSource(source: String): java.nio.file.Path {
+        val root = Files.createTempDirectory("flang-source")
+        val path = root.resolve("main.fl")
+        Files.writeString(path, source)
+        return path
     }
 
     private fun decodeTemplateJson(nbt: String): String {

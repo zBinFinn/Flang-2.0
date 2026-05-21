@@ -1,15 +1,17 @@
+package main;
+
 import std.prelude;
 
-fn defaultPlayer() -> Player {
-    return Player {
-        uuid: gval("UUID", .Default)
-    }
-}
-
 fn testPlayer() {
-    var player = defaultPlayer();
+    var player = Player.default();
     player.damage(5);
     val name = player.getName();
+
+    val str = "Hello";
+    val text = s"<green>Hello";
+
+    var players = List.of(player);
+    players.append(player);
 
     emit `player_action "SendMessage" args($name$) tags(..)`;
 }

@@ -382,26 +382,49 @@ fn mapNumToNum(list: List<Num>, map: fn(Num) -> Num) -> List<Num> {
 
 = Generics
 ```rust
-fn <_From, _To> map(list: List<_From>, map: fn(_From) -> _To) -> List<_To> {
-  var newList = List<_To>.new();
-  for (element in list) {
-    newList.append(map(element));
-  }
-  return newList;
+inline fn <T> id(value: T) -> T {
+  return value;
 }
 
-val from = listOf(
-  (1, "Hello"),
-  (2, "Bye")
-);
-
-val mapper: fn(Num, String) -> String = fn(num: Num, string: String) -> String {
-  return string.repeat(num);
-}
-
-val to = map(from, mapper);
-// ["Hello", "ByeBye"]
+val num = id(1); // Num
+val text = id("hello"); // String
 ```
+
+Generic function type parameters are compile-time only. `Any` is the top type:
+any value can be passed where `Any` is expected. `List<T>` is assignable to
+`List<Any>`, and `Dict<T>` is assignable to `Dict<Any>`, but the reverse is not
+accepted in this pass.
+
+= Lists and Dictionaries
+```rust
+import std.prelude;
+
+fn example() {
+  val empty: List<Num> = List.of();
+  var nums = List.of(1, 2, 3);
+  nums.append(4);
+  val first: Num = nums.get(1);
+  nums.set(2, first);
+  val length: Num = nums.length();
+
+  var dict = Dict<Num>.new();
+  dict.set("money", 5);
+  val money: Num = dict.get("money");
+  val keys: List<String> = dict.keys();
+  val values: List<Num> = dict.values();
+  val size: Num = dict.size();
+}
+```
+
+`List<T>` and `Dict<T>` are compiler-known erased collection types. Their
+runtime representation is DiamondFire's native list/dictionary value; element
+types are enforced by the compiler only. `Dict<T>` uses `String` keys in this
+pass.
+
+The stdlib collection methods are regular Flang functions implemented with
+`emit`, not compiler-intrinsic collection operations. `List.of` is currently
+provided as fixed overloads from 0 through 10 arguments; true varargs are a
+future language feature.
 
 #pagebreak()
 

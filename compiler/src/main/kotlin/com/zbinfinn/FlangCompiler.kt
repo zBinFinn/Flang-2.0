@@ -137,7 +137,7 @@ object FlangCompiler {
         units.firstOrNull()?.takeIf { it.kind == SourceKind.FL }?.let { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    lowerSignature(lowering.signatureForDeclaration(function, owner = null, packageName = unit.packageName))
+                    lowerSignature(lowering.signatureForDeclaration(function, owner = extensionOwner(function, structs, enums), packageName = unit.packageName))
                 }
                 item.implDecl()?.let { impl ->
                     impl.functionDecl().forEach { function ->
@@ -344,7 +344,7 @@ object FlangCompiler {
         units.filter { it.kind == SourceKind.FL }.forEach { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    registerFunctionSignature(signatures, function, owner = null, packageName = unit.packageName, structs = structs, enums = enums)
+                    registerFunctionSignature(signatures, function, owner = extensionOwner(function, structs, enums), packageName = unit.packageName, structs = structs, enums = enums)
                 }
                 item.implDecl()?.let { impl ->
                     val owner = impl.Identifier().text
@@ -369,17 +369,19 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
     ) {
-        val name = function.Identifier().text
+        val name = function.declaredName()
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums)
         if (owner == null && signatures.containsKey(name)) {
             throw FlangCompileException("Duplicate function '$name'.")
         }
-        val params = parseFunctionParameters(function, owner, structs, enums)
+        val params = parseFunctionParameters(function, owner, structs, enums, typeParameters)
         val signature = FunctionSignature(
             name = name,
             owner = owner,
             packageName = packageName,
             params = params,
-            returnType = function.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums) },
+            returnType = function.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums, typeParameters) },
+            typeParameters = typeParameters,
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
             isPrivate = function.PRIVATE() != null,
@@ -398,8 +400,9 @@ object FlangCompiler {
         units.filter { it.kind == SourceKind.FL }.forEach { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    val signature = signatureForFunctionDeclaration(function, owner = null, packageName = unit.packageName, signatures)
-                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = null, packageName = unit.packageName)
+                    val owner = function.functionName().typeRef()?.text
+                    val signature = signatureForFunctionDeclaration(function, owner = owner, packageName = unit.packageName, signatures)
+                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName)
                 }
                 item.implDecl()?.let { impl ->
                     val owner = impl.Identifier().text
@@ -419,7 +422,7 @@ object FlangCompiler {
         packageName: String,
         signatures: Map<String, FunctionSignature>,
     ): FunctionSignature {
-        val name = function.Identifier().text
+        val name = function.declaredName()
         val parameterTypes = function.paramList()?.param().orEmpty()
             .mapIndexed { index, param ->
                 if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
@@ -439,8 +442,9 @@ object FlangCompiler {
         owner: String?,
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
+        typeParameters: Set<String>,
     ): List<FunctionParameter> {
-        val functionName = function.Identifier().text
+        val functionName = function.declaredName()
         val paramNames = mutableSetOf<String>()
         return function.paramList()?.param().orEmpty().mapIndexed { index, param ->
             val paramName = param.Identifier().text
@@ -459,13 +463,13 @@ object FlangCompiler {
                 if (index != 0) {
                     throw FlangCompileException("Receiver parameter 'this' must be the first parameter.")
                 }
-                if (owner !in structs) {
+                if (owner !in structs && !owner.startsWith("List<") && !owner.startsWith("Dict<")) {
                     throw FlangCompileException("Object impl '$owner' cannot declare receiver parameter 'this'.")
                 }
                 FunctionParameter(
                     name = paramName,
                     mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
-                    type = FlangType.STRUCT(owner),
+                    type = parseSignatureType(owner),
                 )
             } else {
                 if (owner != null && paramName == "this") {
@@ -474,10 +478,41 @@ object FlangCompiler {
                 FunctionParameter(
                     name = paramName,
                     mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
-                    type = FlangType.fromTypeRef(typeRef, structs, enums),
+                    type = FlangType.fromTypeRef(typeRef, structs, enums, typeParameters),
                 )
             }
         }
+    }
+
+    private fun FlangParser.FunctionDeclContext.declaredName(): String =
+        functionName().Identifier().text
+
+    private fun FlangParser.FunctionDeclContext.genericTypeParameters(): Set<String> =
+        genericParamList()?.Identifier().orEmpty().map { it.text }.toSet()
+
+    private fun extensionOwner(
+        function: FlangParser.FunctionDeclContext,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+    ): String? {
+        val typeRef = function.functionName().typeRef() ?: return null
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(typeRef, structs, enums)
+        return FlangType.fromTypeRef(typeRef, structs, enums, typeParameters).sourceName
+    }
+
+    private fun implicitOwnerTypeParameters(
+        typeRef: FlangParser.TypeRefContext?,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+    ): Set<String> {
+        if (typeRef == null) return emptySet()
+        val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+        known += structs.keys
+        known += enums.keys
+        return typeRef.text
+            .split(Regex("[^A-Za-z_0-9]+"))
+            .filter { it.isNotBlank() && it !in known }
+            .toSet()
     }
 
     private fun parse(source: String): FlangParser.FileContext {
@@ -582,12 +617,19 @@ private data class FunctionSignature(
     val packageName: String,
     val params: List<FunctionParameter>,
     val returnType: FlangType?,
+    val typeParameters: Set<String> = emptySet(),
+    val typeBindings: Map<String, FlangType> = emptyMap(),
     val hasReceiver: Boolean = false,
     val isInline: Boolean = false,
     val isPrivate: Boolean = false,
+    val callIdentifierOverride: String? = null,
 ) {
     val sourceName: String = owner?.let { "$it.$name" } ?: name
-    val fullIdentifier: String = "${if (packageName.isEmpty()) sourceName else "$packageName.$sourceName"}(${params.joinToString(",") { it.type.sourceName }})"
+    val fullIdentifier: String
+        get() = callIdentifierOverride
+            ?: "${if (packageName.isEmpty()) sourceName else "$packageName.$sourceName"}(${params.joinToString(",") { it.type.sourceName }})"
+    val declarationIdentifier: String =
+        "${if (packageName.isEmpty()) sourceName else "$packageName.$sourceName"}(${params.joinToString(",") { it.type.sourceName }})"
 }
 
 private data class FunctionParameter(val name: String, val mutability: Mutability, val type: FlangType)
@@ -600,31 +642,78 @@ private enum class Mutability {
 }
 
 private sealed class FlangType(open val sourceName: String) {
+    data object ANY : FlangType("Any")
     data object NUM : FlangType("Num")
     data object STRING : FlangType("String")
     data object TEXT : FlangType("Text")
     data object BOOLEAN : FlangType("Boolean")
+    data class TYPE_PARAMETER(val name: String) : FlangType(name)
+    data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
+    data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
     data class STRUCT(val name: String) : FlangType(name)
     data class ENUM(val name: String) : FlangType(name)
 
     val isPrimitive: Boolean
         get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN
 
+    val isVariableBacked: Boolean
+        get() = this == ANY || this is STRUCT || this is ENUM || this is LIST || this is DICT || this is TYPE_PARAMETER
+
     companion object {
         fun fromTypeRef(
             typeRef: FlangParser.TypeRefContext,
             structs: Map<String, StructDefinition>,
             enums: Map<String, EnumDefinition>,
+            typeParameters: Set<String> = emptySet(),
         ): FlangType {
-            val text = typeRef.text
-            return when (text) {
-                NUM.sourceName -> NUM
-                STRING.sourceName -> STRING
-                TEXT.sourceName -> TEXT
-                BOOLEAN.sourceName -> BOOLEAN
-                else -> if (structs.containsKey(text)) STRUCT(text)
-                else if (enums.containsKey(text)) ENUM(text)
-                else throw FlangCompileException("Unsupported type '$text'. Expected Num, String, Text, Boolean, a known struct, or a known enum.")
+            typeRef.tupleType()?.let {
+                throw FlangCompileException("Tuple types are not supported in this compiler pass.")
+            }
+            val simple = typeRef.simpleType()
+            val name = simple.Identifier().text
+            val args = simple.typeRef().map { fromTypeRef(it, structs, enums, typeParameters) }
+            return when (name) {
+                ANY.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Any' does not accept type arguments.")
+                    ANY
+                }
+                NUM.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Num' does not accept type arguments.")
+                    NUM
+                }
+                STRING.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'String' does not accept type arguments.")
+                    STRING
+                }
+                TEXT.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Text' does not accept type arguments.")
+                    TEXT
+                }
+                BOOLEAN.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Boolean' does not accept type arguments.")
+                    BOOLEAN
+                }
+                "List" -> {
+                    if (args.size != 1) throw FlangCompileException("Type 'List' expects exactly one type argument.")
+                    LIST(args.single())
+                }
+                "Dict" -> {
+                    if (args.size != 1) throw FlangCompileException("Type 'Dict' expects exactly one type argument.")
+                    DICT(args.single())
+                }
+                in typeParameters -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type parameter '$name' does not accept type arguments.")
+                    TYPE_PARAMETER(name)
+                }
+                else -> if (structs.containsKey(name)) {
+                    if (args.isNotEmpty()) throw FlangCompileException("Struct '$name' does not accept type arguments.")
+                    STRUCT(name)
+                } else if (enums.containsKey(name)) {
+                    if (args.isNotEmpty()) throw FlangCompileException("Enum '$name' does not accept type arguments.")
+                    ENUM(name)
+                } else {
+                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, List<T>, Dict<T>, a known struct, a known enum, or an in-scope type parameter.")
+                }
             }
         }
     }
@@ -740,7 +829,7 @@ private class FunctionLowering(
         packageName: String = "",
     ): LoweredFunction {
         tempCounter = 0
-        val functionName = function.Identifier().text
+        val functionName = function.declaredName()
         val signature = signatureForDeclaration(function, owner, packageName)
         val previousPackage = currentPackage
         currentPackage = signature.packageName
@@ -792,13 +881,14 @@ private class FunctionLowering(
     }
 
     fun signatureForDeclaration(function: FlangParser.FunctionDeclContext, owner: String?, packageName: String = ""): FunctionSignature {
-        val name = function.Identifier().text
+        val name = function.declaredName()
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums)
         val parameterTypes = function.paramList()?.param().orEmpty()
             .mapIndexed { index, param ->
                 if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
                     owner
                 } else {
-                    FlangType.fromTypeRef(param.typeRef(), structs, enums).sourceName
+                    FlangType.fromTypeRef(param.typeRef(), structs, enums, typeParameters).sourceName
                 }
             }
             .joinToString(",")
@@ -836,13 +926,17 @@ private class FunctionLowering(
     }
 
     private fun parameterElementType(param: FunctionParameter): String =
-        if (param.mutability == Mutability.MUTABLE || param.type is FlangType.STRUCT || param.type is FlangType.ENUM) {
+        if (param.mutability == Mutability.MUTABLE || param.type.isVariableBacked) {
             "var"
         } else {
             when (param.type) {
+                FlangType.ANY -> "var"
                 FlangType.NUM, FlangType.BOOLEAN -> "num"
                 FlangType.STRING -> "txt"
                 FlangType.TEXT -> "comp"
+                is FlangType.TYPE_PARAMETER -> "var"
+                is FlangType.LIST -> "var"
+                is FlangType.DICT -> "var"
                 is FlangType.STRUCT -> "var"
                 is FlangType.ENUM -> "var"
             }
@@ -875,8 +969,10 @@ private class FunctionLowering(
             stmt.returnStmt() != null -> lowerReturn(stmt.returnStmt(), symbols, context)
             stmt.ifEmitStmt() != null -> lowerIfEmit(stmt.ifEmitStmt(), symbols, context)
             stmt.ifStmt() != null -> lowerIf(stmt.ifStmt(), symbols, context)
+            stmt.forStmt() != null -> lowerFor(stmt.forStmt(), symbols, context)
+            stmt.whileStmt() != null -> lowerWhile(stmt.whileStmt(), symbols, context)
             stmt.exprStmt() != null -> lowerExprStmt(stmt.exprStmt(), symbols)
-            else -> throw FlangCompileException("Raw Emit V1 only supports emit, if, val/var, reassignment, return, and function calls inside functions.")
+            else -> throw FlangCompileException("Raw Emit V1 only supports emit, if, for, while, val/var, reassignment, return, and function calls inside functions.")
         }
 
     private fun lowerBlock(
@@ -1003,26 +1099,134 @@ private class FunctionLowering(
             }
         }
 
+    private fun lowerWhile(
+        whileStmt: FlangParser.WhileStmtContext,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val body = lowerBlock(whileStmt.block(), symbols, context)
+        return buildForeverLoopEntries(
+            guard = falseConditionStopGuard(whileStmt.expr(), symbols),
+            body = body.entries,
+        )
+    }
+
+    private fun lowerFor(
+        forStmt: FlangParser.ForStmtContext,
+        symbols: MutableMap<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        forStmt.foreachHeader()?.let { return lowerForeach(it, forStmt.block(), symbols, context) }
+        val header = forStmt.traditionalForHeader()
+            ?: throw FlangCompileException("Unsupported for loop header.")
+        val loopSymbols = LinkedHashMap(symbols)
+        val entries = mutableListOf<DfEntry>()
+        header.traditionalForInit()?.let { init ->
+            entries += when {
+                init.varDecl() != null -> lowerVarDecl(init.varDecl(), loopSymbols, context)
+                init.expr() != null -> lowerExpressionStatement(init.expr(), loopSymbols)
+                else -> emptyList()
+            }
+        }
+        val body = lowerBlock(forStmt.block(), loopSymbols, context)
+        val update = header.traditionalForUpdate()?.expr()?.let { lowerExpressionStatement(it, loopSymbols) }.orEmpty()
+        entries += buildForeverLoopEntries(
+            guard = header.traditionalForCondition()?.expr()?.let { falseConditionStopGuard(it, loopSymbols) }.orEmpty(),
+            body = body.entries + update,
+        )
+        return entries
+    }
+
+    private fun lowerForeach(
+        header: FlangParser.ForeachHeaderContext,
+        block: FlangParser.BlockContext,
+        symbols: Map<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val iterable = lowerAssignmentToValue(header.expr().assignment(), symbols)
+        val listType = iterable.type as? FlangType.LIST
+            ?: throw FlangCompileException("foreach loop requires a List<T> iterable but got ${iterable.type.sourceName}.")
+        val explicitType = header.typeRef()?.let {
+            FlangType.fromTypeRef(it, structs, enums, context.signature.typeParameters)
+                .substitute(context.signature.typeBindings)
+        }
+        val itemType = explicitType ?: listType.elementType
+        if (!listType.elementType.isAssignableTo(itemType)) {
+            throw FlangCompileException("Cannot iterate ${listType.sourceName} with loop variable '${header.Identifier().text}' declared as ${itemType.sourceName}.")
+        }
+        val loopSymbols = LinkedHashMap(symbols)
+        val sourceName = header.Identifier().text
+        val physicalName = context.physicalLocalName(sourceName)
+        declareSymbol(
+            symbols = loopSymbols,
+            name = sourceName,
+            mutability = if (header.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
+            type = itemType,
+            physicalName = physicalName,
+        )
+        val body = lowerBlock(block, loopSymbols, context)
+        return iterable.prelude +
+            repeatForEachBlock(physicalName, iterable.item) +
+            DfBracket(direct = "open", type = "repeat") +
+            body.entries +
+            DfBracket(direct = "close", type = "repeat")
+    }
+
+    private fun buildForeverLoopEntries(
+        guard: List<DfEntry>,
+        body: List<DfEntry>,
+    ): List<DfEntry> =
+        listOf(repeatForeverBlock(), DfBracket(direct = "open", type = "repeat")) +
+            guard +
+            body +
+            DfBracket(direct = "close", type = "repeat")
+
+    private fun falseConditionStopGuard(
+        conditionExpr: FlangParser.ExprContext,
+        symbols: Map<String, Symbol>,
+    ): List<DfEntry> {
+        val condition = lowerAssignmentToValue(conditionExpr.assignment(), symbols)
+        condition.requireType(FlangType.BOOLEAN, "loop condition must be Boolean")
+        return condition.prelude +
+            ifVariableEqualsBlock(condition.item, DfNumber("0")) +
+            DfBracket(direct = "open", type = "norm") +
+            stopRepeatBlock() +
+            DfBracket(direct = "close", type = "norm")
+    }
+
     private fun lowerVarDecl(
         varDecl: FlangParser.VarDeclContext,
         symbols: MutableMap<String, Symbol>,
         context: FunctionContext,
     ): List<DfEntry> {
         val name = varDecl.Identifier().text
-        if (varDecl.expr() == null) {
-            throw FlangCompileException("Local '$name' requires an initializer in this compiler pass.")
-        }
         if (symbols.containsKey(name)) {
             throw FlangCompileException("Duplicate local symbol '$name'.")
         }
         if (name.startsWith(TEMP_PREFIX)) {
             throw FlangCompileException("Local symbol '$name' uses reserved compiler prefix '$TEMP_PREFIX'.")
         }
-        val explicitType = varDecl.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums) }
+        val explicitType = varDecl.typeRef()?.let {
+            FlangType.fromTypeRef(it, structs, enums, context.signature.typeParameters)
+                .substitute(context.signature.typeBindings)
+        }
         val physicalName = context.physicalLocalName(name)
-        val target = lowerExpressionToTarget(varDecl.expr(), physicalName, symbols, explicitType)
+        val expr = varDecl.expr()
+        if (expr == null) {
+            val type = explicitType
+                ?: throw FlangCompileException("Local '$name' requires a type when declared without an initializer.")
+            declareSymbol(
+                symbols = symbols,
+                name = name,
+                mutability = if (varDecl.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
+                type = type,
+                physicalName = physicalName,
+            )
+            return emptyList()
+        }
+        val target = lowerExpressionToTarget(expr, physicalName, symbols, explicitType)
         val type = explicitType ?: target.type
-        if (explicitType != null && explicitType != target.type) {
+        if (explicitType != null && !target.type.isAssignableTo(explicitType)) {
             throw FlangCompileException("Cannot assign ${target.type.sourceName} to '$name' declared as ${explicitType.sourceName}.")
         }
         declareSymbol(
@@ -1038,8 +1242,13 @@ private class FunctionLowering(
     private fun lowerExprStmt(
         exprStmt: FlangParser.ExprStmtContext,
         symbols: MutableMap<String, Symbol>,
+    ): List<DfEntry> = lowerExpressionStatement(exprStmt.expr(), symbols)
+
+    private fun lowerExpressionStatement(
+        expr: FlangParser.ExprContext,
+        symbols: MutableMap<String, Symbol>,
     ): List<DfEntry> {
-        val assignment = exprStmt.expr().assignment()
+        val assignment = expr.assignment()
         if (assignment.EQ() != null) {
             val memberTarget = assignment.logicalOr().memberAccessOrNull()
             if (memberTarget != null) {
@@ -1056,7 +1265,7 @@ private class FunctionLowering(
                     throw FlangCompileException("Field '${memberTarget.field}' of struct '${structType.name}' is private.")
                 }
                 val value = lowerAssignmentToValue(assignment.assignment(), symbols, field.type)
-                if (value.type != field.type) {
+                if (!value.type.isAssignableTo(field.type)) {
                     throw FlangCompileException("Cannot assign ${value.type.sourceName} to '${memberTarget.base}.${field.name}' of type ${field.type.sourceName}.")
                 }
                 return value.prelude + setStructFieldBlock(base.name, field, value.item)
@@ -1070,7 +1279,7 @@ private class FunctionLowering(
                 throw FlangCompileException("Cannot reassign immutable val '$targetName'.")
             }
             val lowered = lowerAssignmentToTarget(assignment.assignment(), target.name, symbols, target.type)
-            if (lowered.type != target.type) {
+            if (!lowered.type.isAssignableTo(target.type)) {
                 throw FlangCompileException("Cannot assign ${lowered.type.sourceName} to '$targetName' of type ${target.type.sourceName}.")
             }
             return lowered.blocks
@@ -1104,7 +1313,7 @@ private class FunctionLowering(
         }
         val outputName = context.inlineOutputName ?: RETURN_VARIABLE_NAME
         val lowered = lowerExpressionToTarget(expr, outputName, symbols, returnType)
-        if (lowered.type != returnType) {
+        if (!lowered.type.isAssignableTo(returnType)) {
             throw FlangCompileException("Cannot return ${lowered.type.sourceName} from function '${context.signature.name}' declared as ${returnType.sourceName}.")
         }
         context.sawReturn = true
@@ -1215,10 +1424,23 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
         expectedType: FlangType? = null,
     ): TargetExpression {
-        if (equality.additive().size != 1) {
-            throw FlangCompileException("Equality expressions are not supported as values yet.")
+        val operands = equality.relational()
+        if (operands.size == 1) return lowerRelationalToTarget(operands.single(), targetName, symbols, expectedType)
+        if (operands.size != 2) {
+            throw FlangCompileException("Chained equality expressions are not supported.")
         }
-        return lowerAdditiveToTarget(equality.additive().single(), targetName, symbols, expectedType)
+        val token = (equality.getChild(1) as TerminalNode).symbol.type
+        val action = when (token) {
+            FlangParser.EQ_EQ -> "="
+            FlangParser.NOT_EQ -> "!="
+            else -> error("Unexpected equality token $token")
+        }
+        return lowerComparisonToTarget(
+            targetName = targetName,
+            action = action,
+            left = { lowerRelationalToItem(operands[0], symbols) },
+            right = { lowerRelationalToItem(operands[1], symbols) },
+        )
     }
 
     private fun lowerEqualityToItem(
@@ -1226,10 +1448,67 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
         expectedType: FlangType? = null,
     ): ExpressionValue {
-        if (equality.additive().size != 1) {
-            throw FlangCompileException("Equality expressions are not supported as values yet.")
+        if (equality.relational().size == 1) return lowerRelationalToItem(equality.relational().single(), symbols, expectedType)
+        return lowerToTemp(symbols) { temp -> lowerEqualityToTarget(equality, temp, symbols, expectedType) }
+    }
+
+    private fun lowerRelationalToTarget(
+        relational: FlangParser.RelationalContext,
+        targetName: String,
+        symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
+    ): TargetExpression {
+        val operands = relational.additive()
+        if (operands.size == 1) return lowerAdditiveToTarget(operands.single(), targetName, symbols, expectedType)
+        if (operands.size != 2) {
+            throw FlangCompileException("Chained relational expressions are not supported.")
         }
-        return lowerAdditiveToItem(equality.additive().single(), symbols, expectedType)
+        val token = (relational.getChild(1) as TerminalNode).symbol.type
+        val action = when (token) {
+            FlangParser.LT -> "<"
+            FlangParser.LT_EQ -> "<="
+            FlangParser.GT -> ">"
+            FlangParser.GT_EQ -> ">="
+            else -> error("Unexpected relational token $token")
+        }
+        return lowerComparisonToTarget(
+            targetName = targetName,
+            action = action,
+            left = { lowerAdditiveToItem(operands[0], symbols).also { it.requireType(FlangType.NUM, "Relational comparisons require Num operands.") } },
+            right = { lowerAdditiveToItem(operands[1], symbols).also { it.requireType(FlangType.NUM, "Relational comparisons require Num operands.") } },
+        )
+    }
+
+    private fun lowerRelationalToItem(
+        relational: FlangParser.RelationalContext,
+        symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
+    ): ExpressionValue {
+        if (relational.additive().size == 1) return lowerAdditiveToItem(relational.additive().single(), symbols, expectedType)
+        return lowerToTemp(symbols) { temp -> lowerRelationalToTarget(relational, temp, symbols, expectedType) }
+    }
+
+    private fun lowerComparisonToTarget(
+        targetName: String,
+        action: String,
+        left: () -> ExpressionValue,
+        right: () -> ExpressionValue,
+    ): TargetExpression {
+        val leftValue = left()
+        val rightValue = right()
+        if (!leftValue.type.isAssignableTo(rightValue.type) && !rightValue.type.isAssignableTo(leftValue.type)) {
+            throw FlangCompileException("Cannot compare ${leftValue.type.sourceName} and ${rightValue.type.sourceName}.")
+        }
+        return TargetExpression(
+            type = FlangType.BOOLEAN,
+            blocks = leftValue.prelude +
+                rightValue.prelude +
+                setVariableBlock(targetName, DfNumber("0")) +
+                ifVariableComparisonBlock(action, leftValue.item, rightValue.item) +
+                DfBracket(direct = "open", type = "norm") +
+                setVariableBlock(targetName, DfNumber("1")) +
+                DfBracket(direct = "close", type = "norm"),
+        )
     }
 
     private fun lowerAdditiveToTarget(
@@ -1431,7 +1710,7 @@ private class FunctionLowering(
         values += DfText(structName)
         struct.fields.forEach { field ->
             val fieldValue = lowerExpressionToTempBackedValue(providedByName.getValue(field.name).expr(), symbols, field.type)
-            if (fieldValue.type != field.type) {
+            if (!fieldValue.type.isAssignableTo(field.type)) {
                 throw FlangCompileException("Cannot assign ${fieldValue.type.sourceName} to field '${field.name}' of type ${field.type.sourceName}.")
             }
             blocks += fieldValue.prelude
@@ -1549,6 +1828,19 @@ private class FunctionLowering(
     }
 
     private fun FlangParser.PostfixContext.enumHelperCallOrNull(symbols: Map<String, Symbol>): EnumHelperCall? {
+        primary().typeStaticCall()?.let { call ->
+            if (call.simpleType().typeRef().isEmpty() && call.callArgList() == null && postfixPart().isEmpty()) {
+                val baseName = call.simpleType().Identifier().text
+                val base = symbols[baseName] ?: return null
+                if (base.type !is FlangType.ENUM) return null
+                val fieldName = when (val helperName = call.Identifier().text) {
+                    "ordinal" -> "$" + "ordinal"
+                    "name" -> "$" + "name"
+                    else -> throw FlangCompileException("Enum '${base.type.sourceName}' has no helper '$helperName'. Expected ordinal() or name().")
+                }
+                return EnumHelperCall(baseName, fieldName)
+            }
+        }
         val baseName = primary().Identifier()?.text ?: return null
         val base = symbols[baseName] ?: return null
         if (base.type !is FlangType.ENUM) return null
@@ -1656,10 +1948,32 @@ private class FunctionLowering(
         equality: FlangParser.EqualityContext,
         symbols: Map<String, Symbol>,
     ): FlangType {
-        if (equality.additive().size != 1) {
-            throw FlangCompileException("Equality expressions are not supported as values yet.")
+        if (equality.relational().size == 1) return inferRelationalType(equality.relational().single(), symbols)
+        if (equality.relational().size != 2) {
+            throw FlangCompileException("Chained equality expressions are not supported.")
         }
-        return inferAdditiveType(equality.additive().single(), symbols)
+        val left = inferRelationalType(equality.relational()[0], symbols)
+        val right = inferRelationalType(equality.relational()[1], symbols)
+        if (!left.isAssignableTo(right) && !right.isAssignableTo(left)) {
+            throw FlangCompileException("Cannot compare ${left.sourceName} and ${right.sourceName}.")
+        }
+        return FlangType.BOOLEAN
+    }
+
+    private fun inferRelationalType(
+        relational: FlangParser.RelationalContext,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        if (relational.additive().size == 1) return inferAdditiveType(relational.additive().single(), symbols)
+        if (relational.additive().size != 2) {
+            throw FlangCompileException("Chained relational expressions are not supported.")
+        }
+        relational.additive().forEach { inferred ->
+            if (inferAdditiveType(inferred, symbols) != FlangType.NUM) {
+                throw FlangCompileException("Relational comparisons require Num operands.")
+            }
+        }
+        return FlangType.BOOLEAN
     }
 
     private fun inferAdditiveType(
@@ -1771,7 +2085,7 @@ private class FunctionLowering(
     }
 
     private fun ExpressionValue.requireType(expected: FlangType, message: String? = null) {
-        if (type != expected) {
+        if (!type.isAssignableTo(expected)) {
             throw FlangCompileException(message ?: "Expected ${expected.sourceName} expression but got ${type.sourceName}.")
         }
     }
@@ -1827,7 +2141,7 @@ private class FunctionLowering(
         expectedType: FlangType? = null,
     ): ExpressionValue {
         lowerGvalCallToValue(call)?.let { return it }
-        val signature = resolveFunctionCall(call, symbols)
+        val signature = resolveFunctionCall(call, symbols, expectedType)
         val returnType = signature.returnType
             ?: throw FlangCompileException("Function '${call.name}' does not return a value.")
         val outputName = nextTempName(symbols)
@@ -1853,15 +2167,14 @@ private class FunctionLowering(
     private fun resolveFunctionCall(
         call: SimpleCall,
         symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
     ): FunctionSignature {
         val overloads = overloadsForCall(call, symbols)
         val sameArity = overloads.filter { it.params.size == callArgumentCountIncludingReceiver(call, symbols) }
         if (sameArity.isEmpty()) {
             throw FlangCompileException("Function '${call.renderedName}' has no overload with ${call.args.size} arguments.")
         }
-        val matches = sameArity.filter { signature ->
-            callArgumentsMatch(signature, call, symbols)
-        }
+        val matches = sameArity.mapNotNull { signature -> instantiateSignatureForCall(signature, call, symbols, expectedType) }
         if (matches.isEmpty()) {
             val argTypes = callArgumentTypes(call, symbols)
             val rendered = argTypes.joinToString(",") { it.sourceName }
@@ -1879,6 +2192,15 @@ private class FunctionLowering(
         call: SimpleCall,
         symbols: Map<String, Symbol>,
     ): List<FunctionSignature> {
+        call.baseType?.let { baseType ->
+            val overloads = signatures.values
+                .filter { it.owner?.substringBefore("<") == baseType.sourceName.substringBefore("<") && it.name == call.name && !it.hasReceiver }
+                .filter { canAccessSignature(it) }
+            if (overloads.isEmpty()) {
+                throw FlangCompileException("Unknown static function '${baseType.sourceName}.${call.name}'.")
+            }
+            return overloads
+        }
         val baseName = call.baseName
         if (baseName == null) {
             return overloadsByName[call.name]
@@ -1889,22 +2211,20 @@ private class FunctionLowering(
 
         val baseSymbol = symbols[baseName]
         if (baseSymbol != null) {
-            val structType = baseSymbol.type as? FlangType.STRUCT
-                ?: throw FlangCompileException("Local '$baseName' is not a struct.")
-            val overloads = implOverloadsByOwnerAndName[structType.name to call.name]
-                ?.filter { it.hasReceiver }
-                ?.filter { canAccessSignature(it) }
-                .orEmpty()
+            val overloads = signatures.values
+                .filter { it.owner?.substringBefore("<") == baseSymbol.type.sourceName.substringBefore("<") && it.name == call.name }
+                .filter { it.hasReceiver }
+                .filter { canAccessSignature(it) }
             if (overloads.isEmpty()) {
-                throw FlangCompileException("Unknown member function '${structType.name}.${call.name}'.")
+                throw FlangCompileException("Unknown member function '${baseSymbol.type.sourceName}.${call.name}'.")
             }
             return overloads
         }
 
-        val overloads = implOverloadsByOwnerAndName[baseName to call.name]
-            ?.filter { !it.hasReceiver }
-            ?.filter { canAccessSignature(it) }
-            .orEmpty()
+        val overloads = signatures.values
+            .filter { it.owner?.substringBefore("<") == baseName && it.name == call.name }
+            .filter { !it.hasReceiver }
+            .filter { canAccessSignature(it) }
         if (overloads.isEmpty()) {
             throw FlangCompileException("Unknown static function '$baseName.${call.name}'.")
         }
@@ -1943,27 +2263,39 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
     ): Int = call.args.size + if (call.baseName?.let { symbols[it] } != null) 1 else 0
 
-    private fun callArgumentsMatch(
+    private fun instantiateSignatureForCall(
         signature: FunctionSignature,
         call: SimpleCall,
         symbols: Map<String, Symbol>,
-    ): Boolean {
+        expectedType: FlangType?,
+    ): FunctionSignature? {
+        val bindings = mutableMapOf<String, FlangType>()
+        if (expectedType != null && signature.returnType != null) {
+            if (!inferGenericBindings(signature.returnType, expectedType, bindings)) return null
+        }
+        call.baseType?.let { baseType ->
+            val ownerType = signature.owner?.let { parseSignatureType(it) } ?: return null
+            if (!inferGenericBindings(ownerType, baseType, bindings)) return null
+        }
         val params = if (signature.hasReceiver) {
-            val receiverName = call.baseName ?: return false
-            val receiver = symbols[receiverName] ?: return false
-            if (receiver.type != signature.params.first().type) return false
+            val receiverName = call.baseName ?: return null
+            val receiver = symbols[receiverName] ?: return null
+            if (!inferGenericBindings(signature.params.first().type, receiver.type, bindings)) return null
             signature.params.drop(1)
         } else {
             signature.params
         }
-        if (params.size != call.args.size) return false
-        return params.zip(call.args).all { (param, arg) ->
+        if (params.size != call.args.size) return null
+        val ok = params.zip(call.args).all { (param, arg) ->
+            val expected = param.type.substitute(bindings)
             if (param.mutability == Mutability.MUTABLE) {
                 if (arg.isMutableReference) {
                     val referencedName = arg.mutableReferenceName ?: return@all false
-                    symbols[referencedName]?.type == param.type
+                    val actual = symbols[referencedName]?.type ?: return@all false
+                    inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
                 } else {
-                    inferExpressionType(arg.expr, symbols) == param.type
+                    val actual = inferExpressionType(arg.expr, symbols)
+                    inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
                 }
             } else if (arg.isMutableReference) {
                 false
@@ -1972,10 +2304,18 @@ private class FunctionLowering(
                 if (enumType != null && arg.expr.assignment().enumLiteralOrNull(enumType) != null) {
                     true
                 } else {
-                    inferExpressionType(arg.expr, symbols) == param.type
+                    val actual = inferExpressionType(arg.expr, symbols)
+                    inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
                 }
             }
         }
+        if (!ok) return null
+        return signature.copy(
+            params = signature.params.map { it.copy(type = it.type.substitute(bindings)) },
+            returnType = signature.returnType?.substitute(bindings),
+            typeBindings = bindings.toMap(),
+            callIdentifierOverride = signature.declarationIdentifier,
+        )
     }
 
     private fun lowerFunctionCallBlocks(
@@ -2002,7 +2342,7 @@ private class FunctionLowering(
             val receiverName = call.baseName ?: throw FlangCompileException("Member function '${signature.sourceName}' requires a receiver.")
             val receiver = symbols[receiverName] ?: throw FlangCompileException("Unknown local '$receiverName'.")
             val receiverParam = signature.params.first()
-            if (receiver.type != receiverParam.type) {
+            if (!receiver.type.isAssignableTo(receiverParam.type)) {
                 throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiver.type.sourceName}.")
             }
             if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE) {
@@ -2022,7 +2362,7 @@ private class FunctionLowering(
                 if (symbol.mutability != Mutability.MUTABLE) {
                     throw FlangCompileException("Cannot pass immutable val '$referencedName' as a mutable reference.")
                 }
-                if (symbol.type != param.type) {
+                if (!symbol.type.isAssignableTo(param.type)) {
                     throw FlangCompileException("Cannot pass ${symbol.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                 }
                 items += DfSlot(slot++, DfVariable(DfVariableScope.LINE, symbol.name))
@@ -2030,7 +2370,7 @@ private class FunctionLowering(
                 throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use &.")
             } else {
                 val value = lowerAssignmentToValue(arg.expr.assignment(), symbols, param.type)
-                if (value.type != param.type) {
+                if (!value.type.isAssignableTo(param.type)) {
                     throw FlangCompileException("Cannot pass ${value.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                 }
                 blocks += value.prelude
@@ -2072,7 +2412,7 @@ private class FunctionLowering(
                 val receiverName = call.baseName ?: throw FlangCompileException("Member function '${signature.sourceName}' requires a receiver.")
                 val receiver = symbols[receiverName] ?: throw FlangCompileException("Unknown local '$receiverName'.")
                 val receiverParam = signature.params.first()
-                if (receiver.type != receiverParam.type) {
+                if (!receiver.type.isAssignableTo(receiverParam.type)) {
                     throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiver.type.sourceName}.")
                 }
                 if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE) {
@@ -2090,7 +2430,7 @@ private class FunctionLowering(
                     if (symbol.mutability != Mutability.MUTABLE) {
                         throw FlangCompileException("Cannot pass immutable val '$referencedName' as a mutable reference.")
                     }
-                    if (symbol.type != param.type) {
+                    if (!symbol.type.isAssignableTo(param.type)) {
                         throw FlangCompileException("Cannot pass ${symbol.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                     }
                     inlineSymbols[param.name] = Symbol(symbol.name, param.mutability, param.type)
@@ -2098,7 +2438,7 @@ private class FunctionLowering(
                     throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use &.")
                 } else {
                     val value = lowerAssignmentToValue(arg.expr.assignment(), symbols, param.type)
-                    if (value.type != param.type) {
+                    if (!value.type.isAssignableTo(param.type)) {
                         throw FlangCompileException("Cannot pass ${value.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                     }
                     val physicalName = "$prefix${param.name}"
@@ -2109,6 +2449,9 @@ private class FunctionLowering(
             }
 
             val returnMode = inlineReturnMode(declaration.function)
+            if (returnMode == InlineReturnMode.STOP_REPEAT && declaration.function.containsReturnInUserLoop()) {
+                throw FlangCompileException("Inline function '${signature.fullIdentifier}' cannot use return inside a for or while loop in this compiler pass.")
+            }
             val context = FunctionContext(
                 signature = signature,
                 isEvent = false,
@@ -2149,6 +2492,8 @@ private class FunctionLowering(
             returnStmt() != null -> true
             ifStmt() != null -> ifStmt().containsReturn()
             ifEmitStmt() != null -> ifEmitStmt().containsReturn()
+            forStmt() != null -> forStmt().block().stmt().any { it.containsReturn() }
+            whileStmt() != null -> whileStmt().block().stmt().any { it.containsReturn() }
             else -> false
         }
 
@@ -2161,6 +2506,22 @@ private class FunctionLowering(
         block().any { it.stmt().any { stmt -> stmt.containsReturn() } } ||
             ifStmt()?.containsReturn() == true ||
             ifEmitStmt()?.containsReturn() == true
+
+    private fun FlangParser.FunctionDeclContext.containsReturnInUserLoop(): Boolean =
+        block().stmt().any { it.containsReturnInUserLoop() }
+
+    private fun FlangParser.StmtContext.containsReturnInUserLoop(): Boolean =
+        when {
+            forStmt() != null -> forStmt().block().stmt().any { it.containsReturn() }
+            whileStmt() != null -> whileStmt().block().stmt().any { it.containsReturn() }
+            ifStmt() != null -> ifStmt().block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } ||
+                ifStmt().ifStmt()?.let { nested -> nested.block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } } == true ||
+                ifStmt().ifEmitStmt()?.let { nested -> nested.block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } } == true
+            ifEmitStmt() != null -> ifEmitStmt().block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } ||
+                ifEmitStmt().ifStmt()?.let { nested -> nested.block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } } == true ||
+                ifEmitStmt().ifEmitStmt()?.let { nested -> nested.block().any { block -> block.stmt().any { it.containsReturnInUserLoop() } } } == true
+            else -> false
+        }
 
     private fun inlinePrefix(signature: FunctionSignature): String {
         val id = inlineCounter++
@@ -2186,6 +2547,25 @@ private class FunctionLowering(
             args = DfArgs(listOf(DfSlot(slot = 0, item = DfNumber("1")))),
         )
 
+    private fun repeatForeverBlock(): DfBlock =
+        DfBlock(block = "repeat", action = "Forever")
+
+    private fun repeatForEachBlock(loopVariableName: String, list: DfItem): DfBlock =
+        DfBlock(
+            block = "repeat",
+            action = "ForEach",
+            args = DfArgs(
+                listOf(
+                    DfSlot(slot = 0, item = DfVariable(DfVariableScope.LINE, loopVariableName)),
+                    DfSlot(slot = 1, item = list),
+                    DfSlot(
+                        slot = 26,
+                        item = DfBlockTag(block = "repeat", action = "ForEach", tag = "Allow List Changes", option = "True"),
+                    ),
+                ),
+            ),
+        )
+
     private fun ifVariableTruthyBlock(condition: DfItem): DfBlock =
         DfBlock(
             block = "if_var",
@@ -2194,6 +2574,21 @@ private class FunctionLowering(
                 listOf(
                     DfSlot(slot = 0, item = condition),
                     DfSlot(slot = 1, item = DfNumber("0")),
+                ),
+            ),
+        )
+
+    private fun ifVariableEqualsBlock(left: DfItem, right: DfItem): DfBlock =
+        ifVariableComparisonBlock("=", left, right)
+
+    private fun ifVariableComparisonBlock(action: String, left: DfItem, right: DfItem): DfBlock =
+        DfBlock(
+            block = "if_var",
+            action = action,
+            args = DfArgs(
+                listOf(
+                    DfSlot(slot = 0, item = left),
+                    DfSlot(slot = 1, item = right),
                 ),
             ),
         )
@@ -2231,10 +2626,14 @@ private class FunctionLowering(
     private fun primitiveStructFieldPlaceholder(structName: String, field: StructField): DfItem? {
         val placeholder = structFieldPlaceholder(structName, field)
         return when (field.type) {
+            FlangType.ANY -> null
             FlangType.NUM -> DfNumber(placeholder)
             FlangType.STRING -> DfText(placeholder)
             FlangType.TEXT -> DfComponent(placeholder)
             FlangType.BOOLEAN -> DfNumber(placeholder)
+            is FlangType.TYPE_PARAMETER -> null
+            is FlangType.LIST -> null
+            is FlangType.DICT -> null
             is FlangType.STRUCT -> null
             is FlangType.ENUM -> null
         }
@@ -2441,8 +2840,13 @@ private class FunctionLowering(
     }
 }
 
-private data class SimpleCall(val name: String, val args: List<SimpleCallArg>, val baseName: String? = null) {
-    val renderedName: String = baseName?.let { "$it.$name" } ?: name
+private data class SimpleCall(
+    val name: String,
+    val args: List<SimpleCallArg>,
+    val baseName: String? = null,
+    val baseType: FlangType? = null,
+) {
+    val renderedName: String = baseType?.let { "${it.sourceName}.$name" } ?: baseName?.let { "$it.$name" } ?: name
 }
 
 private data class ParsedGvalCall(
@@ -2462,11 +2866,83 @@ private data class EnumHelperCall(val baseName: String, val fieldName: String)
 
 private fun SimpleCall.isGvalCall(): Boolean = baseName == null && name == "gval"
 
+private fun FlangParser.FunctionDeclContext.declaredName(): String =
+    functionName().Identifier().text
+
+private fun FlangParser.FunctionDeclContext.genericTypeParameters(): Set<String> =
+    genericParamList()?.Identifier().orEmpty().map { it.text }.toSet()
+
+private fun implicitOwnerTypeParameters(
+    typeRef: FlangParser.TypeRefContext?,
+    structs: Map<String, StructDefinition>,
+    enums: Map<String, EnumDefinition>,
+): Set<String> {
+    if (typeRef == null) return emptySet()
+    val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+    known += structs.keys
+    known += enums.keys
+    return typeRef.text
+        .split(Regex("[^A-Za-z_0-9]+"))
+        .filter { it.isNotBlank() && it !in known }
+        .toSet()
+}
+
+private fun FlangType.substitute(bindings: Map<String, FlangType>): FlangType =
+    when (this) {
+        is FlangType.TYPE_PARAMETER -> bindings[name] ?: this
+        is FlangType.LIST -> FlangType.LIST(elementType.substitute(bindings))
+        is FlangType.DICT -> FlangType.DICT(valueType.substitute(bindings))
+        else -> this
+    }
+
+private fun parseSignatureType(text: String): FlangType =
+    when {
+        text == "Any" -> FlangType.ANY
+        text == "Num" -> FlangType.NUM
+        text == "String" -> FlangType.STRING
+        text == "Text" -> FlangType.TEXT
+        text == "Boolean" -> FlangType.BOOLEAN
+        text.startsWith("List<") && text.endsWith(">") -> FlangType.LIST(parseSignatureType(text.substring(5, text.length - 1)))
+        text.startsWith("Dict<") && text.endsWith(">") -> FlangType.DICT(parseSignatureType(text.substring(5, text.length - 1)))
+        text.length == 1 && text[0].isUpperCase() -> FlangType.TYPE_PARAMETER(text)
+        else -> FlangType.STRUCT(text)
+    }
+
+private fun FlangType.isAssignableTo(expected: FlangType): Boolean =
+    expected == FlangType.ANY ||
+        this == expected ||
+        this is FlangType.LIST && expected is FlangType.LIST && this.elementType.isAssignableTo(expected.elementType) ||
+        this is FlangType.DICT && expected is FlangType.DICT && this.valueType.isAssignableTo(expected.valueType)
+
+private fun inferGenericBindings(
+    expected: FlangType,
+    actual: FlangType,
+    bindings: MutableMap<String, FlangType>,
+): Boolean =
+    when (expected) {
+        is FlangType.TYPE_PARAMETER -> {
+            val previous = bindings[expected.name]
+            if (previous == null) {
+                bindings[expected.name] = actual
+                true
+            } else {
+                actual.isAssignableTo(previous) || previous.isAssignableTo(actual).also {
+                    if (it && previous == FlangType.ANY) bindings[expected.name] = actual
+                }
+            }
+        }
+        FlangType.ANY -> true
+        is FlangType.LIST -> actual is FlangType.LIST && inferGenericBindings(expected.elementType, actual.elementType, bindings)
+        is FlangType.DICT -> actual is FlangType.DICT && inferGenericBindings(expected.valueType, actual.valueType, bindings)
+        else -> actual.isAssignableTo(expected)
+    }
+
 private fun String.toFlangGameValueType(gameValueName: String): FlangType =
     when (this) {
         "NUMBER" -> FlangType.NUM
         "TEXT" -> FlangType.STRING
         "COMPONENT" -> FlangType.TEXT
+        "LIST" -> FlangType.LIST(FlangType.ANY)
         else -> throw FlangCompileException("Game value '$gameValueName' returns unsupported DiamondFire type '$this'.")
     }
 
@@ -2485,6 +2961,28 @@ private fun FlangParser.PostfixContext.functionCallOrNull(): SimpleCall? =
     simpleCallOrNull()
 
 private fun FlangParser.PostfixContext.simpleCallOrNull(): SimpleCall? {
+    primary().typeStaticCall()?.let { staticCall ->
+        val args = staticCall.callArgList()?.callArg().orEmpty().map { arg ->
+            val isMutableReference = arg.AMP() != null
+            SimpleCallArg(
+                expr = arg.expr(),
+                isMutableReference = isMutableReference,
+                mutableReferenceName = if (isMutableReference) arg.expr().assignment().logicalOr().plainIdentifierOrNull() else null,
+            )
+        }
+        if (staticCall.simpleType().typeRef().isEmpty()) {
+            return SimpleCall(
+                name = staticCall.Identifier().text,
+                args = args,
+                baseName = staticCall.simpleType().Identifier().text,
+            )
+        }
+        return SimpleCall(
+            name = staticCall.Identifier().text,
+            args = args,
+            baseType = parseSignatureType(staticCall.simpleType().text),
+        )
+    }
     val primaryName = primary().Identifier()?.text ?: return null
     val parts = postfixPart()
     val name: String
@@ -2556,8 +3054,10 @@ private fun FlangParser.LogicalOrContext.singlePostfixOrNull(): FlangParser.Post
     val logicalAnd = logicalAnd().single()
     if (logicalAnd.equality().size != 1) return null
     val equality = logicalAnd.equality().single()
-    if (equality.additive().size != 1) return null
-    val additive = equality.additive().single()
+    if (equality.relational().size != 1) return null
+    val relational = equality.relational().single()
+    if (relational.additive().size != 1) return null
+    val additive = relational.additive().single()
     if (additive.multiplicative().size != 1) return null
     val multiplicative = additive.multiplicative().single()
     if (multiplicative.postfix().size != 1) return null

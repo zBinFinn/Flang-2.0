@@ -1,0 +1,125 @@
+package std;
+
+inline fn List<T>.of() -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T, v6: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$, $v6$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T, v6: T, v7: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$, $v6$, $v7$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T, v6: T, v7: T, v8: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$, $v6$, $v7$, $v8$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T, v6: T, v7: T, v8: T, v9: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$, $v6$, $v7$, $v8$, $v9$)`;
+    return out;
+}
+
+inline fn List<T>.of(v1: T, v2: T, v3: T, v4: T, v5: T, v6: T, v7: T, v8: T, v9: T, v10: T) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "CreateList" args($out$, $v1$, $v2$, $v3$, $v4$, $v5$, $v6$, $v7$, $v8$, $v9$, $v10$)`;
+    return out;
+}
+
+inline fn List<T>.append(var this, element: T) {
+    emit `set_variable "AppendValue" args($this$, $element$)`;
+}
+
+inline fn List<T>.get(this, index: Num) -> T {
+    var out: T;
+    emit `set_variable "GetListValue" args($out$, $this$, $index$)`;
+    return out;
+}
+
+inline fn List<T>.set(var this, index: Num, element: T) {
+    emit `set_variable "SetListValue" args($this$, $index$, $element$)`;
+}
+
+inline fn List<T>.length(this) -> Num {
+    var out: Num;
+    emit `set_variable "ListLength" args($out$, $this$)`;
+    return out;
+}
+
+inline fn Dict<T>.new() -> Dict<T> {
+    var keys: List<String>;
+    emit `set_variable "CreateList" args($keys$)`;
+    var values: List<T>;
+    emit `set_variable "CreateList" args($values$)`;
+    var out: Dict<T>;
+    emit `set_variable "CreateDict" args($out$, $keys$, $values$)`;
+    return out;
+}
+
+inline fn Dict<T>.get(this, key: String) -> T {
+    var out: T;
+    emit `set_variable "GetDictValue" args($out$, $this$, $key$)`;
+    return out;
+}
+
+inline fn Dict<T>.set(var this, key: String, value: T) {
+    emit `set_variable "SetDictValue" args($this$, $key$, $value$)`;
+}
+
+inline fn Dict<T>.keys(this) -> List<String> {
+    var out: List<String>;
+    emit `set_variable "GetDictKeys" args($out$, $this$)`;
+    return out;
+}
+
+inline fn Dict<T>.values(this) -> List<T> {
+    var out: List<T>;
+    emit `set_variable "GetDictValues" args($out$, $this$)`;
+    return out;
+}
+
+inline fn Dict<T>.size(this) -> Num {
+    var out: Num;
+    emit `set_variable "GetDictSize" args($out$, $this$)`;
+    return out;
+}

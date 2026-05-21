@@ -47,3 +47,4 @@ bin/
 
 ### Minecraft Run Directory
 **/run/
+.intellijPlatform/

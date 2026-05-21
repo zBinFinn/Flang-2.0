@@ -35,7 +35,15 @@ annotationArgs
   ;
 
 functionDecl
-  : PRIVATE? INLINE? FN Identifier LPAREN paramList? RPAREN (ARROW typeRef)? block
+  : PRIVATE? INLINE? FN genericParamList? functionName LPAREN paramList? RPAREN (ARROW typeRef)? block
+  ;
+
+genericParamList
+  : LT Identifier (COMMA Identifier)* GT
+  ;
+
+functionName
+  : (typeRef DOT)? Identifier
   ;
 
 paramList
@@ -57,6 +65,7 @@ stmt
   | ifEmitStmt
   | ifStmt
   | forStmt
+  | whileStmt
   | whenStmt
   | exprStmt SEMI
   ;
@@ -147,7 +156,32 @@ ifEmitStmt
   ;
 
 forStmt
-  : FOR LPAREN Identifier IN expr RPAREN block
+  : FOR LPAREN (foreachHeader | traditionalForHeader) RPAREN block
+  ;
+
+foreachHeader
+  : (VAL | VAR) Identifier (COLON typeRef)? IN expr
+  ;
+
+traditionalForHeader
+  : traditionalForInit? SEMI traditionalForCondition? SEMI traditionalForUpdate?
+  ;
+
+traditionalForInit
+  : varDecl
+  | expr
+  ;
+
+traditionalForCondition
+  : expr
+  ;
+
+traditionalForUpdate
+  : expr
+  ;
+
+whileStmt
+  : WHILE LPAREN expr RPAREN block
   ;
 
 whenStmt
@@ -194,7 +228,11 @@ logicalAnd
   ;
 
 equality
-  : additive ((EQ_EQ | NOT_EQ) additive)*
+  : relational ((EQ_EQ | NOT_EQ) relational)*
+  ;
+
+relational
+  : additive ((LT | LT_EQ | GT | GT_EQ) additive)*
   ;
 
 additive
@@ -230,11 +268,16 @@ primary
   | StyledStringLiteral
   | TRUE
   | FALSE
+  | typeStaticCall
   | structLiteral
   | enumShorthand
   | Identifier
   | tupleLiteral
   | LPAREN expr RPAREN
+  ;
+
+typeStaticCall
+  : simpleType DOT Identifier LPAREN callArgList? RPAREN
   ;
 
 enumShorthand
