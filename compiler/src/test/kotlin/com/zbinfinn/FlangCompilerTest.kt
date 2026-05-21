@@ -1849,6 +1849,116 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersObjectValueAsTypeDict() {
+        val result = FlangCompiler.compile(
+            """
+            object Global;
+
+            fn Main() {
+              val g = Global;
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "CreateDict" })
+        assertTrue(blocks.any { it.jsonObject["action"]?.jsonPrimitive?.content == "CreateList" })
+    }
+
+    @Test
+    fun supportsObjectMemberAndStaticFunctions() {
+        FlangCompiler.compile(
+            """
+            object Global;
+
+            impl Global {
+              fn info(this) {}
+              fn set(var this) {}
+              fn helper() {}
+            }
+
+            fn Main() {
+              var g = Global;
+              g.info();
+              g.set();
+              Global.helper();
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun rejectsMutableObjectReceiverCallOnImmutableValue() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object Global;
+                impl Global {
+                  fn set(var this) {}
+                }
+                fn Main() {
+                  val g = Global;
+                  g.set();
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(error.message!!.contains("mutable member function") || error.message!!.contains("No overload"))
+    }
+
+    @Test
+    fun lowersEventFromProviderObjectAnnotation() {
+        val result = FlangCompiler.compile(
+            """
+            @PlayerEventProvider("Join")
+            object PlayerJoinEvent;
+
+            @Event
+            fn Handle(event: PlayerJoinEvent) {
+              emit `game_action "CancelEvent"`;
+            }
+            """.trimIndent(),
+        )
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("Join", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun rejectsEventWithoutProviderTypedFirstParameter() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                @Event
+                fn Handle() {}
+                """.trimIndent(),
+            )
+        }
+        assertTrue(error.message!!.contains("first parameter typed as an event provider object"))
+    }
+
+    @Test
+    fun writesTemplateNbtWithCompressedJsonAndMetadata() {
+        val result = FlangCompiler.compile(
+            """
+            @GameEventProvider("Join")
+            object JoinEvent;
+
+            @Event
+            fn Join(event: JoinEvent) {
+              emit `game_action "CancelEvent"`;
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(result.templateNbt.startsWith("minecraft:lime_concrete["))
+        assertTrue(result.templateNbt.endsWith("] 1"))
+        assertTrue(result.templateNbt.contains("\"author\":\"Flang 2.0\""))
+        assertTrue(result.templateNbt.contains("\"name\":\"Flang Template - Player Join Event\""))
+        assertEquals(result.templateJson, decodeTemplateJson(result.templateNbt))
+    }
+
+    @Test
     fun rejectsMemberAssignmentOnImmutableStructs() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
@@ -2159,24 +2269,6 @@ class FlangCompilerTest {
         }
 
         assertTrue(error.message!!.contains("-Oall"))
-    }
-
-    @Test
-    fun writesTemplateNbtWithCompressedJsonAndMetadata() {
-        val result = FlangCompiler.compile(
-            """
-            @Event
-            fn Join() {
-              emit `game_action "CancelEvent"`;
-            }
-            """.trimIndent(),
-        )
-
-        assertTrue(result.templateNbt.startsWith("minecraft:lime_concrete["))
-        assertTrue(result.templateNbt.endsWith("] 1"))
-        assertTrue(result.templateNbt.contains("\"author\":\"Flang 2.0\""))
-        assertTrue(result.templateNbt.contains("\"name\":\"Flang Template - Player Join Event\""))
-        assertEquals(result.templateJson, decodeTemplateJson(result.templateNbt))
     }
 
     private fun assertVariable(slot: kotlinx.serialization.json.JsonObject, name: String, scope: String) {

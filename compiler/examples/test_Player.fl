@@ -15,9 +15,12 @@ fn getAllPlayers() -> List<Player> {
     return players;
 }
 
-fn testPlayer() {
+@Event
+fn testPlayer(var event: PlayerJoinEvent) {
     for (var player in getAllPlayers()) {
         player.damage(5);
     }
+
+    event.getPlayer().sendMessage(s"<green>Hello World");
 }
 

@@ -1,0 +1,9 @@
+package std.helpers;
+
+object GameActions;
+
+impl GameActions {
+    inline fn cancelEvent() {
+        emit `game_action "CancelEvent"`;
+    }
+}

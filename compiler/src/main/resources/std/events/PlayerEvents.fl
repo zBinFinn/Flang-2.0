@@ -1,0 +1,17 @@
+package std.events;
+
+import std.helpers.GameActions;
+
+@PlayerEventProvider("Join")
+object PlayerJoinEvent;
+
+impl PlayerJoinEvent {
+    fn getPlayer(this) -> Player {
+        return Player.default();
+    }
+
+    inline fn cancel(var this) {
+        emit `player_action "Kick"`;
+    }
+}
+

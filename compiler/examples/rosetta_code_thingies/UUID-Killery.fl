@@ -11,4 +11,3 @@ fn join(var event: PlayerJoinEvent) {
         }
     }
 }
-
