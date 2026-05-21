@@ -31,7 +31,7 @@ class FlangSemanticAnnotator : Annotator {
                 filePath = file.virtualFile?.path?.let { Path.of(it) },
                 projectRoots = listOfNotNull(file.project.basePath?.let { Path.of(it) }),
             )
-            model.structs.keys + model.enums.keys + setOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean")
+            model.structs.keys + model.enums.keys + model.interfaces.keys + setOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean")
         }.getOrElse {
             setOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean")
         }
@@ -46,9 +46,15 @@ class FlangSemanticAnnotator : Annotator {
             }
         }
 
-        Regex("""\b(struct|enum|object|impl)\s+([A-Za-z_][A-Za-z0-9_]*)""").findAll(text).forEach { match ->
+        Regex("""\b(struct|interface|enum|object|impl)\s+([A-Za-z_][A-Za-z0-9_]*)""").findAll(text).forEach { match ->
             val range = match.groups[2]?.range ?: return@forEach
             ranges += TextRange(range.first, range.last + 1)
+        }
+        Regex("""\bimpl\s+([A-Za-z_][A-Za-z0-9_]*)\s+for\s+([A-Za-z_][A-Za-z0-9_]*)""").findAll(text).forEach { match ->
+            listOf(1, 2).forEach { group ->
+                val range = match.groups[group]?.range ?: return@forEach
+                ranges += TextRange(range.first, range.last + 1)
+            }
         }
         Regex("""(:|->)\s*([A-Za-z_][A-Za-z0-9_]*)""").findAll(text).forEach { addKnown(it, 2) }
         Regex("""\b([A-Za-z_][A-Za-z0-9_]*)\s*\{""").findAll(text).forEach { addKnown(it, 1) }

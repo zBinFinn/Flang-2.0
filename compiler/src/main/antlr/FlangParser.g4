@@ -21,6 +21,7 @@ qualifiedName
 item
   : annotation* functionDecl
   | annotation* structDecl
+  | annotation* interfaceDecl
   | annotation* enumDecl
   | annotation* implDecl
   | annotation* objectDecl
@@ -304,7 +305,10 @@ tupleLiteral
 structDecl : STRUCT Identifier LBRACE structFieldList? RBRACE ;
 structFieldList : structField (COMMA structField)* COMMA? ;
 structField : PRIVATE? Identifier COLON typeRef ;
+interfaceDecl : INTERFACE Identifier LBRACE interfaceMember* RBRACE ;
+interfaceMember : functionPrototype SEMI | Identifier functionDecl ;
+functionPrototype : PRIVATE? INLINE? FN genericParamList? functionName LPAREN paramList? RPAREN (ARROW typeRef)? ;
 enumDecl   : ENUM Identifier LBRACE enumEntryList? RBRACE ;
 enumEntryList : Identifier (COMMA Identifier)* COMMA? ;
-implDecl   : IMPL Identifier LBRACE functionDecl* RBRACE ;
+implDecl   : IMPL Identifier (FOR Identifier)? LBRACE functionDecl* RBRACE ;
 objectDecl : OBJECT Identifier (SEMI | block) ;

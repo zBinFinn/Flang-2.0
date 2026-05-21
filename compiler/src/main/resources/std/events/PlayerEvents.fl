@@ -2,6 +2,12 @@ package std.events;
 
 import std.helpers.GameActions;
 
+interface CancellableEvent {
+    default fn cancel(var this) {
+        emit `game_action "CancelEvent"`;
+    }
+}
+
 @PlayerEventProvider("Join")
 object PlayerJoinEvent;
 
@@ -9,9 +15,7 @@ impl PlayerJoinEvent {
     fn getPlayer(this) -> Player {
         return Player.default();
     }
-
-    inline fn cancel(var this) {
-        emit `player_action "Kick"`;
-    }
 }
+
+impl CancellableEvent for PlayerJoinEvent {}
 

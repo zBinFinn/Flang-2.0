@@ -1298,6 +1298,209 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersInterfaceImplementationAndDynamicDispatchInListMode() {
+        val result = FlangCompiler.compile(
+            """
+            interface DoesSomething {
+              fn do(this, value: Num);
+            }
+
+            struct A { num: Num }
+
+            impl DoesSomething for A {
+              fn do(this, value: Num) {
+              }
+            }
+
+            fn useIt(thing: DoesSomething) {
+              thing.do(5);
+            }
+
+            fn Main() {
+              val a = A { num: 1 };
+              useIt(a);
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("useIt(DoesSomething)", "Main()", "A.do(A,Num)"), result.templates.map { it.displayIdentifier })
+        val useBlocks = Json.parseToJsonElement(result.templates[0].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(useBlocks[1].jsonObject, "%index(thing,1).do(%index(thing,1),Num)")
+        assertSlotItem(useBlocks[1].jsonObject, 0, "var", "thing")
+        assertSlotItem(useBlocks[1].jsonObject, 1, "num", "5")
+    }
+
+    @Test
+    fun lowersInterfaceDynamicDispatchInDictMode() {
+        val result = FlangCompiler.compile(
+            """
+            interface DoesSomething {
+              fn do(this);
+            }
+
+            struct A { num: Num }
+
+            impl DoesSomething for A {
+              fn do(this) {
+              }
+            }
+
+            fn useIt(thing: DoesSomething) {
+              thing.do();
+            }
+            """.trimIndent(),
+            CompileOptions(structMode = StructMode.DICT),
+        )
+
+        val useBlocks = Json.parseToJsonElement(result.templates[0].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertCallFunc(useBlocks[1].jsonObject, "%entry(thing,$" + "type).do(%entry(thing,$" + "type))")
+    }
+
+    @Test
+    fun synthesizesDefaultInterfaceMethodsAndAllowsOverrides() {
+        val result = FlangCompiler.compile(
+            """
+            interface Cancellable {
+              default fn cancel(var this) {
+                emit `game_action "CancelEvent"`;
+              }
+            }
+
+            struct DefaultEvent { id: Num }
+            struct SpecialEvent { id: Num }
+
+            impl Cancellable for DefaultEvent {
+            }
+
+            impl Cancellable for SpecialEvent {
+              fn cancel(var this) {
+                emit `game_action "UncancelEvent"`;
+              }
+            }
+
+            fn Main() {
+              var defaultEvent = DefaultEvent { id: 1 };
+              var specialEvent = SpecialEvent { id: 2 };
+              defaultEvent.cancel();
+              specialEvent.cancel();
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(
+            listOf("Main()", "DefaultEvent.cancel(DefaultEvent)", "SpecialEvent.cancel(SpecialEvent)"),
+            result.templates.map { it.displayIdentifier },
+        )
+        val defaultBlocks = Json.parseToJsonElement(result.templates[1].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("CancelEvent", defaultBlocks[1].jsonObject["action"]!!.jsonPrimitive.content)
+        val specialBlocks = Json.parseToJsonElement(result.templates[2].templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("UncancelEvent", specialBlocks[1].jsonObject["action"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun allowsInterfaceTypesInGenericContainers() {
+        FlangCompiler.compile(
+            """
+            interface DoesSomething {
+              fn do(this);
+            }
+
+            struct A { num: Num }
+
+            impl DoesSomething for A {
+              fn do(this) {
+              }
+            }
+
+            fn takes(list: List<DoesSomething>) {
+            }
+
+            fn Main(list: List<A>) {
+              takes(list);
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun synthesizesDefaultInterfaceMethodsForObjects() {
+        val result = FlangCompiler.compile(
+            """
+            interface Cancellable {
+              default fn cancel(var this) {
+                emit `game_action "CancelEvent"`;
+              }
+            }
+
+            object EventObject;
+
+            impl Cancellable for EventObject {
+            }
+
+            fn Main() {
+              var event = EventObject;
+              event.cancel();
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(listOf("Main()", "EventObject.cancel(EventObject)"), result.templates.map { it.displayIdentifier })
+    }
+
+    @Test
+    fun validatesInterfaceImplementations() {
+        val missing = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                interface DoesSomething {
+                  fn do(this);
+                }
+                struct A { num: Num }
+                impl DoesSomething for A {
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(missing.message!!.contains("does not implement required interface method"))
+
+        val mismatch = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                interface DoesSomething {
+                  fn do(this, value: Num);
+                }
+                struct A { num: Num }
+                impl DoesSomething for A {
+                  fn do(this, value: String) {
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(mismatch.message!!.contains("does not match any method"))
+
+        val duplicate = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                interface DoesSomething {
+                  fn do(this);
+                }
+                struct A { num: Num }
+                impl DoesSomething for A {
+                  fn do(this) {
+                  }
+                }
+                impl DoesSomething for A {
+                  fn do(this) {
+                  }
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(duplicate.message!!.contains("Duplicate impl 'DoesSomething for A'"))
+    }
+
+    @Test
     fun lowersVoidFunctionCallsAndRejectsVoidCallsAsValues() {
         val result = FlangCompiler.compile(
             """

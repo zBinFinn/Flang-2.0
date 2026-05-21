@@ -25,6 +25,7 @@ enum class FlangCompletionKind {
     VARIABLE,
     FUNCTION,
     STRUCT,
+    INTERFACE,
     FIELD,
     ENUM_ENTRY,
     ENUM_HELPER,
@@ -42,6 +43,7 @@ sealed class FlangType(open val sourceName: String) {
     data class STRUCT(val name: String) : FlangType(name)
     data class OBJECT(val name: String) : FlangType(name)
     data class ENUM(val name: String) : FlangType(name)
+    data class INTERFACE(val name: String) : FlangType(name)
 
     companion object {
         fun fromSourceName(
@@ -49,6 +51,7 @@ sealed class FlangType(open val sourceName: String) {
             structs: Map<String, FlangStructDefinition>,
             enums: Map<String, FlangEnumDefinition>,
             objects: Set<String> = emptySet(),
+            interfaces: Set<String> = emptySet(),
             typeParameters: Set<String> = emptySet(),
         ): FlangType? {
             fun parse(text: String): FlangType? {
@@ -73,7 +76,7 @@ sealed class FlangType(open val sourceName: String) {
                     "List" -> LIST(ANY)
                     "Dict" -> DICT(ANY)
                     in typeParameters -> TYPE_PARAMETER(trimmed)
-                    else -> if (trimmed in structs) STRUCT(trimmed) else if (trimmed in objects) OBJECT(trimmed) else if (trimmed in enums) ENUM(trimmed) else null
+                    else -> if (trimmed in structs) STRUCT(trimmed) else if (trimmed in objects) OBJECT(trimmed) else if (trimmed in enums) ENUM(trimmed) else if (trimmed in interfaces) INTERFACE(trimmed) else null
                 }
             }
             return parse(name)
@@ -142,6 +145,12 @@ data class FlangEnumDefinition(
 
 data class FlangEnumEntry(val name: String, val ordinal: Int)
 
+data class FlangInterfaceDefinition(
+    val name: String,
+    val packageName: String,
+    val methods: List<FlangFunctionSignature>,
+)
+
 data class FlangCompletion(
     val lookup: String,
     val kind: FlangCompletionKind,
@@ -156,12 +165,16 @@ data class FlangFrontendModel(
     val enums: Map<String, FlangEnumDefinition>,
     val functions: List<FlangFunctionSignature>,
     val objects: Set<String>,
+    val interfaces: Map<String, FlangInterfaceDefinition>,
 ) {
     val functionsByName: Map<String, List<FlangFunctionSignature>> =
         functions.filter { it.owner == null }.groupBy { it.name }
 
     val implFunctionsByOwnerAndName: Map<Pair<String, String>, List<FlangFunctionSignature>> =
         functions.filter { it.owner != null }.groupBy { it.owner!! to it.name }
+
+    val interfaceFunctionsByOwnerAndName: Map<Pair<String, String>, List<FlangFunctionSignature>> =
+        interfaces.values.flatMap { it.methods }.groupBy { it.owner!! to it.name }
 }
 
 data class FlangCompletionRequest(
@@ -188,8 +201,9 @@ object FlangFrontend {
         val objects = units.filter { it.kind == FlangSourceKind.FL }
             .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
             .toSet()
-        val functions = buildFunctionSignatures(units, structs, enums, objects)
-        return FlangFrontendModel(units, structs, enums, functions, objects)
+        val interfaces = buildInterfaceTable(units, structs, enums, objects)
+        val functions = buildFunctionSignatures(units, structs, enums, objects, interfaces.keys)
+        return FlangFrontendModel(units, structs, enums, functions, objects, interfaces)
     }
 
     fun completions(request: FlangCompletionRequest): List<FlangCompletion> {
@@ -239,6 +253,9 @@ object FlangFrontend {
             model.structs.values.forEach { struct ->
                 add(FlangCompletion(struct.name, FlangCompletionKind.STRUCT, typeText = struct.packageName))
             }
+            model.interfaces.values.forEach { iface ->
+                add(FlangCompletion(iface.name, FlangCompletionKind.INTERFACE, typeText = iface.packageName))
+            }
             model.enums.values.forEach { enum ->
                 add(FlangCompletion(enum.name, FlangCompletionKind.ENUM_ENTRY, typeText = enum.packageName))
             }
@@ -270,6 +287,9 @@ object FlangFrontend {
             }
         model.structs.values.forEach { struct ->
             add(FlangCompletion(struct.name, FlangCompletionKind.STRUCT, typeText = struct.packageName))
+        }
+        model.interfaces.values.forEach { iface ->
+            add(FlangCompletion(iface.name, FlangCompletionKind.INTERFACE, typeText = iface.packageName))
         }
         return completions.values.sortedWith(compareBy({ it.kind.ordinal }, { it.lookup }))
     }
@@ -372,24 +392,68 @@ object FlangFrontend {
         }
     }
 
+    private fun buildInterfaceTable(
+        units: List<FlangSourceUnit>,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+    ): Map<String, FlangInterfaceDefinition> {
+        val declarations = units.filter { it.kind == FlangSourceKind.FL }
+            .flatMap { unit -> unit.file.item().mapNotNull { it.interfaceDecl()?.let { decl -> unit to decl } } }
+        val names = declarations.map { it.second.Identifier().text }.toSet()
+        return declarations.associate { (unit, decl) ->
+            val name = decl.Identifier().text
+            val methods = decl.interfaceMember().mapNotNull { member ->
+                val function = member.functionDecl()
+                val prototype = member.functionPrototype()
+                val methodName = function?.functionName()?.Identifier()?.text ?: prototype?.functionName()?.Identifier()?.text ?: return@mapNotNull null
+                val params = (function?.paramList() ?: prototype?.paramList())?.param().orEmpty().mapIndexedNotNull { index, param ->
+                    val isReceiver = index == 0 && param.Identifier().text == "this" && param.typeRef() == null
+                    val type = if (isReceiver) {
+                        FlangType.INTERFACE(name)
+                    } else {
+                        param.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, names) } ?: return@mapIndexedNotNull null
+                    }
+                    FlangFunctionParameter(
+                        param.Identifier().text,
+                        if (param.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
+                        type,
+                    )
+                }
+                FlangFunctionSignature(
+                    name = methodName,
+                    owner = name,
+                    packageName = unit.packageName,
+                    params = params,
+                    returnType = (function?.typeRef() ?: prototype?.typeRef())?.let { FlangType.fromSourceName(it.text, structs, enums, objects, names) },
+                    hasReceiver = params.firstOrNull()?.name == "this",
+                    isInline = function?.INLINE() != null || prototype?.INLINE() != null,
+                    isPrivate = function?.PRIVATE() != null || prototype?.PRIVATE() != null,
+                )
+            }
+            name to FlangInterfaceDefinition(name, unit.packageName, methods)
+        }
+    }
+
     private fun buildFunctionSignatures(
         units: List<FlangSourceUnit>,
         structs: Map<String, FlangStructDefinition>,
         enums: Map<String, FlangEnumDefinition>,
         objects: Set<String>,
+        interfaces: Set<String>,
     ): List<FlangFunctionSignature> =
         buildList {
             units.filter { it.kind == FlangSourceKind.FL }.forEach { unit ->
                 unit.file.item().forEach { item ->
                     item.functionDecl()?.let {
                         val owner = it.functionName().typeRef()?.text
-                        add(signatureFor(it, owner, unit.packageName, structs, enums, objects))
+                        add(signatureFor(it, owner, unit.packageName, structs, enums, objects, interfaces))
                     }
                     item.implDecl()?.let { impl ->
-                        val owner = impl.Identifier().text
+                        val owner = impl.implementorName()
                         val ownerPackage = structs[owner]?.packageName ?: unit.packageName
                         if (owner in structs || owner in objects) {
-                            impl.functionDecl().forEach { add(signatureFor(it, owner, ownerPackage, structs, enums, objects)) }
+                            impl.functionDecl().forEach { add(signatureFor(it, owner, ownerPackage, structs, enums, objects, interfaces)) }
                         }
                     }
                 }
@@ -403,6 +467,7 @@ object FlangFrontend {
         structs: Map<String, FlangStructDefinition>,
         enums: Map<String, FlangEnumDefinition>,
         objects: Set<String>,
+        interfaces: Set<String>,
     ): FlangFunctionSignature {
         val typeParams = function.genericParamList()?.Identifier().orEmpty().map { it.text }.toSet() +
             function.functionName().typeRef()?.text.orEmpty()
@@ -411,9 +476,9 @@ object FlangFrontend {
         val params = function.paramList()?.param().orEmpty().mapIndexedNotNull { index, param ->
             val isReceiver = owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null
             val type = if (isReceiver) {
-                FlangType.fromSourceName(owner, structs, enums, objects, typeParams) ?: FlangType.STRUCT(owner)
+                FlangType.fromSourceName(owner, structs, enums, objects, interfaces, typeParams) ?: FlangType.STRUCT(owner)
             } else {
-                param.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, typeParams) } ?: return@mapIndexedNotNull null
+                param.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) } ?: return@mapIndexedNotNull null
             }
             FlangFunctionParameter(
                 param.Identifier().text,
@@ -426,7 +491,7 @@ object FlangFrontend {
             owner = owner,
             packageName = packageName,
             params = params,
-            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, typeParams) },
+            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) },
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
             isPrivate = function.PRIVATE() != null,
@@ -442,12 +507,12 @@ object FlangFrontend {
         val symbols = linkedMapOf<String, FlangSymbol>()
         val item = file.item().firstOrNull { it.containsOffset(offset) } ?: return symbols
         val function = item.functionDecl() ?: item.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) } ?: return symbols
-        val owner = item.implDecl()?.Identifier()?.text
+        val owner = item.implDecl()?.implementorName()
         function.paramList()?.param().orEmpty().forEachIndexed { index, param ->
             val type = if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
                 FlangType.STRUCT(owner)
             } else {
-                param.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums) } ?: return@forEachIndexed
+                param.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums, interfaces = model.interfaces.keys) } ?: return@forEachIndexed
             }
             symbols[param.Identifier().text] = FlangSymbol(
                 param.Identifier().text,
@@ -476,7 +541,7 @@ object FlangFrontend {
                     forStmt.foreachHeader()?.let { header ->
                         val iterableType = inferExprType(header.expr(), symbols, model, packageName)
                         val inferredType = (iterableType as? FlangType.LIST)?.elementType ?: FlangType.ANY
-                        val type = header.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums) } ?: inferredType
+                        val type = header.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums, interfaces = model.interfaces.keys) } ?: inferredType
                         loopSymbols[header.Identifier().text] = FlangSymbol(
                             header.Identifier().text,
                             if (header.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
@@ -484,7 +549,7 @@ object FlangFrontend {
                         )
                     }
                     forStmt.traditionalForHeader()?.traditionalForInit()?.varDecl()?.takeIf { it.start.startIndex < offset }?.let { decl ->
-                        val type = decl.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums) }
+                        val type = decl.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums, interfaces = model.interfaces.keys) }
                             ?: decl.expr()?.let { inferExprType(it, loopSymbols, model, packageName) }
                         if (type != null) {
                             loopSymbols[decl.Identifier().text] = FlangSymbol(
@@ -505,7 +570,7 @@ object FlangFrontend {
                 return
             }
             stmt.varDecl()?.takeIf { it.stop.stopIndex < offset }?.let { decl ->
-                val type = decl.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums) }
+                val type = decl.typeRef()?.let { FlangType.fromSourceName(it.text, model.structs, model.enums, interfaces = model.interfaces.keys) }
                     ?: decl.expr()?.let { inferExprType(it, symbols, model, packageName) }
                     ?: return@let
                 symbols[decl.Identifier().text] = FlangSymbol(
@@ -548,6 +613,19 @@ object FlangFrontend {
         packageName: String,
     ): List<FlangCompletion> {
         val symbol = symbols[base]
+        if (symbol?.type is FlangType.INTERFACE) {
+            return model.interfaces[symbol.type.name]?.methods.orEmpty()
+                .filter { it.hasReceiver && canAccess(it, packageName) }
+                .map {
+                    FlangCompletion(
+                        lookup = it.name,
+                        insertText = "${it.name}()",
+                        kind = FlangCompletionKind.FUNCTION,
+                        tailText = "(${it.params.drop(1).joinToString(", ") { p -> "${p.name}: ${p.type.sourceName}" }})",
+                        typeText = it.returnType?.sourceName ?: "Unit",
+                    )
+                }
+        }
         if (symbol?.type is FlangType.STRUCT || symbol?.type is FlangType.OBJECT || symbol?.type is FlangType.LIST || symbol?.type is FlangType.DICT) {
             val structName = (symbol.type as? FlangType.STRUCT)?.name
             val fields = structName?.let { name ->
@@ -610,13 +688,13 @@ object FlangFrontend {
         val function = item?.functionDecl() ?: item?.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) }
 
         file.findVarDeclAt(offset)?.let { decl ->
-            decl.typeRef()?.text?.let { FlangType.fromSourceName(it, model.structs, model.enums) as? FlangType.ENUM }?.let { return it }
+            decl.typeRef()?.text?.let { FlangType.fromSourceName(it, model.structs, model.enums, interfaces = model.interfaces.keys) as? FlangType.ENUM }?.let { return it }
         }
         source.assignmentTargetBefore(offset)?.let { target -> (symbols[target]?.type as? FlangType.ENUM)?.let { return it } }
         source.structFieldBefore(offset, model)?.let { return it as? FlangType.ENUM }
         function?.typeRef()?.let { returnType ->
             if (source.substring(0, offset).lastIndexOf("return") > function.start.startIndex) {
-                (FlangType.fromSourceName(returnType.text, model.structs, model.enums) as? FlangType.ENUM)?.let { return it }
+                (FlangType.fromSourceName(returnType.text, model.structs, model.enums, interfaces = model.interfaces.keys) as? FlangType.ENUM)?.let { return it }
             }
         }
         source.callContextBefore(offset)?.let { (name, argIndex, base) ->
@@ -624,9 +702,9 @@ object FlangFrontend {
                 model.functionsByName[name].orEmpty()
             } else {
                 val receiverType = symbols[base]?.type
-                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name
+                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name ?: (receiverType as? FlangType.INTERFACE)?.name
                 if (ownerName != null) {
-                    model.implFunctionsByOwnerAndName[ownerName to name].orEmpty()
+                    (model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty())
                         .filter { it.hasReceiver }
                         .map { it.copy(params = it.params.drop(1)) }
                 } else {
@@ -667,8 +745,12 @@ object FlangFrontend {
                 model.functionsByName[name].orEmpty()
             } else {
                 val receiverType = symbols[base]?.type
-                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name
-                if (ownerName != null) model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() else model.implFunctionsByOwnerAndName[base to name].orEmpty()
+                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name ?: (receiverType as? FlangType.INTERFACE)?.name
+                if (ownerName != null) {
+                    model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty()
+                } else {
+                    model.implFunctionsByOwnerAndName[base to name].orEmpty()
+                }
             }
             overloads.firstOrNull { canAccess(it, packageName) }?.returnType?.let { return it }
         }
@@ -693,7 +775,7 @@ object FlangFrontend {
                 val match = Regex("""(var\s+)?([A-Za-z_][A-Za-z0-9_]*)(?::\s*([A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?))?""").matchEntire(param)
                     ?: return@forEach
                 val typeName = match.groupValues.getOrNull(3).orEmpty()
-                val type = FlangType.fromSourceName(typeName, model.structs, model.enums) ?: return@forEach
+                val type = FlangType.fromSourceName(typeName, model.structs, model.enums, interfaces = model.interfaces.keys) ?: return@forEach
                 symbols[match.groupValues[2]] = FlangSymbol(
                     match.groupValues[2],
                     if (match.groupValues[1].isNotEmpty()) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
@@ -704,7 +786,7 @@ object FlangFrontend {
             .findAll(before)
             .forEach { match ->
                 val explicitType = match.groupValues[3].takeIf { it.isNotBlank() }
-                    ?.let { FlangType.fromSourceName(it, model.structs, model.enums) }
+                    ?.let { FlangType.fromSourceName(it, model.structs, model.enums, interfaces = model.interfaces.keys) }
                 val inferredType = explicitType ?: inferTextExpressionType(match.groupValues[4].trim(), symbols, model)
                 if (inferredType != null) {
                     symbols[match.groupValues[2]] = FlangSymbol(
@@ -731,7 +813,7 @@ object FlangFrontend {
         if (text in model.objects) return FlangType.OBJECT(text)
         Regex("""^List(?:<([^>]+)>)?\.of\((.*)\)$""").matchEntire(text)?.let { match ->
             match.groupValues[1].takeIf { it.isNotBlank() }?.let {
-                return FlangType.LIST(FlangType.fromSourceName(it, model.structs, model.enums) ?: FlangType.ANY)
+                return FlangType.LIST(FlangType.fromSourceName(it, model.structs, model.enums, interfaces = model.interfaces.keys) ?: FlangType.ANY)
             }
             val args = match.groupValues[2].split(',').map { it.trim() }.filter { it.isNotEmpty() }
             val firstType = args.firstOrNull()?.let { inferTextExpressionType(it, symbols, model) } ?: FlangType.ANY
@@ -739,7 +821,7 @@ object FlangFrontend {
         }
         Regex("""^Dict(?:<([^>]+)>)?\.new\(\)$""").matchEntire(text)?.let { match ->
             val valueType = match.groupValues[1].takeIf { it.isNotBlank() }
-                ?.let { FlangType.fromSourceName(it, model.structs, model.enums) }
+                ?.let { FlangType.fromSourceName(it, model.structs, model.enums, interfaces = model.interfaces.keys) }
                 ?: FlangType.ANY
             return FlangType.DICT(valueType)
         }
@@ -861,6 +943,9 @@ private fun String.callContextBefore(offset: Int): Triple<String, Int, String?>?
         Triple(member, commas, base)
     }
 }
+
+private fun FlangParser.ImplDeclContext.implementorName(): String =
+    if (FOR() == null) Identifier(0).text else Identifier(1).text
 
 private fun String.structFieldBefore(offset: Int, model: FlangFrontendModel): FlangType? {
     val before = substring(0, offset)

@@ -140,7 +140,7 @@ class FlangLexerAdapter : LexerBase() {
     companion object {
         private val keywords = setOf(
             "inline", "package", "import", "private", "fn", "emit", "val", "var", "true", "false",
-            "return", "if", "else", "for", "in", "while", "when", "struct", "enum", "impl", "object", "args", "tags",
+            "return", "if", "else", "for", "in", "while", "when", "struct", "interface", "default", "enum", "impl", "object", "args", "tags",
         )
     }
 }

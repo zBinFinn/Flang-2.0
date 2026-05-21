@@ -61,6 +61,8 @@ private const val INLINE_PREFIX = "$" + "flang_inline_"
 private const val RETURN_VARIABLE_NAME = "$" + "out"
 private const val SELECTION_TYPE_ENUM = "SelectionType"
 
+private var currentInterfaceImplementations: Set<InterfaceImplementationKey> = emptySet()
+
 private enum class SourceKind {
     FL,
     FLI,
@@ -103,9 +105,12 @@ object FlangCompiler {
         val enums = buildEnumTable(units)
         val structs = buildStructTable(units, enums)
         val objects = buildObjectTable(units)
-        val signatures = buildFunctionSignatures(units, structs, enums, objects)
-        val declarations = buildFunctionDeclarations(units, signatures)
-        val lowering = FunctionLowering(ActionDump.loadFromResources(), signatures, declarations, structs, enums, objects, options.structMode)
+        val interfaces = buildInterfaceTable(units, structs, enums, objects)
+        val interfaceImpls = buildInterfaceImplementationTable(units, interfaces, structs, objects)
+        currentInterfaceImplementations = interfaceImpls.map { InterfaceImplementationKey(it.interfaceName, it.implementorName) }.toSet()
+        val signatures = buildFunctionSignatures(units, structs, enums, objects, interfaces, interfaceImpls)
+        val declarations = buildFunctionDeclarations(units, signatures, interfaces, interfaceImpls)
+        val lowering = FunctionLowering(ActionDump.loadFromResources(), signatures, declarations, structs, enums, objects, interfaces, options.structMode)
         declarations.values.forEach { declaration ->
             val signature = lowering.signatureForDeclaration(declaration.function, declaration.owner, declaration.packageName)
             if (declaration.annotations.any { it.Identifier().text == "Event" } && signature.isInline) {
@@ -120,7 +125,18 @@ object FlangCompiler {
             entries.forEach { entry ->
                 val block = entry as? DfBlock ?: return@forEach
                 if (block.block == "call_func" && block.data != null) {
-                    pendingCalls += block.data
+                    val dynamicMethod = dynamicInterfaceMethodName(block.data)
+                    if (dynamicMethod != null) {
+                        interfaceImpls
+                            .filter { interfaces.getValue(it.interfaceName).methodsByName.containsKey(dynamicMethod) }
+                            .forEach { implementation ->
+                                signatures.values
+                                    .filter { it.owner == implementation.implementorName && it.name == dynamicMethod }
+                                    .forEach { pendingCalls += it.fullIdentifier }
+                            }
+                    } else {
+                        pendingCalls += block.data
+                    }
                 }
             }
         }
@@ -137,11 +153,12 @@ object FlangCompiler {
         units.firstOrNull()?.takeIf { it.kind == SourceKind.FL }?.let { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    lowerSignature(lowering.signatureForDeclaration(function, owner = extensionOwner(function, structs, enums, objects), packageName = unit.packageName))
+                    lowerSignature(lowering.signatureForDeclaration(function, owner = extensionOwner(function, structs, enums, objects, interfaces), packageName = unit.packageName))
                 }
                 item.implDecl()?.let { impl ->
+                    if (impl.interfaceNameOrNull() != null) return@let
                     impl.functionDecl().forEach { function ->
-                        lowerSignature(lowering.signatureForDeclaration(function, impl.Identifier().text, packageName = unit.packageName))
+                        lowerSignature(lowering.signatureForDeclaration(function, impl.implementorName(), packageName = unit.packageName))
                     }
                 }
             }
@@ -297,6 +314,11 @@ object FlangCompiler {
         return "$qualifiedName($parameterTypes)"
     }
 
+    private fun dynamicInterfaceMethodName(identifier: String): String? {
+        if (!identifier.contains("%index(") && !identifier.contains("%entry(")) return null
+        return Regex("""\)\.([A-Za-z_][A-Za-z0-9_]*)\(""").find(identifier)?.groupValues?.get(1)
+    }
+
     private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>): List<DfEntry> {
         var optimized = entries
         if (Optimization.ELIDE_REDUNDANT_SELECT_RESET in optimizations) {
@@ -339,25 +361,38 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
+        interfaceImpls: List<InterfaceImplementation>,
     ): Map<String, FunctionSignature> {
         val signatures = linkedMapOf<String, FunctionSignature>()
         units.filter { it.kind == SourceKind.FL }.forEach { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
-                    registerFunctionSignature(signatures, function, owner = extensionOwner(function, structs, enums, objects), packageName = unit.packageName, structs = structs, enums = enums, objects = objects)
+                    registerFunctionSignature(signatures, function, owner = extensionOwner(function, structs, enums, objects, interfaces), packageName = unit.packageName, structs = structs, enums = enums, objects = objects, interfaces = interfaces)
                 }
                 item.implDecl()?.let { impl ->
-                    val owner = impl.Identifier().text
+                    val owner = impl.implementorName()
+                    val interfaceName = impl.interfaceNameOrNull()
+                    if (interfaceName != null && interfaceName !in interfaces) {
+                        throw FlangCompileException("Impl target '$interfaceName' is not a known interface.")
+                    }
                     if (owner !in structs && owner !in objects) {
                         throw FlangCompileException("Impl target '$owner' is not a known struct or object.")
                     }
                     val ownerPackage = structs[owner]?.packageName ?: unit.packageName
                     impl.functionDecl().forEach { function ->
-                        registerFunctionSignature(signatures, function, owner = owner, packageName = ownerPackage, structs = structs, enums = enums, objects = objects)
+                        registerFunctionSignature(signatures, function, owner = owner, packageName = ownerPackage, structs = structs, enums = enums, objects = objects, interfaces = interfaces)
                     }
                 }
             }
         }
+        interfaceImpls.forEach { implementation ->
+            val interfaceDefinition = interfaces.getValue(implementation.interfaceName)
+            interfaceDefinition.methods.filter { it.isDefault && implementation.specializedMethodKeys.none { key -> key.matches(it) } }.forEach { method ->
+                registerInterfaceMethodSignature(signatures, method, implementation.implementorType, implementation.implementorPackage)
+            }
+        }
+        validateInterfaceImplementations(interfaces, interfaceImpls)
         return signatures
     }
 
@@ -369,19 +404,20 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
     ) {
         val name = function.declaredName()
-        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums, objects)
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums, objects, interfaces)
         if (owner == null && signatures.containsKey(name)) {
             throw FlangCompileException("Duplicate function '$name'.")
         }
-        val params = parseFunctionParameters(function, owner, structs, enums, objects, typeParameters)
+        val params = parseFunctionParameters(function, owner, structs, enums, objects, interfaces, typeParameters)
         val signature = FunctionSignature(
             name = name,
             owner = owner,
             packageName = packageName,
             params = params,
-            returnType = function.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums, objects, typeParameters) },
+            returnType = function.typeRef()?.let { FlangType.fromTypeRef(it, structs, enums, objects, interfaces, typeParameters) },
             typeParameters = typeParameters,
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
@@ -393,9 +429,64 @@ object FlangCompiler {
         signatures[signature.fullIdentifier] = signature
     }
 
+    private fun registerInterfaceMethodSignature(
+        signatures: MutableMap<String, FunctionSignature>,
+        method: InterfaceMethodDefinition,
+        ownerType: FlangType,
+        packageName: String,
+    ) {
+        val owner = ownerType.sourceName
+        val signature = FunctionSignature(
+            name = method.name,
+            owner = owner,
+            packageName = packageName,
+            params = method.params.mapIndexed { index, param ->
+                if (index == 0 && param.name == "this") {
+                    param.copy(type = ownerType)
+                } else {
+                    param
+                }
+            },
+            returnType = method.returnType,
+            typeParameters = emptySet(),
+            hasReceiver = method.params.firstOrNull()?.name == "this",
+            isInline = method.isInline,
+            isPrivate = method.isPrivate,
+        )
+        if (signatures.containsKey(signature.fullIdentifier)) {
+            throw FlangCompileException("Duplicate function signature '${signature.fullIdentifier}'.")
+        }
+        signatures[signature.fullIdentifier] = signature
+    }
+
+    private fun validateInterfaceImplementations(
+        interfaces: Map<String, InterfaceDefinition>,
+        implementations: List<InterfaceImplementation>,
+    ) {
+        implementations.forEach { implementation ->
+            val interfaceDefinition = interfaces.getValue(implementation.interfaceName)
+            val specialized = implementation.specializedMethodKeys
+            val unknown = specialized.firstOrNull { key -> interfaceDefinition.methods.none { key.matches(it) } }
+            if (unknown != null) {
+                throw FlangCompileException("Method '${unknown.name}' does not match any method in interface '${interfaceDefinition.name}'.")
+            }
+            interfaceDefinition.methods.forEach { method ->
+                val matches = specialized.filter { it.matches(method) }
+                if (matches.size > 1) {
+                    throw FlangCompileException("Duplicate implementation of interface method '${method.name}' for '${implementation.implementorName}'.")
+                }
+                if (matches.isEmpty() && !method.isDefault) {
+                    throw FlangCompileException("Type '${implementation.implementorName}' does not implement required interface method '${interfaceDefinition.name}.${method.name}'.")
+                }
+            }
+        }
+    }
+
     private fun buildFunctionDeclarations(
         units: List<SourceUnit>,
         signatures: Map<String, FunctionSignature>,
+        interfaces: Map<String, InterfaceDefinition>,
+        interfaceImpls: List<InterfaceImplementation>,
     ): Map<String, FunctionDeclaration> {
         val declarations = linkedMapOf<String, FunctionDeclaration>()
         units.filter { it.kind == SourceKind.FL }.forEach { unit ->
@@ -406,7 +497,7 @@ object FlangCompiler {
                     declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName)
                 }
                 item.implDecl()?.let { impl ->
-                    val owner = impl.Identifier().text
+                    val owner = impl.implementorName()
                     impl.functionDecl().forEach { function ->
                         val signature = signatureForFunctionDeclaration(function, owner, packageName = unit.packageName, signatures)
                         declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName)
@@ -414,7 +505,35 @@ object FlangCompiler {
                 }
             }
         }
+        interfaceImpls.forEach { implementation ->
+            val interfaceDefinition = interfaces.getValue(implementation.interfaceName)
+            interfaceDefinition.methods.filter { it.isDefault && implementation.specializedMethodKeys.none { key -> key.matches(it) } }.forEach { method ->
+                val function = method.function ?: throw FlangCompileException("Interface method '${method.name}' has no default body.")
+                val signature = signatureForInterfaceDefault(function, implementation.implementorName, implementation.implementorPackage, signatures)
+                declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = implementation.implementorName, packageName = implementation.implementorPackage)
+            }
+        }
         return declarations
+    }
+
+    private fun signatureForInterfaceDefault(
+        function: FlangParser.FunctionDeclContext,
+        owner: String,
+        packageName: String,
+        signatures: Map<String, FunctionSignature>,
+    ): FunctionSignature {
+        val name = function.declaredName()
+        val parameterTypes = function.paramList()?.param().orEmpty()
+            .mapIndexed { index, param ->
+                if (index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
+                    owner
+                } else {
+                    param.typeRef()!!.text
+                }
+            }
+            .joinToString(",")
+        val fullIdentifier = functionIdentifier(packageName, "$owner.$name", parameterTypes)
+        return signatures[fullIdentifier] ?: throw FlangCompileException("Unknown function signature '$fullIdentifier'.")
     }
 
     private fun signatureForFunctionDeclaration(
@@ -444,6 +563,7 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
         typeParameters: Set<String>,
     ): List<FunctionParameter> {
         val functionName = function.declaredName()
@@ -468,7 +588,7 @@ object FlangCompiler {
                 FunctionParameter(
                     name = paramName,
                     mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
-                    type = parseReceiverType(owner, structs, enums, objects),
+                    type = parseReceiverType(owner, structs, enums, objects, interfaces),
                 )
             } else {
                 if (owner != null && paramName == "this") {
@@ -477,7 +597,7 @@ object FlangCompiler {
                 FunctionParameter(
                     name = paramName,
                     mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
-                    type = FlangType.fromTypeRef(typeRef, structs, enums, objects, typeParameters),
+                    type = FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces, typeParameters),
                 )
             }
         }
@@ -494,10 +614,11 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
     ): String? {
         val typeRef = function.functionName().typeRef() ?: return null
-        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(typeRef, structs, enums, objects)
-        return FlangType.fromTypeRef(typeRef, structs, enums, objects, typeParameters).sourceName
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(typeRef, structs, enums, objects, interfaces)
+        return FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces, typeParameters).sourceName
     }
 
     private fun implicitOwnerTypeParameters(
@@ -505,12 +626,14 @@ object FlangCompiler {
         structs: Map<String, StructDefinition>,
         enums: Map<String, EnumDefinition>,
         objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition> = emptyMap(),
     ): Set<String> {
         if (typeRef == null) return emptySet()
         val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
         known += structs.keys
         known += enums.keys
         known += objects.keys
+        known += interfaces.keys
         return typeRef.text
             .split(Regex("[^A-Za-z_0-9]+"))
             .filter { it.isNotBlank() && it !in known }
@@ -616,6 +739,124 @@ object FlangCompiler {
         }
         return objects
     }
+
+    private fun buildInterfaceTable(
+        units: List<SourceUnit>,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+        objects: Map<String, ObjectDefinition>,
+    ): Map<String, InterfaceDefinition> {
+        val declarations = units.filter { it.kind == SourceKind.FL }
+            .flatMap { unit -> unit.file.item().mapNotNull { it.interfaceDecl()?.let { decl -> unit to decl } } }
+        val placeholders = declarations.associate { (_, decl) -> decl.Identifier().text to InterfaceDefinition(decl.Identifier().text, "", emptyList()) }
+        val interfaces = linkedMapOf<String, InterfaceDefinition>()
+        declarations.forEach { (unit, decl) ->
+            val name = decl.Identifier().text
+            if (name in structs || name in enums || name in objects) {
+                throw FlangCompileException("Type '$name' is already declared.")
+            }
+            if (interfaces.containsKey(name)) {
+                throw FlangCompileException("Duplicate interface '$name'.")
+            }
+            val methodNames = mutableSetOf<String>()
+            val methods = decl.interfaceMember().map { member ->
+                val defaultFunction = member.functionDecl()
+                val prototype = member.functionPrototype()
+                if (defaultFunction != null && member.Identifier().text != "default") {
+                    throw FlangCompileException("Interface method bodies must be introduced with 'default fn'.")
+                }
+                val methodName = (defaultFunction?.declaredName() ?: prototype.functionName().Identifier().text)
+                if (!methodNames.add(methodName)) {
+                    throw FlangCompileException("Duplicate interface method '$methodName' in interface '$name'.")
+                }
+                val params = if (defaultFunction != null) {
+                    parseFunctionParameters(defaultFunction, owner = name, structs, enums, objects, placeholders, defaultFunction.genericTypeParameters())
+                } else {
+                    parseFunctionPrototypeParameters(prototype, name, structs, enums, objects, placeholders)
+                }
+                if (params.firstOrNull()?.name != "this") {
+                    throw FlangCompileException("Interface method '$name.$methodName' must declare an explicit receiver parameter 'this'.")
+                }
+                InterfaceMethodDefinition(
+                    name = methodName,
+                    params = params,
+                    returnType = (defaultFunction?.typeRef() ?: prototype?.typeRef())?.let { FlangType.fromTypeRef(it, structs, enums, objects, placeholders) },
+                    isDefault = defaultFunction != null,
+                    isInline = defaultFunction?.INLINE() != null || prototype?.INLINE() != null,
+                    isPrivate = defaultFunction?.PRIVATE() != null || prototype?.PRIVATE() != null,
+                    function = defaultFunction,
+                )
+            }
+            interfaces[name] = InterfaceDefinition(name, unit.packageName, methods)
+        }
+        return interfaces
+    }
+
+    private fun parseFunctionPrototypeParameters(
+        prototype: FlangParser.FunctionPrototypeContext,
+        owner: String,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+        objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
+    ): List<FunctionParameter> {
+        val functionName = prototype.functionName().Identifier().text
+        val paramNames = mutableSetOf<String>()
+        return prototype.paramList()?.param().orEmpty().mapIndexed { index, param ->
+            val paramName = param.Identifier().text
+            if (!paramNames.add(paramName)) {
+                throw FlangCompileException("Duplicate parameter '$paramName' in function '$functionName'.")
+            }
+            val typeRef = param.typeRef()
+            val isReceiver = typeRef == null && paramName == "this"
+            if (typeRef == null && !isReceiver) {
+                throw FlangCompileException("Parameter '$paramName' in function '$functionName' requires a type.")
+            }
+            FunctionParameter(
+                name = paramName,
+                mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
+                type = if (isReceiver) {
+                    if (index != 0) throw FlangCompileException("Receiver parameter 'this' must be the first parameter.")
+                    FlangType.INTERFACE(owner)
+                } else {
+                    FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces)
+                },
+            )
+        }
+    }
+
+    private fun buildInterfaceImplementationTable(
+        units: List<SourceUnit>,
+        interfaces: Map<String, InterfaceDefinition>,
+        structs: Map<String, StructDefinition>,
+        objects: Map<String, ObjectDefinition>,
+    ): List<InterfaceImplementation> {
+        val seen = mutableSetOf<InterfaceImplementationKey>()
+        return units.filter { it.kind == SourceKind.FL }.flatMap { unit ->
+            unit.file.item().mapNotNull { item ->
+                val impl = item.implDecl() ?: return@mapNotNull null
+                val interfaceName = impl.interfaceNameOrNull() ?: return@mapNotNull null
+                val implementor = impl.implementorName()
+                if (interfaceName !in interfaces) {
+                    throw FlangCompileException("Unknown interface '$interfaceName'.")
+                }
+                if (implementor !in structs && implementor !in objects) {
+                    throw FlangCompileException("Impl target '$implementor' is not a known struct or object.")
+                }
+                val key = InterfaceImplementationKey(interfaceName, implementor)
+                if (!seen.add(key)) {
+                    throw FlangCompileException("Duplicate impl '$interfaceName for $implementor'.")
+                }
+                InterfaceImplementation(
+                    interfaceName = interfaceName,
+                    implementorName = implementor,
+                    implementorType = if (implementor in objects) FlangType.OBJECT(implementor) else FlangType.STRUCT(implementor),
+                    implementorPackage = structs[implementor]?.packageName ?: unit.packageName,
+                    specializedMethodKeys = impl.functionDecl().map { InterfaceMethodKey.fromFunction(it, implementor) },
+                )
+            }
+        }
+    }
 }
 
 private data class LoweredFunction(val displayIdentifier: String, val entries: List<DfEntry>)
@@ -624,6 +865,67 @@ private data class ObjectDefinition(
     val name: String,
     val provider: EventProviderAnnotation?,
 )
+
+private data class InterfaceDefinition(
+    val name: String,
+    val packageName: String,
+    val methods: List<InterfaceMethodDefinition>,
+) {
+    val methodsByName: Map<String, InterfaceMethodDefinition> = methods.associateBy { it.name }
+}
+
+private data class InterfaceMethodDefinition(
+    val name: String,
+    val params: List<FunctionParameter>,
+    val returnType: FlangType?,
+    val isDefault: Boolean,
+    val isInline: Boolean,
+    val isPrivate: Boolean,
+    val function: FlangParser.FunctionDeclContext?,
+)
+
+private data class InterfaceImplementation(
+    val interfaceName: String,
+    val implementorName: String,
+    val implementorType: FlangType,
+    val implementorPackage: String,
+    val specializedMethodKeys: List<InterfaceMethodKey>,
+)
+
+private data class InterfaceImplementationKey(val interfaceName: String, val implementorName: String)
+
+private data class InterfaceMethodKey(
+    val name: String,
+    val params: List<FunctionParameter>,
+    val returnType: FlangType?,
+) {
+    fun matches(method: InterfaceMethodDefinition): Boolean =
+        name == method.name &&
+            params.size == method.params.size &&
+            params.zip(method.params).all { (actual, expected) ->
+                actual.name == expected.name &&
+                    actual.mutability == expected.mutability &&
+                    (actual.type.sourceName == expected.type.sourceName || expected.name == "this" && expected.type is FlangType.INTERFACE)
+            } &&
+            returnType?.sourceName == method.returnType?.sourceName
+
+    companion object {
+        fun fromFunction(function: FlangParser.FunctionDeclContext, owner: String): InterfaceMethodKey =
+            InterfaceMethodKey(
+                name = function.functionName().Identifier().text,
+                params = function.paramList()?.param().orEmpty().mapIndexed { index, param ->
+                    val typeRef = param.typeRef()
+                    val isReceiver = typeRef == null && param.Identifier().text == "this"
+                    FunctionParameter(
+                        name = param.Identifier().text,
+                        mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
+                        type = if (isReceiver && index == 0) parseSignatureType(owner) else parseSignatureType(typeRef!!.text),
+                    )
+                },
+                returnType = function.typeRef()?.text?.let(::parseSignatureType),
+            )
+    }
+}
 
 private enum class EventProviderKind {
     PLAYER,
@@ -685,12 +987,13 @@ private sealed class FlangType(open val sourceName: String) {
     data class STRUCT(val name: String) : FlangType(name)
     data class OBJECT(val name: String) : FlangType(name)
     data class ENUM(val name: String) : FlangType(name)
+    data class INTERFACE(val name: String) : FlangType(name)
 
     val isPrimitive: Boolean
         get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN
 
     val isVariableBacked: Boolean
-        get() = this == ANY || this is STRUCT || this is OBJECT || this is ENUM || this is LIST || this is DICT || this is TYPE_PARAMETER
+        get() = this == ANY || this is STRUCT || this is OBJECT || this is ENUM || this is INTERFACE || this is LIST || this is DICT || this is TYPE_PARAMETER
 
     companion object {
         fun fromTypeRef(
@@ -698,6 +1001,7 @@ private sealed class FlangType(open val sourceName: String) {
             structs: Map<String, StructDefinition>,
             enums: Map<String, EnumDefinition>,
             objects: Map<String, ObjectDefinition> = emptyMap(),
+            interfaces: Map<String, InterfaceDefinition> = emptyMap(),
             typeParameters: Set<String> = emptySet(),
         ): FlangType {
             typeRef.tupleType()?.let {
@@ -705,7 +1009,7 @@ private sealed class FlangType(open val sourceName: String) {
             }
             val simple = typeRef.simpleType()
             val name = simple.Identifier().text
-            val args = simple.typeRef().map { fromTypeRef(it, structs, enums, objects, typeParameters) }
+            val args = simple.typeRef().map { fromTypeRef(it, structs, enums, objects, interfaces, typeParameters) }
             return when (name) {
                 ANY.sourceName -> {
                     if (args.isNotEmpty()) throw FlangCompileException("Type 'Any' does not accept type arguments.")
@@ -748,8 +1052,11 @@ private sealed class FlangType(open val sourceName: String) {
                 } else if (objects.containsKey(name)) {
                     if (args.isNotEmpty()) throw FlangCompileException("Object '$name' does not accept type arguments.")
                     OBJECT(name)
+                } else if (interfaces.containsKey(name)) {
+                    if (args.isNotEmpty()) throw FlangCompileException("Interface '$name' does not accept type arguments.")
+                    INTERFACE(name)
                 } else {
-                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, List<T>, Dict<T>, a known struct, a known enum, or an in-scope type parameter.")
+                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, List<T>, Dict<T>, a known struct, object, enum, interface, or an in-scope type parameter.")
                 }
             }
         }
@@ -819,6 +1126,7 @@ private class FunctionLowering(
     private val structs: Map<String, StructDefinition>,
     private val enums: Map<String, EnumDefinition>,
     private val objects: Map<String, ObjectDefinition>,
+    private val interfaces: Map<String, InterfaceDefinition>,
     private val structMode: StructMode,
 ) {
     private var tempCounter = 0
@@ -940,13 +1248,13 @@ private class FunctionLowering(
 
     fun signatureForDeclaration(function: FlangParser.FunctionDeclContext, owner: String?, packageName: String = ""): FunctionSignature {
         val name = function.declaredName()
-        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums)
+        val typeParameters = function.genericTypeParameters() + implicitOwnerTypeParameters(function.functionName().typeRef(), structs, enums, objects, interfaces)
         val parameterTypes = function.paramList()?.param().orEmpty()
             .mapIndexed { index, param ->
                 if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
                     owner
                 } else {
-                    FlangType.fromTypeRef(param.typeRef(), structs, enums, objects, typeParameters).sourceName
+                    FlangType.fromTypeRef(param.typeRef(), structs, enums, objects, interfaces, typeParameters).sourceName
                 }
             }
             .joinToString(",")
@@ -998,6 +1306,7 @@ private class FunctionLowering(
                 is FlangType.STRUCT -> "var"
                 is FlangType.OBJECT -> "var"
                 is FlangType.ENUM -> "var"
+                is FlangType.INTERFACE -> "var"
             }
         }
 
@@ -1206,7 +1515,7 @@ private class FunctionLowering(
         val listType = iterable.type as? FlangType.LIST
             ?: throw FlangCompileException("foreach loop requires a List<T> iterable but got ${iterable.type.sourceName}.")
         val explicitType = header.typeRef()?.let {
-            FlangType.fromTypeRef(it, structs, enums, objects, context.signature.typeParameters)
+            FlangType.fromTypeRef(it, structs, enums, objects, interfaces, context.signature.typeParameters)
                 .substitute(context.signature.typeBindings)
         }
         val itemType = explicitType ?: listType.elementType
@@ -1266,7 +1575,7 @@ private class FunctionLowering(
             throw FlangCompileException("Local symbol '$name' uses reserved compiler prefix '$TEMP_PREFIX'.")
         }
         val explicitType = varDecl.typeRef()?.let {
-            FlangType.fromTypeRef(it, structs, enums, objects, context.signature.typeParameters)
+            FlangType.fromTypeRef(it, structs, enums, objects, interfaces, context.signature.typeParameters)
                 .substitute(context.signature.typeBindings)
         }
         val physicalName = context.physicalLocalName(name)
@@ -2315,6 +2624,19 @@ private class FunctionLowering(
 
         val baseSymbol = symbols[baseName]
         if (baseSymbol != null) {
+            val interfaceType = baseSymbol.type as? FlangType.INTERFACE
+            if (interfaceType != null) {
+                val interfaceDefinition = interfaces[interfaceType.name]
+                    ?: throw FlangCompileException("Unknown interface '${interfaceType.name}'.")
+                val overloads = interfaceDefinition.methods
+                    .filter { it.name == call.name }
+                    .filter { !it.isPrivate || interfaceDefinition.packageName == currentPackage }
+                    .map { interfaceMethodSignature(interfaceDefinition, it) }
+                if (overloads.isEmpty()) {
+                    throw FlangCompileException("Unknown member function '${baseSymbol.type.sourceName}.${call.name}'.")
+                }
+                return overloads
+            }
             val overloads = signatures.values
                 .filter { it.owner?.substringBefore("<") == baseSymbol.type.sourceName.substringBefore("<") && it.name == call.name }
                 .filter { it.hasReceiver }
@@ -2334,6 +2656,21 @@ private class FunctionLowering(
         }
         return overloads
     }
+
+    private fun interfaceMethodSignature(
+        interfaceDefinition: InterfaceDefinition,
+        method: InterfaceMethodDefinition,
+    ): FunctionSignature =
+        FunctionSignature(
+            name = method.name,
+            owner = interfaceDefinition.name,
+            packageName = interfaceDefinition.packageName,
+            params = method.params,
+            returnType = method.returnType,
+            hasReceiver = true,
+            isInline = method.isInline,
+            isPrivate = method.isPrivate,
+        )
 
     private fun canAccessSignature(signature: FunctionSignature): Boolean =
         !signature.isPrivate || signature.packageName == currentPackage
@@ -2437,6 +2774,7 @@ private class FunctionLowering(
         }
         val blocks = mutableListOf<DfEntry>()
         val items = mutableListOf<DfSlot>()
+        var dynamicReceiverTypePlaceholder: String? = null
         var slot = 0
         if (signature.returnType != null) {
             val out = outputName ?: throw FlangCompileException("Function '${call.name}' requires an output variable.")
@@ -2451,6 +2789,9 @@ private class FunctionLowering(
             }
             if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE) {
                 throw FlangCompileException("Cannot call mutable member function '${signature.sourceName}' on immutable val '$receiverName'.")
+            }
+            if (receiver.type is FlangType.INTERFACE) {
+                dynamicReceiverTypePlaceholder = interfaceRuntimeTypePlaceholder(receiver.name, receiver.type.name)
             }
             items += DfSlot(slot++, DfVariable(DfVariableScope.LINE, receiver.name))
             signature.params.drop(1)
@@ -2481,7 +2822,14 @@ private class FunctionLowering(
                 items += DfSlot(slot++, value.item)
             }
         }
-        blocks += DfBlock(block = "call_func", data = signature.fullIdentifier, args = DfArgs(items))
+        val callIdentifier = dynamicReceiverTypePlaceholder?.let { placeholder ->
+            val packagePrefix = if (signature.packageName.isEmpty()) "" else "${signature.packageName}."
+            val parameterTypes = signature.params.joinToString(",") { param ->
+                if (param.name == "this") placeholder else param.type.sourceName
+            }
+            "$packagePrefix$placeholder.${signature.name}($parameterTypes)"
+        } ?: signature.fullIdentifier
+        blocks += DfBlock(block = "call_func", data = callIdentifier, args = DfArgs(items))
         return blocks
     }
 
@@ -2727,6 +3075,16 @@ private class FunctionLowering(
             StructMode.DICT -> "%entry($enumVariableName,$fieldName)"
         }
 
+    private fun interfaceRuntimeTypePlaceholder(variableName: String, interfaceName: String): String {
+        val implementors = currentInterfaceImplementations.filter { it.interfaceName == interfaceName }
+        val objectOnly = implementors.isNotEmpty() && implementors.all { it.implementorName in objects }
+        return when {
+            objectOnly -> "%entry($variableName,$" + "type)"
+            structMode == StructMode.LIST -> "%index($variableName,1)"
+            else -> "%entry($variableName,$" + "type)"
+        }
+    }
+
     private fun primitiveStructFieldPlaceholder(structName: String, field: StructField): DfItem? {
         val placeholder = structFieldPlaceholder(structName, field)
         return when (field.type) {
@@ -2741,6 +3099,7 @@ private class FunctionLowering(
             is FlangType.STRUCT -> null
             is FlangType.OBJECT -> null
             is FlangType.ENUM -> null
+            is FlangType.INTERFACE -> null
         }
     }
 
@@ -2977,17 +3336,25 @@ private fun FlangParser.FunctionDeclContext.declaredName(): String =
 private fun FlangParser.FunctionDeclContext.genericTypeParameters(): Set<String> =
     genericParamList()?.Identifier().orEmpty().map { it.text }.toSet()
 
+private fun FlangParser.ImplDeclContext.interfaceNameOrNull(): String? =
+    if (FOR() == null) null else Identifier(0).text
+
+private fun FlangParser.ImplDeclContext.implementorName(): String =
+    if (FOR() == null) Identifier(0).text else Identifier(1).text
+
 private fun implicitOwnerTypeParameters(
     typeRef: FlangParser.TypeRefContext?,
     structs: Map<String, StructDefinition>,
     enums: Map<String, EnumDefinition>,
     objects: Map<String, ObjectDefinition> = emptyMap(),
+    interfaces: Map<String, InterfaceDefinition> = emptyMap(),
 ): Set<String> {
     if (typeRef == null) return emptySet()
     val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
     known += structs.keys
     known += enums.keys
     known += objects.keys
+    known += interfaces.keys
     return typeRef.text
         .split(Regex("[^A-Za-z_0-9]+"))
         .filter { it.isNotBlank() && it !in known }
@@ -3020,13 +3387,15 @@ private fun parseReceiverType(
     structs: Map<String, StructDefinition>,
     enums: Map<String, EnumDefinition>,
     objects: Map<String, ObjectDefinition>,
+    interfaces: Map<String, InterfaceDefinition> = emptyMap(),
 ): FlangType =
     when {
         owner.startsWith("List<") || owner.startsWith("Dict<") -> parseSignatureType(owner)
         owner in structs -> FlangType.STRUCT(owner)
         owner in objects -> FlangType.OBJECT(owner)
         owner in enums -> FlangType.ENUM(owner)
-        else -> throw FlangCompileException("Impl target '$owner' is not a known struct or object.")
+        owner in interfaces -> FlangType.INTERFACE(owner)
+        else -> throw FlangCompileException("Impl target '$owner' is not a known struct, object, enum, or interface.")
     }
 
 private fun parseEventProviderAnnotation(
@@ -3082,6 +3451,8 @@ private fun parseGameValueOverrideType(text: String, gameValueName: String): Fla
 private fun FlangType.isAssignableTo(expected: FlangType): Boolean =
     expected == FlangType.ANY ||
         this == expected ||
+        this is FlangType.STRUCT && expected is FlangType.INTERFACE && InterfaceImplementationKey(expected.name, this.name) in currentInterfaceImplementations ||
+        this is FlangType.OBJECT && expected is FlangType.INTERFACE && InterfaceImplementationKey(expected.name, this.name) in currentInterfaceImplementations ||
         this is FlangType.LIST && expected is FlangType.LIST && this.elementType.isAssignableTo(expected.elementType) ||
         this is FlangType.DICT && expected is FlangType.DICT && this.valueType.isAssignableTo(expected.valueType)
 

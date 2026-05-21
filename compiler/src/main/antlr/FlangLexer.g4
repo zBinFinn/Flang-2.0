@@ -19,6 +19,7 @@ IN      : 'in';
 WHILE   : 'while';
 WHEN    : 'when';
 STRUCT  : 'struct';
+INTERFACE : 'interface';
 ENUM    : 'enum';
 IMPL    : 'impl';
 OBJECT  : 'object';
