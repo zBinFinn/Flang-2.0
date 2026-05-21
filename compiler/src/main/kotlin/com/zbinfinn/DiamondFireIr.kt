@@ -34,8 +34,12 @@ data class DfBlock(
         data?.let { put("data", it) }
     }
 
+    // DiamondFireIr.kt line 37
     private fun blockNeedsArgs(block: String): Boolean =
-        block in setOf("event", "func", "player_action", "game_action", "set_var", "select_obj", "call_func")
+        block in setOf(
+            "event", "entity_event", "game_event", "func", "process", "player_action", "entity_action", "game_action",
+            "set_var", "select_obj", "call_func", "start_process", "control", "if_player", "if_entity", "if_game"
+        )
 }
 
 data class DfBracket(val direct: String, val type: String) : DfEntry {

@@ -22,5 +22,6 @@ fn testPlayer(var event: PlayerJoinEvent) {
     }
 
     event.getPlayer().sendMessage(s"<green>Hello World");
+    event.cancel();
 }
 
