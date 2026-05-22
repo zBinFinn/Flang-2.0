@@ -23,6 +23,7 @@ data class DfBlock(
     val action: String? = null,
     val data: String? = null,
     val args: DfArgs = DfArgs(emptyList()),
+    val sourceOrigin: DfSourceOrigin? = null,
 ) : DfEntry {
     override fun toJson(): JsonObject = buildJsonObject {
         put("id", "block")
@@ -41,6 +42,12 @@ data class DfBlock(
             "set_var", "select_obj", "call_func", "start_process", "control", "if_player", "if_entity", "if_game"
         )
 }
+
+data class DfSourceOrigin(
+    val fileId: String,
+    val line: Int,
+    val column: Int,
+)
 
 data class DfBracket(val direct: String, val type: String) : DfEntry {
     override fun toJson(): JsonObject = buildJsonObject {

@@ -1,5 +1,5 @@
 - Verify that importing specific functions works properly
 - Auto-completion for import pathing
 - Auto-completion for functions on structs
-- Interfaces
 - Stdlib work -> interface that both Player and Entity implement called EntityOrPlayer or sm...
+- `when` syntax

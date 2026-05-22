@@ -8,9 +8,9 @@ import com.intellij.psi.tree.IElementType
 class FlangBraceMatcher : PairedBraceMatcher {
     override fun getPairs(): Array<BracePair> =
         arrayOf(
-            BracePair(FlangTokenTypes.BRACE, FlangTokenTypes.BRACE, true),
-            BracePair(FlangTokenTypes.PAREN, FlangTokenTypes.PAREN, false),
-            BracePair(FlangTokenTypes.BRACKET, FlangTokenTypes.BRACKET, false),
+            BracePair(FlangTokenTypes.LBRACE, FlangTokenTypes.RBRACE, true),
+            BracePair(FlangTokenTypes.LPAREN, FlangTokenTypes.RPAREN, false),
+            BracePair(FlangTokenTypes.LBRACKET, FlangTokenTypes.RBRACKET, false),
         )
 
     override fun isPairedBracesAllowedBeforeType(lbraceType: IElementType, contextType: IElementType?): Boolean = true

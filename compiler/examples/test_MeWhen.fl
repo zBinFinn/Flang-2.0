@@ -1,0 +1,62 @@
+package main;
+
+import std.prelude;
+
+fn spawnCreeper() -> Entity {
+    val spawnEgg = newItem("creeper_spawn_egg");
+    val silly: Num;
+    emit `set_variable "SetAllCoords" args($silly$, 2, 50, 5)`;
+    emit `game_action "SpawnMob" args($spawnEgg$, $silly$)`;
+    return Entity {
+        uuid: gval("UUID", .LastEntity)
+    }
+}
+
+@Event
+fn join(var event: PlayerJoinEvent) {
+    var player = event.getPlayer();
+    var creeper = spawnCreeper();
+    if (creeper.getTag("hello") == "Hello") {
+        player.sendMessage(s"Hello 1");
+    }
+
+    creeper.setTag("hello", "Hello");
+    if (creeper.getTag("hello") == "Hello") {
+        player.sendMessage(s"Hello 2");
+    }
+
+
+    return;
+
+    var item = newItem("stone");
+
+    itemSetTag(&item, "hello", "World");
+    player.giveItem(item);
+
+    if (itemHasTag(item, "hello")) {
+        player.sendMessage(s"Has hello Tag");
+    }
+
+    if (itemHasTag(item, "hello2")) {
+        player.sendMessage(s"Has hello2 Tag");
+    } else {
+        player.sendMessage(s"Does not have hello2 Tag");
+    }
+}
+
+fn newItem(id: String) -> Item {
+    var out: Item;
+    emit `set_variable "SetItemType" args($out$, $id$) tags(..)`;
+    return out;
+}
+
+inline fn itemSetTag(var item: Item, tag: String, value: String) {
+    emit `set_variable "SetItemTag" args($item$, $tag$, $value$)`;
+}
+
+fn itemHasTag(item: Item, tag: String) -> Boolean {
+    if emit `if_variable "ItemHasTag" args($item$, $tag$)` {
+        return true;
+    }
+    return false;
+}

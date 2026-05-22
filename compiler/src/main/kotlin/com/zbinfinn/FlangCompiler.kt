@@ -20,10 +20,13 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Base64
 import java.util.zip.GZIPOutputStream
+import kotlin.io.path.relativeTo
+import kotlin.io.path.relativeToOrSelf
 
 data class CompileOptions(
     val templateNameOverride: String? = null,
     val structMode: StructMode = StructMode.LIST,
+    val panicOnBadAs: Boolean = false,
     val optimizations: Set<Optimization> = emptySet(),
 )
 
@@ -34,6 +37,7 @@ enum class StructMode {
 
 enum class Optimization {
     ELIDE_REDUNDANT_SELECT_RESET,
+    ELIDE_REDUNDANT_VAR_HANDOFF,
 }
 
 data class CompiledTemplate(
@@ -110,7 +114,17 @@ object FlangCompiler {
         currentInterfaceImplementations = interfaceImpls.map { InterfaceImplementationKey(it.interfaceName, it.implementorName) }.toSet()
         val signatures = buildFunctionSignatures(units, structs, enums, objects, interfaces, interfaceImpls)
         val declarations = buildFunctionDeclarations(units, signatures, interfaces, interfaceImpls)
-        val lowering = FunctionLowering(ActionDump.loadFromResources(), signatures, declarations, structs, enums, objects, interfaces, options.structMode)
+        val lowering = FunctionLowering(
+            actionDump = ActionDump.loadFromResources(),
+            signatures = signatures,
+            declarations = declarations,
+            structs = structs,
+            enums = enums,
+            objects = objects,
+            interfaces = interfaces,
+            structMode = options.structMode,
+            panicOnBadAs = options.panicOnBadAs,
+        )
         declarations.values.forEach { declaration ->
             val signature = lowering.signatureForDeclaration(declaration.function, declaration.owner, declaration.packageName)
             if (declaration.annotations.any { it.Identifier().text == "Event" } && signature.isInline) {
@@ -145,7 +159,7 @@ object FlangCompiler {
             if (signature.isInline || loweredByIdentifier.containsKey(signature.fullIdentifier)) return
             val declaration = declarations[signature.fullIdentifier]
                 ?: throw FlangCompileException("Function '${signature.fullIdentifier}' has no declaration.")
-            val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName)
+            val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName, declaration.sourceId)
             loweredByIdentifier[signature.fullIdentifier] = lowered
             enqueueCalls(lowered.entries)
         }
@@ -178,7 +192,7 @@ object FlangCompiler {
         }
 
         val templates = loweredFunctions.map { lowered ->
-            val optimizedEntries = optimize(lowered.entries, options.optimizations)
+            val optimizedEntries = optimize(lowered.entries, options.optimizations, lowered.functionIdentifier)
             val template = DfTemplate(optimizedEntries)
             val templateJson = json.encodeToString(JsonElement.serializer(), template.toJson())
             val displayName = templateName(options, lowered.displayIdentifier, loweredFunctions.size)
@@ -203,12 +217,13 @@ object FlangCompiler {
         lateinit var loadImport: (String, List<Path>) -> SourceUnit
 
         fun loadPath(path: Path, moduleName: String?, expectedPackage: String?): SourceUnit {
-            val normalized = path.toAbsolutePath().normalize()
+            val normalized = path.toAbsolutePath().normalize();
             val key = moduleName ?: "file:${normalized}"
             loaded[key]?.let { return it }
             val source = Files.readString(normalized)
             val kind = sourceKind(normalized.toString())
-            val unit = sourceUnit(normalized.toString(), moduleName, kind, parse(source), expectedPackage)
+            // TODO: normalized.last().toString() is horrible
+            val unit = sourceUnit(normalized.last().toString(), moduleName, kind, parse(source), expectedPackage)
             val existing = loaded[key]
             if (existing != null) {
                 if (existing.id != unit.id) {
@@ -319,10 +334,19 @@ object FlangCompiler {
         return Regex("""\)\.([A-Za-z_][A-Za-z0-9_]*)\(""").find(identifier)?.groupValues?.get(1)
     }
 
-    private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>): List<DfEntry> {
+    private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>, functionIdentifier: String): List<DfEntry> {
         var optimized = entries
         if (Optimization.ELIDE_REDUNDANT_SELECT_RESET in optimizations) {
             optimized = elideRedundantSelectReset(optimized)
+        }
+        if (Optimization.ELIDE_REDUNDANT_VAR_HANDOFF in optimizations) {
+            val result = elideRedundantVarHandoffs(optimized)
+            optimized = result.entries
+            result.warnings.forEach { warning ->
+                val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
+//                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+                // TODO
+            }
         }
         return optimized
     }
@@ -342,6 +366,125 @@ object FlangCompiler {
 
     private fun DfEntry?.isSelectObject(): Boolean =
         this is DfBlock && block == "select_obj"
+
+    private data class VariableOccurrence(
+        val key: ScopedVar,
+        val entryIndex: Int,
+        val slot: Int,
+    )
+
+    private data class ScopedVar(
+        val scope: DfVariableScope,
+        val name: String,
+    )
+
+    private data class VarHandoffWarning(
+        val elidedVariable: String,
+        val rewiredVariable: String,
+        val origin: DfSourceOrigin?,
+    )
+
+    private data class VarHandoffOptimizationResult(
+        val entries: List<DfEntry>,
+        val warnings: List<VarHandoffWarning>,
+    )
+
+    private fun elideRedundantVarHandoffs(entries: List<DfEntry>): VarHandoffOptimizationResult {
+        val occurrencesByVar = linkedMapOf<ScopedVar, MutableList<VariableOccurrence>>()
+
+        entries.forEachIndexed { entryIndex, entry ->
+            val block = entry as? DfBlock ?: return@forEachIndexed
+            block.args.items.forEach { slot ->
+                val variable = slot.item as? DfVariable ?: return@forEach
+                occurrencesByVar
+                    .getOrPut(ScopedVar(variable.scope, variable.name)) { mutableListOf() }
+                    .add(VariableOccurrence(ScopedVar(variable.scope, variable.name), entryIndex, slot.slot))
+            }
+        }
+
+        val removed = mutableSetOf<Int>()
+        val rewrittenTargets = mutableMapOf<Int, DfVariable>()
+        val warnings = mutableListOf<VarHandoffWarning>()
+
+        occurrencesByVar.forEach { (candidate, occurrences) ->
+            if (occurrences.size != 2) return@forEach
+            val first = occurrences[0]
+            val second = occurrences[1]
+            if (first.entryIndex + 1 != second.entryIndex) return@forEach
+            if (first.slot != 0 || second.slot != 1) return@forEach
+            if (first.entryIndex in removed || second.entryIndex in removed) return@forEach
+
+            val producer = entries.getOrNull(first.entryIndex) as? DfBlock ?: return@forEach
+            val copy = entries.getOrNull(second.entryIndex) as? DfBlock ?: return@forEach
+
+            if (producer.block != "set_var") return@forEach
+            if (copy.block != "set_var" || copy.action != "=") return@forEach
+            if (containsSuspiciousDynamicVarReference(entries, candidate.name)) return@forEach
+
+            val producerTarget = producer.slotVariable(0) ?: return@forEach
+            if (producerTarget.scope != candidate.scope || producerTarget.name != candidate.name) return@forEach
+            if (producer.referencesVariableBeyondSlot(candidate, allowedSlot = 0)) return@forEach
+
+            val copyTarget = copy.slotVariable(0) ?: return@forEach
+            val copySource = copy.slotVariable(1) ?: return@forEach
+            if (copySource.scope != candidate.scope || copySource.name != candidate.name) return@forEach
+
+            rewrittenTargets[first.entryIndex] = copyTarget
+            removed += second.entryIndex
+            warnings += VarHandoffWarning(
+                elidedVariable = candidate.name,
+                rewiredVariable = copyTarget.name,
+                origin = producer.sourceOrigin,
+            )
+        }
+
+        val optimized = buildList {
+            entries.forEachIndexed { index, entry ->
+                if (index in removed) return@forEachIndexed
+                val rewritten = rewrittenTargets[index]
+                if (rewritten != null) {
+                    val block = entry as DfBlock
+                    add(block.withSlotVariable(0, rewritten))
+                } else {
+                    add(entry)
+                }
+            }
+        }
+        return VarHandoffOptimizationResult(entries = optimized, warnings = warnings)
+    }
+
+    private fun containsSuspiciousDynamicVarReference(entries: List<DfEntry>, variableName: String): Boolean {
+        val placeholder = "%var($variableName)"
+        return entries.any { entry ->
+            val block = entry as? DfBlock ?: return@any false
+            block.args.items.any { slot ->
+                when (val item = slot.item) {
+                    is DfText -> item.value.contains(placeholder)
+                    is DfVariable -> item.name.contains(placeholder)
+                    else -> false
+                }
+            }
+        }
+    }
+
+    private fun DfBlock.slotVariable(slot: Int): DfVariable? =
+        args.items.firstOrNull { it.slot == slot }?.item as? DfVariable
+
+    private fun DfBlock.referencesVariableBeyondSlot(variable: ScopedVar, allowedSlot: Int): Boolean =
+        args.items.any { slot ->
+            if (slot.slot == allowedSlot) return@any false
+            val item = slot.item as? DfVariable ?: return@any false
+            item.scope == variable.scope && item.name == variable.name
+        }
+
+    private fun DfBlock.withSlotVariable(slot: Int, replacement: DfVariable): DfBlock {
+        val matches = args.items.filter { it.slot == slot }
+        if (matches.size != 1) return this
+        val rewrittenItems = args.items.map {
+            if (it.slot == slot) DfSlot(slot = slot, item = replacement) else it
+        }
+        return copy(args = DfArgs(rewrittenItems))
+    }
 
     private fun templateName(
         options: CompileOptions,
@@ -494,13 +637,13 @@ object FlangCompiler {
                 item.functionDecl()?.let { function ->
                     val owner = function.functionName().typeRef()?.text
                     val signature = signatureForFunctionDeclaration(function, owner = owner, packageName = unit.packageName, signatures)
-                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName)
+                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName, sourceId = unit.id)
                 }
                 item.implDecl()?.let { impl ->
                     val owner = impl.implementorName()
                     impl.functionDecl().forEach { function ->
                         val signature = signatureForFunctionDeclaration(function, owner, packageName = unit.packageName, signatures)
-                        declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName)
+                        declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName, sourceId = unit.id)
                     }
                 }
             }
@@ -510,7 +653,13 @@ object FlangCompiler {
             interfaceDefinition.methods.filter { it.isDefault && implementation.specializedMethodKeys.none { key -> key.matches(it) } }.forEach { method ->
                 val function = method.function ?: throw FlangCompileException("Interface method '${method.name}' has no default body.")
                 val signature = signatureForInterfaceDefault(function, implementation.implementorName, implementation.implementorPackage, signatures)
-                declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = implementation.implementorName, packageName = implementation.implementorPackage)
+                declarations[signature.fullIdentifier] = FunctionDeclaration(
+                    emptyList(),
+                    function,
+                    owner = implementation.implementorName,
+                    packageName = implementation.implementorPackage,
+                    sourceId = "<interface-default:${implementation.interfaceName}>",
+                )
             }
         }
         return declarations
@@ -629,7 +778,7 @@ object FlangCompiler {
         interfaces: Map<String, InterfaceDefinition> = emptyMap(),
     ): Set<String> {
         if (typeRef == null) return emptySet()
-        val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+        val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound", "List", "Dict")
         known += structs.keys
         known += enums.keys
         known += objects.keys
@@ -713,7 +862,7 @@ object FlangCompiler {
             enums[SELECTION_TYPE_ENUM] = EnumDefinition(
                 SELECTION_TYPE_ENUM,
                 "",
-                listOf("Default", "Selection", "Victim", "Attacker").mapIndexed { index, name ->
+                listOf("Default", "Selection", "Victim", "Attacker", "LastEntity").mapIndexed { index, name ->
                     EnumEntry(name, index)
                 },
             )
@@ -859,7 +1008,11 @@ object FlangCompiler {
     }
 }
 
-private data class LoweredFunction(val displayIdentifier: String, val entries: List<DfEntry>)
+private data class LoweredFunction(
+    val displayIdentifier: String,
+    val entries: List<DfEntry>,
+    val functionIdentifier: String,
+)
 
 private data class ObjectDefinition(
     val name: String,
@@ -943,6 +1096,7 @@ private data class FunctionDeclaration(
     val function: FlangParser.FunctionDeclContext,
     val owner: String?,
     val packageName: String,
+    val sourceId: String,
 )
 
 private data class FunctionSignature(
@@ -981,6 +1135,11 @@ private sealed class FlangType(open val sourceName: String) {
     data object STRING : FlangType("String")
     data object TEXT : FlangType("Text")
     data object BOOLEAN : FlangType("Boolean")
+    data object ITEM : FlangType("Item")
+    data object LOCATION : FlangType("Location")
+    data object PARTICLE : FlangType("Particle")
+    data object VECTOR : FlangType("Vector")
+    data object SOUND : FlangType("Sound")
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
@@ -990,7 +1149,7 @@ private sealed class FlangType(open val sourceName: String) {
     data class INTERFACE(val name: String) : FlangType(name)
 
     val isPrimitive: Boolean
-        get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN
+        get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN || this == ITEM || this == LOCATION || this == PARTICLE || this == VECTOR || this == SOUND
 
     val isVariableBacked: Boolean
         get() = this == ANY || this is STRUCT || this is OBJECT || this is ENUM || this is INTERFACE || this is LIST || this is DICT || this is TYPE_PARAMETER
@@ -1031,6 +1190,26 @@ private sealed class FlangType(open val sourceName: String) {
                     if (args.isNotEmpty()) throw FlangCompileException("Type 'Boolean' does not accept type arguments.")
                     BOOLEAN
                 }
+                ITEM.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Item' does not accept type arguments.")
+                    ITEM
+                }
+                LOCATION.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Location' does not accept type arguments.")
+                    LOCATION
+                }
+                PARTICLE.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Particle' does not accept type arguments.")
+                    PARTICLE
+                }
+                VECTOR.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Vector' does not accept type arguments.")
+                    VECTOR
+                }
+                SOUND.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Sound' does not accept type arguments.")
+                    SOUND
+                }
                 "List" -> {
                     if (args.size != 1) throw FlangCompileException("Type 'List' expects exactly one type argument.")
                     LIST(args.single())
@@ -1056,7 +1235,7 @@ private sealed class FlangType(open val sourceName: String) {
                     if (args.isNotEmpty()) throw FlangCompileException("Interface '$name' does not accept type arguments.")
                     INTERFACE(name)
                 } else {
-                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, List<T>, Dict<T>, a known struct, object, enum, interface, or an in-scope type parameter.")
+                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, Item, Location, Particle, Vector, Sound, List<T>, Dict<T>, a known struct, object, enum, interface, or an in-scope type parameter.")
                 }
             }
         }
@@ -1128,10 +1307,13 @@ private class FunctionLowering(
     private val objects: Map<String, ObjectDefinition>,
     private val interfaces: Map<String, InterfaceDefinition>,
     private val structMode: StructMode,
+    private val panicOnBadAs: Boolean,
 ) {
     private var tempCounter = 0
     private var inlineCounter = 0
     private var currentPackage = ""
+    private var currentSourceId = "<unknown>"
+    private var currentStatementOrigin: DfSourceOrigin? = null
     private val inlineCallStack = mutableListOf<String>()
     private val overloadsByName: Map<String, List<FunctionSignature>> =
         signatures.values.filter { it.owner == null }.groupBy { it.name }
@@ -1179,12 +1361,17 @@ private class FunctionLowering(
         function: FlangParser.FunctionDeclContext,
         owner: String? = null,
         packageName: String = "",
+        sourceId: String = "<unknown>",
     ): LoweredFunction {
         tempCounter = 0
         val functionName = function.declaredName()
         val signature = signatureForDeclaration(function, owner, packageName)
         val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
+        val previousStatementOrigin = currentStatementOrigin
         currentPackage = signature.packageName
+        currentSourceId = sourceId
+        currentStatementOrigin = null
         try {
         val isEvent = annotations.any { it.Identifier().text == "Event" }
         if (isEvent && signature.isInline) {
@@ -1216,7 +1403,7 @@ private class FunctionLowering(
 
         val entries = mutableListOf<DfEntry>(header)
         function.block().stmt().forEach { stmt ->
-            entries += lowerStatement(stmt, symbols, context)
+            entries += lowerStatementWithOrigin(stmt, symbols, context)
         }
         if (signature.returnType != null && !context.sawReturn) {
             throw FlangCompileException("Function '$functionName' declares return type ${signature.returnType.sourceName} but has no return statement.")
@@ -1227,9 +1414,29 @@ private class FunctionLowering(
         } else {
             signature.fullIdentifier
         }
-        return LoweredFunction(displayIdentifier, entries)
+        return LoweredFunction(displayIdentifier, entries, signature.fullIdentifier)
         } finally {
             currentPackage = previousPackage
+            currentSourceId = previousSourceId
+            currentStatementOrigin = previousStatementOrigin
+        }
+    }
+
+    private fun lowerStatementWithOrigin(
+        stmt: FlangParser.StmtContext,
+        symbols: MutableMap<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val previousOrigin = currentStatementOrigin
+        currentStatementOrigin = DfSourceOrigin(
+            fileId = currentSourceId,
+            line = stmt.start.line,
+            column = stmt.start.charPositionInLine + 1,
+        )
+        try {
+            return lowerStatement(stmt, symbols, context)
+        } finally {
+            currentStatementOrigin = previousOrigin
         }
     }
 
@@ -1292,20 +1499,25 @@ private class FunctionLowering(
     }
 
     private fun parameterElementType(param: FunctionParameter): String =
-        if (param.mutability == Mutability.MUTABLE || param.type.isVariableBacked) {
+        if (param.mutability == Mutability.MUTABLE) {
             "var"
         } else {
             when (param.type) {
-                FlangType.ANY -> "var"
-                FlangType.NUM, FlangType.BOOLEAN -> "num"
-                FlangType.STRING -> "txt"
-                FlangType.TEXT -> "comp"
-                is FlangType.TYPE_PARAMETER -> "var"
-                is FlangType.LIST -> "var"
-                is FlangType.DICT -> "var"
-                is FlangType.STRUCT -> "var"
-                is FlangType.OBJECT -> "var"
-                is FlangType.ENUM -> "var"
+                is FlangType.ANY -> "any"
+                is FlangType.NUM, FlangType.BOOLEAN -> "num"
+                is FlangType.STRING -> "txt"
+                is FlangType.TEXT -> "comp"
+                is FlangType.ITEM -> "item"
+                is FlangType.LOCATION -> "loc"
+                is FlangType.PARTICLE -> "part"
+                is FlangType.VECTOR -> "vec"
+                is FlangType.SOUND -> "snd"
+                is FlangType.TYPE_PARAMETER,
+                is FlangType.LIST,
+                is FlangType.DICT,
+                is FlangType.STRUCT,
+                is FlangType.OBJECT,
+                is FlangType.ENUM,
                 is FlangType.INTERFACE -> "var"
             }
         }
@@ -1358,7 +1570,7 @@ private class FunctionLowering(
         )
         val entries = mutableListOf<DfEntry>()
         block.stmt().forEach { stmt ->
-            entries += lowerStatement(stmt, branchSymbols, branchContext)
+            entries += lowerStatementWithOrigin(stmt, branchSymbols, branchContext)
         }
         return LoweredBranch(entries, branchContext.sawReturn)
     }
@@ -2002,6 +2214,37 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
         expectedType: FlangType? = null,
     ): ExpressionValue {
+        val castTargets = postfix.typeRef()
+        if (castTargets.isNotEmpty()) {
+            var current = lowerPostfixWithoutCastsToItem(postfix, symbols, expectedType)
+            castTargets.forEach { castTypeRef ->
+                val castType = parseCastType(castTypeRef)
+                if (!current.type.isAllowedAsSourceForAsCast()) {
+                    throw FlangCompileException("Cannot cast ${current.type.sourceName} with 'as'. Only Any, List<Any>, and Dict<Any> can be cast.")
+                }
+                if (!current.type.isAllowedAsSourceForAsCastTo(castType)) {
+                    throw FlangCompileException("Cannot cast ${current.type.sourceName} to ${castType.sourceName} with 'as'.")
+                }
+                val prelude = current.prelude.toMutableList()
+                if (panicOnBadAs) {
+                    prelude += asCastRuntimeGuard(current.item, current.type, castType)
+                }
+                current = ExpressionValue(
+                    type = castType,
+                    item = current.item,
+                    prelude = prelude,
+                )
+            }
+            return current
+        }
+        return lowerPostfixWithoutCastsToItem(postfix, symbols, expectedType)
+    }
+
+    private fun lowerPostfixWithoutCastsToItem(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
+    ): ExpressionValue {
         val enumLiteral = postfix.enumLiteralOrNull(expectedType)
         if (enumLiteral != null) {
             return lowerToTemp(symbols) { temp -> lowerEnumLiteralToTarget(enumLiteral, temp) }
@@ -2397,6 +2640,28 @@ private class FunctionLowering(
     }
 
     private fun inferPostfixType(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        val castTargets = postfix.typeRef()
+        if (castTargets.isNotEmpty()) {
+            var current = inferPostfixTypeWithoutCasts(postfix, symbols)
+            castTargets.forEach { castTypeRef ->
+                val castType = parseCastType(castTypeRef)
+                if (!current.isAllowedAsSourceForAsCast()) {
+                    throw FlangCompileException("Cannot cast ${current.sourceName} with 'as'. Only Any, List<Any>, and Dict<Any> can be cast.")
+                }
+                if (!current.isAllowedAsSourceForAsCastTo(castType)) {
+                    throw FlangCompileException("Cannot cast ${current.sourceName} to ${castType.sourceName} with 'as'.")
+                }
+                current = castType
+            }
+            return current
+        }
+        return inferPostfixTypeWithoutCasts(postfix, symbols)
+    }
+
+    private fun inferPostfixTypeWithoutCasts(
         postfix: FlangParser.PostfixContext,
         symbols: Map<String, Symbol>,
     ): FlangType {
@@ -2853,11 +3118,13 @@ private class FunctionLowering(
 
         inlineCallStack += signature.fullIdentifier
         val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
         currentPackage = signature.packageName
         try {
             val prefix = inlinePrefix(signature)
             val blocks = mutableListOf<DfEntry>()
             val inlineSymbols = linkedMapOf<String, Symbol>()
+            currentSourceId = declaration.sourceId
             val explicitParams = if (signature.hasReceiver) signature.params.drop(1) else signature.params
 
             if (signature.hasReceiver) {
@@ -2912,7 +3179,7 @@ private class FunctionLowering(
                 inlineReturnMode = returnMode,
             )
             declaration.function.block().stmt().forEach { stmt ->
-                blocks += lowerStatement(stmt, inlineSymbols, context)
+                blocks += lowerStatementWithOrigin(stmt, inlineSymbols, context)
             }
 
             return if (returnMode == InlineReturnMode.STOP_REPEAT) {
@@ -2924,6 +3191,7 @@ private class FunctionLowering(
             }
         } finally {
             currentPackage = previousPackage
+            currentSourceId = previousSourceId
             inlineCallStack.removeAt(inlineCallStack.lastIndex)
         }
     }
@@ -3054,7 +3322,90 @@ private class FunctionLowering(
                     values.mapIndexed { index, item -> DfSlot(slot = index + 1, item = item) } +
                     tags,
             ),
+            sourceOrigin = currentStatementOrigin,
         )
+
+    private fun parseCastType(typeRef: FlangParser.TypeRefContext): FlangType =
+        FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces, emptySet())
+
+    private fun FlangType.isAllowedAsSourceForAsCast(): Boolean =
+        this == FlangType.ANY ||
+            (this is FlangType.LIST && this.elementType == FlangType.ANY) ||
+            (this is FlangType.DICT && this.valueType == FlangType.ANY)
+
+    private fun FlangType.isAllowedAsSourceForAsCastTo(target: FlangType): Boolean =
+        when {
+            this == FlangType.ANY -> true
+            this is FlangType.LIST && this.elementType == FlangType.ANY && target is FlangType.LIST -> true
+            this is FlangType.DICT && this.valueType == FlangType.ANY && target is FlangType.DICT -> true
+            else -> false
+        }
+
+    private fun asCastRuntimeGuard(
+        value: DfItem,
+        sourceType: FlangType,
+        targetType: FlangType,
+    ): List<DfEntry> {
+        val typeOption = runtimeTypeOptionForCast(sourceType, targetType)
+        return listOf(
+            DfBlock(
+                block = "if_var",
+                action = "VarIsType",
+                args = DfArgs(
+                    listOf(
+                        DfSlot(slot = 0, item = value),
+                        DfSlot(
+                            slot = 26,
+                            item = DfBlockTag(
+                                block = "if_var",
+                                action = "VarIsType",
+                                tag = "Variable Type",
+                                option = typeOption,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            DfBracket(direct = "open", type = "norm"),
+            DfBracket(direct = "close", type = "norm"),
+            DfBlock(block = "else"),
+            DfBracket(direct = "open", type = "norm"),
+            DfBlock(
+                block = "control",
+                action = "PrintDebug",
+                args = DfArgs(listOf(DfSlot(0, DfText("Cast failed: expected ${targetType.sourceName}, got ${sourceType.sourceName}")))),
+            ),
+            DfBlock(block = "control", action = "EndAllThreads"),
+            DfBracket(direct = "close", type = "norm"),
+        )
+    }
+
+    private fun runtimeTypeOptionForCast(sourceType: FlangType, targetType: FlangType): String =
+        when (targetType) {
+            FlangType.NUM, FlangType.BOOLEAN -> "Number"
+            FlangType.STRING -> "String"
+            FlangType.TEXT -> "Styled Text"
+            FlangType.ITEM -> "Item"
+            FlangType.LOCATION -> "Location"
+            FlangType.PARTICLE -> "Particle"
+            FlangType.VECTOR -> "Vector"
+            FlangType.SOUND -> "Sound"
+            is FlangType.LIST -> "List"
+            is FlangType.DICT -> "Dictionary"
+            FlangType.ANY -> when (sourceType) {
+                is FlangType.LIST -> "List"
+                is FlangType.DICT -> "Dictionary"
+                FlangType.TEXT -> "Styled Text"
+                FlangType.STRING -> "String"
+                FlangType.ITEM -> "Item"
+                FlangType.LOCATION -> "Location"
+                FlangType.PARTICLE -> "Particle"
+                FlangType.VECTOR -> "Vector"
+                FlangType.SOUND -> "Sound"
+                else -> "Number"
+            }
+            else -> throw FlangCompileException("Runtime panic checks for 'as ${targetType.sourceName}' are not supported.")
+        }
 
     private fun structFieldPlaceholder(structName: String, field: StructField): String =
         when (structMode) {
@@ -3088,11 +3439,16 @@ private class FunctionLowering(
     private fun primitiveStructFieldPlaceholder(structName: String, field: StructField): DfItem? {
         val placeholder = structFieldPlaceholder(structName, field)
         return when (field.type) {
-            FlangType.ANY -> null
-            FlangType.NUM -> DfNumber(placeholder)
-            FlangType.STRING -> DfText(placeholder)
-            FlangType.TEXT -> DfComponent(placeholder)
-            FlangType.BOOLEAN -> DfNumber(placeholder)
+            is FlangType.ANY -> null
+            is FlangType.NUM -> DfNumber(placeholder)
+            is FlangType.STRING -> DfText(placeholder)
+            is FlangType.TEXT -> DfComponent(placeholder)
+            is FlangType.BOOLEAN -> DfNumber(placeholder)
+            is FlangType.ITEM -> null
+            is FlangType.LOCATION -> null
+            is FlangType.PARTICLE -> null
+            is FlangType.VECTOR -> null
+            is FlangType.SOUND -> null
             is FlangType.TYPE_PARAMETER -> null
             is FlangType.LIST -> null
             is FlangType.DICT -> null
@@ -3262,6 +3618,17 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
     ): LoweredEmitArg =
         when {
+            arg.PERCENT() != null -> {
+                val scope = arg.Identifier().firstOrNull()?.text?.let { DfVariableScope.fromSource(it) } ?: DfVariableScope.LINE
+                val dynamicNameExpr = arg.expr()
+                val value = lowerExpressionToTempBackedValue(dynamicNameExpr, symbols)
+                val varName = when (value.item) {
+                    is DfVariable -> "%var(${value.item.name})"
+                    is DfText -> value.item.value
+                    else -> throw FlangCompileException("Dynamic %var(...) names must resolve to a variable or string value.")
+                }
+                LoweredEmitArg(DfVariable(scope, varName), value.prelude)
+            }
             arg.DOLLAR(0) != null -> {
                 val value = lowerExpressionToTempBackedValue(arg.expr(), symbols)
                 LoweredEmitArg(value.item, value.prelude)
@@ -3350,7 +3717,7 @@ private fun implicitOwnerTypeParameters(
     interfaces: Map<String, InterfaceDefinition> = emptyMap(),
 ): Set<String> {
     if (typeRef == null) return emptySet()
-    val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+    val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound", "List", "Dict")
     known += structs.keys
     known += enums.keys
     known += objects.keys
@@ -3376,6 +3743,11 @@ private fun parseSignatureType(text: String): FlangType =
         text == "String" -> FlangType.STRING
         text == "Text" -> FlangType.TEXT
         text == "Boolean" -> FlangType.BOOLEAN
+        text == "Item" -> FlangType.ITEM
+        text == "Location" -> FlangType.LOCATION
+        text == "Particle" -> FlangType.PARTICLE
+        text == "Vector" -> FlangType.VECTOR
+        text == "Sound" -> FlangType.SOUND
         text.startsWith("List<") && text.endsWith(">") -> FlangType.LIST(parseSignatureType(text.substring(5, text.length - 1)))
         text.startsWith("Dict<") && text.endsWith(">") -> FlangType.DICT(parseSignatureType(text.substring(5, text.length - 1)))
         text.length == 1 && text[0].isUpperCase() -> FlangType.TYPE_PARAMETER(text)
@@ -3391,6 +3763,7 @@ private fun parseReceiverType(
 ): FlangType =
     when {
         owner.startsWith("List<") || owner.startsWith("Dict<") -> parseSignatureType(owner)
+        owner in setOf("Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound") -> parseSignatureType(owner)
         owner in structs -> FlangType.STRUCT(owner)
         owner in objects -> FlangType.OBJECT(owner)
         owner in enums -> FlangType.ENUM(owner)
@@ -3421,7 +3794,7 @@ private fun parseGameValueOverrideType(text: String, gameValueName: String): Fla
     fun invalid(): Nothing =
         throw FlangCompileException(
             "Invalid game value type override for '$gameValueName': '$text'. " +
-                "Expected Any, Num, String, Text, Boolean, List<T>, or Dict<T>.",
+                "Expected Any, Num, String, Text, Boolean, Item, Location, Particle, Vector, Sound, List<T>, or Dict<T>.",
         )
 
     fun parse(value: String): FlangType {
@@ -3433,6 +3806,11 @@ private fun parseGameValueOverrideType(text: String, gameValueName: String): Fla
             trimmed == "String" -> FlangType.STRING
             trimmed == "Text" -> FlangType.TEXT
             trimmed == "Boolean" -> FlangType.BOOLEAN
+            trimmed == "Item" -> FlangType.ITEM
+            trimmed == "Location" -> FlangType.LOCATION
+            trimmed == "Particle" -> FlangType.PARTICLE
+            trimmed == "Vector" -> FlangType.VECTOR
+            trimmed == "Sound" -> FlangType.SOUND
             trimmed.startsWith("List<") && trimmed.endsWith(">") -> {
                 val inner = trimmed.substring("List<".length, trimmed.length - 1)
                 FlangType.LIST(parse(inner))
@@ -3484,6 +3862,11 @@ private fun String.toFlangGameValueType(gameValueName: String): FlangType =
         "NUMBER" -> FlangType.NUM
         "TEXT" -> FlangType.STRING
         "COMPONENT" -> FlangType.TEXT
+        "ITEM" -> FlangType.ITEM
+        "LOCATION" -> FlangType.LOCATION
+        "PARTICLE" -> FlangType.PARTICLE
+        "VECTOR" -> FlangType.VECTOR
+        "SOUND" -> FlangType.SOUND
         "LIST" -> FlangType.LIST(FlangType.ANY)
         "DICT" -> FlangType.DICT(FlangType.ANY)
         else -> throw FlangCompileException("Game value '$gameValueName' returns unsupported DiamondFire type '$this'.")

@@ -4,7 +4,7 @@ import std.helpers.GameActions;
 
 interface CancellableEvent {
     default fn cancel(var this) {
-        emit `game_action "CancelEvent"`;
+        GameActions.cancelEvent();
     }
 }
 
@@ -12,7 +12,7 @@ interface CancellableEvent {
 object PlayerJoinEvent;
 
 impl PlayerJoinEvent {
-    fn getPlayer(this) -> Player {
+    inline fn getPlayer(this) -> Player {
         return Player.default();
     }
 }

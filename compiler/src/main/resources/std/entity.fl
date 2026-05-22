@@ -1,0 +1,17 @@
+package std;
+
+struct Entity {
+    uuid: String
+}
+
+impl Entity {
+    private inline fn select(this) {
+        emit `select_object "EntityUUID" args($this.uuid$)`;
+    }
+
+    private inline fn deselect(this) {
+        emit `select_object "Reset"`;
+    }
+
+
+}

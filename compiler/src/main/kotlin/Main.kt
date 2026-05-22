@@ -2,7 +2,7 @@ package com.zbinfinn
 
 import java.nio.file.Path
 
-private const val USAGE = "Usage: flang [--dictstructs|-ds] [-Oall|-Oselect-reset] <source.fl>"
+private const val USAGE = "Usage: flang [--dictstructs|-ds] [--panic-on-bad-as] [-Oall|-Oselect-reset|-Otemp-copy] <source.fl>"
 
 internal data class CliOptions(
     val sourcePath: String,
@@ -16,6 +16,7 @@ fun main(args: Array<String>) {
 
 internal fun parseCliArgs(args: Array<String>): CliOptions {
     var structMode = StructMode.LIST
+    var panicOnBadAs = false
     val optimizations = mutableSetOf<Optimization>()
     var sourcePath: String? = null
 
@@ -26,6 +27,12 @@ internal fun parseCliArgs(args: Array<String>): CliOptions {
                     error(USAGE)
                 }
                 structMode = StructMode.DICT
+            }
+            "--panic-on-bad-as" -> {
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                panicOnBadAs = true
             }
             "-Oall" -> {
                 if (sourcePath != null) {
@@ -38,6 +45,12 @@ internal fun parseCliArgs(args: Array<String>): CliOptions {
                     error(USAGE)
                 }
                 optimizations += Optimization.ELIDE_REDUNDANT_SELECT_RESET
+            }
+            "-Otemp-copy" -> {
+                if (sourcePath != null) {
+                    error(USAGE)
+                }
+                optimizations += Optimization.ELIDE_REDUNDANT_VAR_HANDOFF
             }
             else -> {
                 if (arg.startsWith("-")) {
@@ -55,6 +68,7 @@ internal fun parseCliArgs(args: Array<String>): CliOptions {
         sourcePath = sourcePath ?: error(USAGE),
         compileOptions = CompileOptions(
             structMode = structMode,
+            panicOnBadAs = panicOnBadAs,
             optimizations = optimizations,
         ),
     )

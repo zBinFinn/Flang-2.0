@@ -128,6 +128,7 @@ emitArgList
 emitArg
   : DOLLAR expr DOLLAR
   | VAR LPAREN Identifier COMMA Identifier RPAREN
+  | Identifier? PERCENT VAR LPAREN DOLLAR expr DOLLAR RPAREN
   | IntegerLiteral
   | StringLiteral
   | StyledStringLiteral
@@ -245,7 +246,7 @@ multiplicative
   ;
 
 postfix
-  : primary (postfixPart)*
+  : primary (postfixPart)* (AS typeRef)*
   ;
 
 postfixPart

@@ -37,6 +37,11 @@ sealed class FlangType(open val sourceName: String) {
     data object STRING : FlangType("String")
     data object TEXT : FlangType("Text")
     data object BOOLEAN : FlangType("Boolean")
+    data object ITEM : FlangType("Item")
+    data object LOCATION : FlangType("Location")
+    data object PARTICLE : FlangType("Particle")
+    data object VECTOR : FlangType("Vector")
+    data object SOUND : FlangType("Sound")
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
@@ -73,6 +78,11 @@ sealed class FlangType(open val sourceName: String) {
                     STRING.sourceName -> STRING
                     TEXT.sourceName -> TEXT
                     BOOLEAN.sourceName -> BOOLEAN
+                    ITEM.sourceName -> ITEM
+                    LOCATION.sourceName -> LOCATION
+                    PARTICLE.sourceName -> PARTICLE
+                    VECTOR.sourceName -> VECTOR
+                    SOUND.sourceName -> SOUND
                     "List" -> LIST(ANY)
                     "Dict" -> DICT(ANY)
                     in typeParameters -> TYPE_PARAMETER(trimmed)
@@ -247,7 +257,7 @@ object FlangFrontend {
         }
 
         if (isTypeLikeContext(request.source, offset)) {
-            listOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean").forEach {
+            listOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound").forEach {
                 add(FlangCompletion(it, FlangCompletionKind.STRUCT, typeText = "builtin"))
             }
             model.structs.values.forEach { struct ->
@@ -365,7 +375,7 @@ object FlangFrontend {
             FlangEnumDefinition(
                 SELECTION_TYPE_ENUM,
                 "",
-                listOf("Default", "Selection", "Victim", "Attacker").mapIndexed { index, name -> FlangEnumEntry(name, index) },
+                listOf("Default", "Selection", "Victim", "Attacker", "LastEntity").mapIndexed { index, name -> FlangEnumEntry(name, index) },
             ),
         )
         return enums
@@ -472,7 +482,7 @@ object FlangFrontend {
         val typeParams = function.genericParamList()?.Identifier().orEmpty().map { it.text }.toSet() +
             function.functionName().typeRef()?.text.orEmpty()
                 .split(Regex("[^A-Za-z_0-9]+"))
-                .filter { it.isNotBlank() && it !in setOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict") && it !in structs && it !in enums }
+                .filter { it.isNotBlank() && it !in setOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound", "List", "Dict") && it !in structs && it !in enums }
         val params = function.paramList()?.param().orEmpty().mapIndexedNotNull { index, param ->
             val isReceiver = owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null
             val type = if (isReceiver) {
@@ -626,7 +636,7 @@ object FlangFrontend {
                     )
                 }
         }
-        if (symbol?.type is FlangType.STRUCT || symbol?.type is FlangType.OBJECT || symbol?.type is FlangType.LIST || symbol?.type is FlangType.DICT) {
+        if (symbol?.type != null && symbol.type !is FlangType.ENUM && symbol.type !is FlangType.INTERFACE) {
             val structName = (symbol.type as? FlangType.STRUCT)?.name
             val fields = structName?.let { name ->
                 model.structs[name]?.fields.orEmpty()
@@ -702,7 +712,7 @@ object FlangFrontend {
                 model.functionsByName[name].orEmpty()
             } else {
                 val receiverType = symbols[base]?.type
-                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name ?: (receiverType as? FlangType.INTERFACE)?.name
+                val ownerName = receiverType?.sourceName
                 if (ownerName != null) {
                     (model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty())
                         .filter { it.hasReceiver }
@@ -745,7 +755,7 @@ object FlangFrontend {
                 model.functionsByName[name].orEmpty()
             } else {
                 val receiverType = symbols[base]?.type
-                val ownerName = (receiverType as? FlangType.STRUCT)?.name ?: (receiverType as? FlangType.OBJECT)?.name ?: (receiverType as? FlangType.INTERFACE)?.name
+                val ownerName = receiverType?.sourceName
                 if (ownerName != null) {
                     model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty()
                 } else {
