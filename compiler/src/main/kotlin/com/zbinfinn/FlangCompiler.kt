@@ -366,11 +366,15 @@ object FlangCompiler {
             optimized = elideRedundantSelectReset(optimized)
         }
         if (Optimization.ELIDE_REDUNDANT_VAR_HANDOFF in optimizations) {
-            val result = elideRedundantVarHandoffs(optimized)
-            optimized = result.entries
-            result.warnings.forEach { warning ->
-                val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
-                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+            var handoffPasses = 0
+            while (handoffPasses++ < 16) {
+                val result = elideRedundantVarHandoffs(optimized)
+                if (result.entries == optimized) break
+                optimized = result.entries
+                result.warnings.forEach { warning ->
+                    val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
+                    println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+                }
             }
         }
         return optimized
@@ -461,6 +465,7 @@ object FlangCompiler {
             val copyTarget = copy.slotVariable(0) ?: return@forEach
             val copySource = copy.slotVariable(1) ?: return@forEach
             if (copySource.scope != candidate.scope || copySource.name != candidate.name) return@forEach
+            if (candidate.name.startsWith(INLINE_PREFIX) && copyTarget.name.startsWith(TEMP_PREFIX)) return@forEach
 
             rewrittenTargets[first.entryIndex] = copyTarget
             removed += second.entryIndex
@@ -2536,9 +2541,102 @@ private class FunctionLowering(
             return lowerFunctionCallToValue(call, symbols, expectedType)
         }
         if (postfix.postfixPart().isNotEmpty()) {
-            throw FlangCompileException("Calls and member access are not supported as expression values yet.")
+            return lowerPostfixChainToItem(postfix, symbols, expectedType)
         }
         return lowerPrimaryToItem(postfix.primary(), symbols)
+    }
+
+    private fun lowerPostfixChainToItem(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
+    ): ExpressionValue {
+        val workingSymbols = LinkedHashMap(symbols)
+        val blocks = mutableListOf<DfEntry>()
+        var current: ExpressionValue? = postfix.primary().typeStaticCall()?.let { lowerFunctionCallToValue(it.toSimpleCall(), workingSymbols) }
+        val primaryName = postfix.primary().Identifier()?.text
+        var index = 0
+
+        fun materializeReceiver(): String {
+            val value = current ?: lowerPrimaryToItem(postfix.primary(), workingSymbols)
+            blocks += value.prelude
+            val variable = value.item as? DfVariable
+            val receiverName = if (variable != null) {
+                variable.name
+            } else {
+                val temp = nextTempName(workingSymbols)
+                blocks += setVariableBlock(temp, value.item)
+                temp
+            }
+            workingSymbols[receiverName] = Symbol(receiverName, Mutability.IMMUTABLE, value.type, variable?.scope ?: DfVariableScope.LINE)
+            current = ExpressionValue(value.type, DfVariable(variable?.scope ?: DfVariableScope.LINE, receiverName))
+            return receiverName
+        }
+
+        while (index < postfix.postfixPart().size) {
+            val part = postfix.postfixPart()[index]
+            val isLastPart = index == postfix.postfixPart().lastIndex
+            current = when {
+                part.DOT() == null && part.LPAREN() != null -> {
+                    if (current != null || index != 0 || primaryName == null) {
+                        throw FlangCompileException("Unsupported expression value.")
+                    }
+                    lowerFunctionCallToValue(SimpleCall(primaryName, part.simpleCallArgs()), workingSymbols, if (isLastPart) expectedType else null)
+                }
+                part.DOT() != null && part.LPAREN() != null -> {
+                    val receiverName = materializeReceiver()
+                    lowerEnumPostfixHelperToPlaceholder(receiverName, part, workingSymbols)
+                        ?: lowerFunctionCallToValue(
+                            SimpleCall(part.Identifier().text, part.simpleCallArgs(), baseName = receiverName),
+                            workingSymbols,
+                            if (isLastPart) expectedType else null,
+                        )
+                }
+                part.DOT() != null && part.LPAREN() == null -> {
+                    val nextPart = postfix.postfixPart().getOrNull(index + 1)
+                    val objectMember = primaryName
+                        ?.takeIf { current == null }
+                        ?.let { MemberAccess(it, part.Identifier().text) }
+                        ?.takeIf { objectVariable(it) != null }
+                    if (objectMember != null) {
+                        lowerStructFieldReadToPlaceholder(objectMember, workingSymbols)
+                    } else if (nextPart != null && nextPart.DOT() == null && nextPart.LPAREN() != null) {
+                        val receiverName = materializeReceiver()
+                        index++
+                        lowerEnumPostfixHelperToPlaceholder(receiverName, part, workingSymbols)
+                            ?: lowerFunctionCallToValue(
+                                SimpleCall(part.Identifier().text, nextPart.simpleCallArgs(), baseName = receiverName),
+                                workingSymbols,
+                                if (index == postfix.postfixPart().lastIndex) expectedType else null,
+                            )
+                    } else {
+                        val receiverName = materializeReceiver()
+                        lowerStructFieldReadToPlaceholder(MemberAccess(receiverName, part.Identifier().text), workingSymbols)
+                    }
+                }
+                else -> throw FlangCompileException("Unsupported expression value.")
+            }
+            index++
+        }
+
+        val value = current ?: throw FlangCompileException("Unsupported expression value.")
+        return value.copy(prelude = blocks + value.prelude)
+    }
+
+    private fun lowerEnumPostfixHelperToPlaceholder(
+        receiverName: String,
+        part: FlangParser.PostfixPartContext,
+        symbols: Map<String, Symbol>,
+    ): ExpressionValue? {
+        if (part.simpleCallArgs().isNotEmpty()) return null
+        val receiver = symbols[receiverName] ?: return null
+        if (receiver.type !is FlangType.ENUM) return null
+        val fieldName = when (val helperName = part.Identifier().text) {
+            "ordinal" -> "$" + "ordinal"
+            "name" -> "$" + "name"
+            else -> throw FlangCompileException("Enum '${receiver.type.sourceName}' has no helper '$helperName'. Expected ordinal() or name().")
+        }
+        return lowerEnumHelperCallToPlaceholder(EnumHelperCall(receiverName, fieldName), symbols)
     }
 
     private fun lowerPrimaryToItem(
@@ -3015,7 +3113,7 @@ private class FunctionLowering(
                 return resolveObjectVariableType(objectDefinition.name, variableDefinition)
             }
             val base = symbols[member.base] ?: throw FlangCompileException("Unknown local '${member.base}'.")
-            val structType = base.type as? FlangType.STRUCT
+            val structType = base.type.referentOrSelf() as? FlangType.STRUCT
                 ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
             return structs[structType.name]?.fieldsByName?.get(member.field)?.type
                 ?: throw FlangCompileException("Struct '${structType.name}' has no field '${member.field}'.")
@@ -3030,9 +3128,107 @@ private class FunctionLowering(
         }
 
         if (postfix.postfixPart().isNotEmpty()) {
-            throw FlangCompileException("Calls and member access are not supported as expression values yet.")
+            return inferPostfixChainType(postfix, symbols)
         }
         return inferPrimaryType(postfix.primary(), symbols)
+    }
+
+    private fun inferPostfixChainType(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        val workingSymbols = LinkedHashMap(symbols)
+        var currentType: FlangType? = postfix.primary().typeStaticCall()?.let { staticCall ->
+            val call = staticCall.toSimpleCall()
+            inferGvalCallType(call)
+                ?: inferMallocCallType(call)
+                ?: (resolveFunctionCall(call, workingSymbols).returnType
+                    ?: throw FlangCompileException("Function '${call.name}' does not return a value."))
+        }
+        val primaryName = postfix.primary().Identifier()?.text
+        var receiverCounter = 0
+        var index = 0
+
+        fun materializeReceiver(): String {
+            val type = currentType ?: inferPrimaryType(postfix.primary(), workingSymbols)
+            val name = "$TEMP_PREFIX" + "infer_${receiverCounter++}"
+            workingSymbols[name] = Symbol(name, Mutability.IMMUTABLE, type)
+            currentType = type
+            return name
+        }
+
+        while (index < postfix.postfixPart().size) {
+            val part = postfix.postfixPart()[index]
+            currentType = when {
+                part.DOT() == null && part.LPAREN() != null -> {
+                    if (currentType != null || index != 0 || primaryName == null) {
+                        throw FlangCompileException("Unsupported expression value.")
+                    }
+                    val call = SimpleCall(primaryName, part.simpleCallArgs())
+                    inferGvalCallType(call)
+                        ?: inferMallocCallType(call)
+                        ?: (resolveFunctionCall(call, workingSymbols).returnType
+                            ?: throw FlangCompileException("Function '${call.name}' does not return a value."))
+                }
+                part.DOT() != null && part.LPAREN() != null -> {
+                    val receiverName = materializeReceiver()
+                    inferEnumPostfixHelperType(receiverName, part, workingSymbols)
+                        ?: (resolveFunctionCall(SimpleCall(part.Identifier().text, part.simpleCallArgs(), baseName = receiverName), workingSymbols).returnType
+                            ?: throw FlangCompileException("Function '${part.Identifier().text}' does not return a value."))
+                }
+                part.DOT() != null && part.LPAREN() == null -> {
+                    val nextPart = postfix.postfixPart().getOrNull(index + 1)
+                    val objectMember = primaryName
+                        ?.takeIf { currentType == null }
+                        ?.let { MemberAccess(it, part.Identifier().text) }
+                        ?.takeIf { objectVariable(it) != null }
+                    if (objectMember != null) {
+                        inferMemberAccessType(objectMember, workingSymbols)
+                    } else if (nextPart != null && nextPart.DOT() == null && nextPart.LPAREN() != null) {
+                        val receiverName = materializeReceiver()
+                        index++
+                        inferEnumPostfixHelperType(receiverName, part, workingSymbols)
+                            ?: (resolveFunctionCall(SimpleCall(part.Identifier().text, nextPart.simpleCallArgs(), baseName = receiverName), workingSymbols).returnType
+                                ?: throw FlangCompileException("Function '${part.Identifier().text}' does not return a value."))
+                    } else {
+                        val receiverName = materializeReceiver()
+                        inferMemberAccessType(MemberAccess(receiverName, part.Identifier().text), workingSymbols)
+                    }
+                }
+                else -> throw FlangCompileException("Unsupported expression value.")
+            }
+            index++
+        }
+        return currentType ?: throw FlangCompileException("Unsupported expression value.")
+    }
+
+    private fun inferEnumPostfixHelperType(
+        receiverName: String,
+        part: FlangParser.PostfixPartContext,
+        symbols: Map<String, Symbol>,
+    ): FlangType? {
+        if (part.simpleCallArgs().isNotEmpty()) return null
+        val receiver = symbols[receiverName] ?: return null
+        if (receiver.type !is FlangType.ENUM) return null
+        return when (val helperName = part.Identifier().text) {
+            "ordinal" -> FlangType.NUM
+            "name" -> FlangType.STRING
+            else -> throw FlangCompileException("Enum '${receiver.type.sourceName}' has no helper '$helperName'. Expected ordinal() or name().")
+        }
+    }
+
+    private fun inferMemberAccessType(
+        member: MemberAccess,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        objectVariable(member)?.let { (objectDefinition, variableDefinition) ->
+            return resolveObjectVariableType(objectDefinition.name, variableDefinition)
+        }
+        val base = symbols[member.base] ?: throw FlangCompileException("Unknown local '${member.base}'.")
+        val structType = base.type.referentOrSelf() as? FlangType.STRUCT
+            ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
+        return structs[structType.name]?.fieldsByName?.get(member.field)?.type
+            ?: throw FlangCompileException("Struct '${structType.name}' has no field '${member.field}'.")
     }
 
     private fun inferPrimaryType(

@@ -1179,6 +1179,104 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersChainedCallsAndMemberAccessAsExpressionValues() {
+        val result = FlangCompiler.compile(
+            """
+            struct Box { value: Num }
+
+            fn makeBox() -> Box {
+              return Box { value: 7 };
+            }
+
+            impl Box {
+              fn copy(this) -> Box {
+                return this;
+              }
+
+              fn valueOf(this) -> Num {
+                return this.value;
+              }
+            }
+
+            fn Main() {
+              val direct = makeBox().value;
+              val viaCall = makeBox().copy().valueOf();
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.last().templateJson).jsonObject["blocks"]!!.jsonArray
+        val callIdentifiers = mainBlocks.mapNotNull { block ->
+            block.jsonObject.takeIf { it["block"]?.jsonPrimitive?.content == "call_func" }
+                ?.get("data")
+                ?.jsonPrimitive
+                ?.content
+        }
+        assertEquals(listOf("makeBox()", "makeBox()", "Box.copy(Box)", "Box.valueOf(Box)"), callIdentifiers)
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "direct"
+        })
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "viaCall"
+        })
+    }
+
+    @Test
+    fun lowersGenericReferenceCallResultsAsMemberExpressionReceivers() {
+        FlangCompiler.compileFile(writeTempSource(
+            """
+            package main;
+            import std.prelude;
+
+            object GameState {
+              var playerData: Dict<&PlayerData> = Dict.new();
+            }
+
+            impl GameState {
+              fn getData(player: Player) -> &PlayerData {
+                return GameState.playerData.get(player.uuid);
+              }
+            }
+
+            struct PlayerData {
+              clicks: Num
+            }
+
+            fn String.concat(this, other: String) -> String {
+              var out: String;
+              emit `set_variable "String" args(${ '$' }out${ '$' }, ${ '$' }this${ '$' }, ${ '$' }other${ '$' })`;
+              return out;
+            }
+
+            fn Text.concat(this, other: Any) -> Text {
+              var out: Text;
+              emit `set_variable "StyledText" args(${ '$' }out${ '$' }, ${ '$' }this${ '$' }, ${ '$' }other${ '$' }) tags(..)`;
+              return out;
+            }
+
+            @Event
+            fn rightClick(var event: PlayerRightClickEvent) {
+              var player = event.getPlayer();
+              val data = GameState.getData(player);
+              data.clicks = data.clicks + 1;
+              player.sendActionBar(s"<green>Your Clicks: ".concat(data.clicks));
+            }
+
+            fn Main() {
+              val player = Player.default();
+              val data = GameState.getData(player);
+              data.clicks = data.clicks + 1;
+              val clicks = GameState.getData(player).clicks;
+              val directData = GameState.playerData.get(player.uuid);
+              directData.clicks = directData.clicks + 1;
+            }
+            """.trimIndent(),
+        ))
+    }
+
+    @Test
     fun checksMutableImplReceiverCalls() {
         FlangCompiler.compile(
             """
@@ -2891,6 +2989,43 @@ class FlangCompilerTest {
         assertTrue(blocks.any {
             it.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
                 it.jsonObject["action"]?.jsonPrimitive?.content == "CreateList"
+        })
+    }
+
+    @Test
+    fun elidesInlineGenericDictReturnToFunctionOutput() {
+        val result = FlangCompiler.compileFile(
+            writeTempSource(
+                """
+                package main;
+                import std.prelude;
+
+                struct PlayerData {
+                  clicks: Num
+                }
+
+                object GameState {
+                  var playerData: Dict<&PlayerData> = Dict.new();
+                }
+
+                impl GameState {
+                  fn getData(player: Player) -> &PlayerData {
+                    return GameState.playerData.get(player.uuid);
+                  }
+                }
+                """.trimIndent(),
+            ),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "main.GameState.getData(Player)" }.templateJson)
+            .jsonObject["blocks"]!!.jsonArray
+        val getDict = blocks.single { it.jsonObject["action"]?.jsonPrimitive?.content == "GetDictValue" }.jsonObject
+        assertSlotItem(getDict, 0, "var", "${ '$' }out")
+        assertTrue(blocks.none { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["action"]?.jsonPrimitive?.content == "=" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "${ '$' }out"
         })
     }
 

@@ -49,4 +49,10 @@ impl Player {
         emit `player_action "GiveItems" args($item$)`;
         this.deselect();
     }
+
+    inline fn setItemInSlot(var this, item: Item, slot: Num) {
+        this.select();
+        emit `player_action "SetSlotItem" args($item$, $slot$)`;
+        this.deselect();
+    }
 }

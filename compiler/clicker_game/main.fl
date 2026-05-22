@@ -8,7 +8,8 @@ object GameState {
 
 impl GameState {
     fn registerPlayer(player: Player) {
-        val data = malloc(PlayerData, PlayerData.load(player));
+        val data = malloc(PlayerData);
+        *data = PlayerData.load(player);
         GameState.playerData.set(player.uuid, data);
     }
 
@@ -31,12 +32,20 @@ fn startup(var event: PlotStartupEvent) {
 @Event
 fn join(var event: PlayerJoinEvent) {
     var player = event.getPlayer();
+    GameState.registerPlayer(player);
+    player.setItemInSlot(Item.of("emerald"), 5);
+}
+
+inline fn Item.of(id: String) -> Item {
+    var item: Item;
+    emit `set_variable "SetItemType" args($item$, $id$)`;
+    return item;
 }
 
 @Event
 fn rightClick(var event: PlayerRightClickEvent) {
     var player = event.getPlayer();
-    val data = GameState.getData();
+    val data = GameState.getData(player);
     data.clicks = data.clicks + 1;
     player.sendActionBar(s"<green>Your Clicks: ".concat(data.clicks));
 }
