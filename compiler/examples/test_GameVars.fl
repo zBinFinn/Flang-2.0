@@ -1,0 +1,16 @@
+@Event
+fn join(var event: PlayerJoinEvent) {
+
+}
+
+object GameVars;
+
+impl GameVars {
+    fn set(key: String, value: Any) {
+
+    }
+
+    fn get(key: String, var out: Any) {
+        
+    }
+}

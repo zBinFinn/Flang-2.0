@@ -92,13 +92,13 @@ class ActionDump private constructor(
             fun invalid(): Nothing =
                 throw FlangCompileException(
                     "Invalid game value type override for '$name': '$type'. " +
-                        "Expected Any, Num, String, Text, Boolean, List<T>, or Dict<T>.",
+                        "Expected Any, Num, String, Text, Boolean, Item, Location, Particle, Vector, Sound, List<T>, or Dict<T>.",
                 )
 
             fun validate(value: String) {
                 val trimmed = value.trim()
                 when {
-                    trimmed in setOf("Any", "Num", "String", "Text", "Boolean") -> return
+                    trimmed in setOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound") -> return
                     trimmed.startsWith("List<") && trimmed.endsWith(">") ->
                         validate(trimmed.substring("List<".length, trimmed.length - 1))
                     trimmed.startsWith("Dict<") && trimmed.endsWith(">") ->

@@ -629,7 +629,7 @@ object FlangCompiler {
         interfaces: Map<String, InterfaceDefinition> = emptyMap(),
     ): Set<String> {
         if (typeRef == null) return emptySet()
-        val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+        val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound", "List", "Dict")
         known += structs.keys
         known += enums.keys
         known += objects.keys
@@ -982,6 +982,10 @@ private sealed class FlangType(open val sourceName: String) {
     data object TEXT : FlangType("Text")
     data object BOOLEAN : FlangType("Boolean")
     data object ITEM : FlangType("Item")
+    data object LOCATION : FlangType("Location")
+    data object PARTICLE : FlangType("Particle")
+    data object VECTOR : FlangType("Vector")
+    data object SOUND : FlangType("Sound")
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
@@ -991,7 +995,7 @@ private sealed class FlangType(open val sourceName: String) {
     data class INTERFACE(val name: String) : FlangType(name)
 
     val isPrimitive: Boolean
-        get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN
+        get() = this == NUM || this == STRING || this == TEXT || this == BOOLEAN || this == ITEM || this == LOCATION || this == PARTICLE || this == VECTOR || this == SOUND
 
     val isVariableBacked: Boolean
         get() = this == ANY || this is STRUCT || this is OBJECT || this is ENUM || this is INTERFACE || this is LIST || this is DICT || this is TYPE_PARAMETER
@@ -1036,6 +1040,22 @@ private sealed class FlangType(open val sourceName: String) {
                     if (args.isNotEmpty()) throw FlangCompileException("Type 'Item' does not accept type arguments.")
                     ITEM
                 }
+                LOCATION.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Location' does not accept type arguments.")
+                    LOCATION
+                }
+                PARTICLE.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Particle' does not accept type arguments.")
+                    PARTICLE
+                }
+                VECTOR.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Vector' does not accept type arguments.")
+                    VECTOR
+                }
+                SOUND.sourceName -> {
+                    if (args.isNotEmpty()) throw FlangCompileException("Type 'Sound' does not accept type arguments.")
+                    SOUND
+                }
                 "List" -> {
                     if (args.size != 1) throw FlangCompileException("Type 'List' expects exactly one type argument.")
                     LIST(args.single())
@@ -1061,7 +1081,7 @@ private sealed class FlangType(open val sourceName: String) {
                     if (args.isNotEmpty()) throw FlangCompileException("Interface '$name' does not accept type arguments.")
                     INTERFACE(name)
                 } else {
-                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, List<T>, Dict<T>, a known struct, object, enum, interface, or an in-scope type parameter.")
+                    throw FlangCompileException("Unsupported type '${typeRef.text}'. Expected Any, Num, String, Text, Boolean, Item, Location, Particle, Vector, Sound, List<T>, Dict<T>, a known struct, object, enum, interface, or an in-scope type parameter.")
                 }
             }
         }
@@ -1306,6 +1326,10 @@ private class FunctionLowering(
                 is FlangType.STRING -> "txt"
                 is FlangType.TEXT -> "comp"
                 is FlangType.ITEM -> "item"
+                is FlangType.LOCATION -> "loc"
+                is FlangType.PARTICLE -> "part"
+                is FlangType.VECTOR -> "vec"
+                is FlangType.SOUND -> "snd"
                 is FlangType.TYPE_PARAMETER -> "var"
                 is FlangType.LIST -> "var"
                 is FlangType.DICT -> "var"
@@ -3100,6 +3124,10 @@ private class FunctionLowering(
             is FlangType.TEXT -> DfComponent(placeholder)
             is FlangType.BOOLEAN -> DfNumber(placeholder)
             is FlangType.ITEM -> null
+            is FlangType.LOCATION -> null
+            is FlangType.PARTICLE -> null
+            is FlangType.VECTOR -> null
+            is FlangType.SOUND -> null
             is FlangType.TYPE_PARAMETER -> null
             is FlangType.LIST -> null
             is FlangType.DICT -> null
@@ -3357,7 +3385,7 @@ private fun implicitOwnerTypeParameters(
     interfaces: Map<String, InterfaceDefinition> = emptyMap(),
 ): Set<String> {
     if (typeRef == null) return emptySet()
-    val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "List", "Dict")
+    val known = mutableSetOf("Any", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound", "List", "Dict")
     known += structs.keys
     known += enums.keys
     known += objects.keys
@@ -3383,6 +3411,11 @@ private fun parseSignatureType(text: String): FlangType =
         text == "String" -> FlangType.STRING
         text == "Text" -> FlangType.TEXT
         text == "Boolean" -> FlangType.BOOLEAN
+        text == "Item" -> FlangType.ITEM
+        text == "Location" -> FlangType.LOCATION
+        text == "Particle" -> FlangType.PARTICLE
+        text == "Vector" -> FlangType.VECTOR
+        text == "Sound" -> FlangType.SOUND
         text.startsWith("List<") && text.endsWith(">") -> FlangType.LIST(parseSignatureType(text.substring(5, text.length - 1)))
         text.startsWith("Dict<") && text.endsWith(">") -> FlangType.DICT(parseSignatureType(text.substring(5, text.length - 1)))
         text.length == 1 && text[0].isUpperCase() -> FlangType.TYPE_PARAMETER(text)
@@ -3398,6 +3431,7 @@ private fun parseReceiverType(
 ): FlangType =
     when {
         owner.startsWith("List<") || owner.startsWith("Dict<") -> parseSignatureType(owner)
+        owner in setOf("Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound") -> parseSignatureType(owner)
         owner in structs -> FlangType.STRUCT(owner)
         owner in objects -> FlangType.OBJECT(owner)
         owner in enums -> FlangType.ENUM(owner)
@@ -3428,7 +3462,7 @@ private fun parseGameValueOverrideType(text: String, gameValueName: String): Fla
     fun invalid(): Nothing =
         throw FlangCompileException(
             "Invalid game value type override for '$gameValueName': '$text'. " +
-                "Expected Any, Num, String, Text, Boolean, List<T>, or Dict<T>.",
+                "Expected Any, Num, String, Text, Boolean, Item, Location, Particle, Vector, Sound, List<T>, or Dict<T>.",
         )
 
     fun parse(value: String): FlangType {
@@ -3440,6 +3474,11 @@ private fun parseGameValueOverrideType(text: String, gameValueName: String): Fla
             trimmed == "String" -> FlangType.STRING
             trimmed == "Text" -> FlangType.TEXT
             trimmed == "Boolean" -> FlangType.BOOLEAN
+            trimmed == "Item" -> FlangType.ITEM
+            trimmed == "Location" -> FlangType.LOCATION
+            trimmed == "Particle" -> FlangType.PARTICLE
+            trimmed == "Vector" -> FlangType.VECTOR
+            trimmed == "Sound" -> FlangType.SOUND
             trimmed.startsWith("List<") && trimmed.endsWith(">") -> {
                 val inner = trimmed.substring("List<".length, trimmed.length - 1)
                 FlangType.LIST(parse(inner))
@@ -3491,6 +3530,11 @@ private fun String.toFlangGameValueType(gameValueName: String): FlangType =
         "NUMBER" -> FlangType.NUM
         "TEXT" -> FlangType.STRING
         "COMPONENT" -> FlangType.TEXT
+        "ITEM" -> FlangType.ITEM
+        "LOCATION" -> FlangType.LOCATION
+        "PARTICLE" -> FlangType.PARTICLE
+        "VECTOR" -> FlangType.VECTOR
+        "SOUND" -> FlangType.SOUND
         "LIST" -> FlangType.LIST(FlangType.ANY)
         "DICT" -> FlangType.DICT(FlangType.ANY)
         else -> throw FlangCompileException("Game value '$gameValueName' returns unsupported DiamondFire type '$this'.")

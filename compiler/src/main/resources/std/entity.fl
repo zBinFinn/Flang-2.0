@@ -11,25 +11,5 @@ impl Entity {
         emit `select_object "Reset"`;
     }
 
-    fn setTag(var this, key: String, value: String) {
-        this.select();
-        emit `entity_action "SetCustomTag" args($key$, $value$)`;
-        this.deselect();
-    }
 
-    fn getStringTag(this, key: String) -> String {
-        var out: String;
-        this.select();
-        emit `entity_action "GetCustomTag" args($out$, $key$)`;
-        this.deselect();
-        return out;
-    }
-
-    fn getNumTag(this, key: String) -> Num {
-        var out: Num;
-        this.select();
-        emit `entity_action "GetCustomTag" args($out$, $key$)`;
-        this.deselect();
-        return out;
-    }
 }

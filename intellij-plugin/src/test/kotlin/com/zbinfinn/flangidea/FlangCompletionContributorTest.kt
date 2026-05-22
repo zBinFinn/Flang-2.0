@@ -132,6 +132,41 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertDoesntContain(lookups, ".Two")
     }
 
+    fun testCompletesNewBuiltinPrimitiveTypeNames() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main(value: <caret>) {
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "Location", "Particle", "Vector", "Sound")
+    }
+
+    fun testCompletesPrimitiveExtensionFunctionsOnMemberAccess() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Num.bump(this) -> Num {
+              return this + 1;
+            }
+
+            fn Sound.echo(this) -> Sound {
+              return this;
+            }
+
+            fn Main(sound: Sound) {
+              val x: Num = 1;
+              x.<caret>
+              sound.echo();
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "bump")
+    }
+
     private fun completionLookups(): List<String> {
         val file = myFixture.file
         return FlangFrontend.completions(

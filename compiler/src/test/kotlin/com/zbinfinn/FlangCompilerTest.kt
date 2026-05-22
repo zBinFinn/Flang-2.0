@@ -2474,6 +2474,68 @@ class FlangCompilerTest {
         assertTrue(error.message!!.contains("-Oall"))
     }
 
+    @Test
+    fun acceptsNewPrimitiveTypesInSignaturesAndLocals() {
+        FlangCompiler.compile(
+            """
+            fn useLocation(location: Location) -> Location {
+              val copy: Location = location;
+              return copy;
+            }
+
+            fn useParticle(particle: Particle) -> Particle {
+              val copy: Particle = particle;
+              return copy;
+            }
+
+            fn useVector(vector: Vector) -> Vector {
+              val copy: Vector = vector;
+              return copy;
+            }
+
+            fn useSound(sound: Sound) -> Sound {
+              val copy: Sound = sound;
+              return copy;
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun rejectsTypeArgumentsOnNewPrimitiveTypes() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test() {
+                  var bad: Sound<Num>;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(error.message!!.contains("does not accept type arguments"))
+    }
+
+    @Test
+    fun supportsPrimitiveExtensionFunctionsAsReceivers() {
+        FlangCompiler.compile(
+            """
+            fn Num.bump(this) -> Num {
+              return this + 1;
+            }
+
+            fn Sound.keep(this) -> Sound {
+              return this;
+            }
+
+            fn Main(sound: Sound) -> Num {
+              var value: Num = 1;
+              val soundCopy = sound.keep();
+              return value.bump();
+            }
+            """.trimIndent(),
+        )
+    }
+
     private fun assertVariable(slot: kotlinx.serialization.json.JsonObject, name: String, scope: String) {
         val data = slot["item"]!!.jsonObject["data"]!!.jsonObject
         assertEquals(name, data["name"]!!.jsonPrimitive.content)
