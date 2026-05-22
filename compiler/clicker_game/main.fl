@@ -2,7 +2,59 @@ package game;
 
 import std.prelude;
 
+object GameState {
+    var playerData: Dict<&PlayerData> = Dict.new();
+}
+
 @Event
 fn join(var event: PlayerJoinEvent) {
+    var player = event.getPlayer();
+    player.sendMessage(s"<green>Hello World!");
+    PlayerData.createForPlayer(player);
+    var data = PlayerData.getForPlayer(player);
+    data.clicks = 5;
+    PlayerData.setForPlayer(player, data);
+}
 
+struct PlayerData {
+    clicks: Num
+}
+
+impl PlayerData {
+    inline fn createForPlayer(player: Player) {
+        val uuid = player.uuid;
+        GameVars.set(uuid.concat("-data"), PlayerData {
+            clicks: 0
+        });
+    }
+
+    inline fn getForPlayer(player: Player) -> PlayerData {
+        val uuid = player.uuid;
+        GameVars.get(uuid.concat("-data")) as PlayerData;
+    }
+
+    inline fn setForPlayer(player: Player, data: PlayerData) {
+        val uuid = player.uuid;
+        GameVars.set(uuid.concat("-data"), data);
+    }
+}
+
+fn String.concat(this, other: String) -> String {
+    var out: String;
+    emit `set_variable "String" args($out$, $this$, $other$)`;
+    return out;
+}
+
+object GameVars;
+
+impl GameVars {
+    inline fn set(key: String, value: Any) {
+        emit `set_variable "=" args(GAME %var($key$), $value$)`;
+    }
+
+    inline fn get(key: String) -> Any {
+        var out: Any;
+        emit `set_variable "=" args($out$, GAME %var($key$))`;
+        return out;
+    }
 }

@@ -144,6 +144,41 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertContainsElements(completionLookups(), "Location", "Particle", "Vector", "Sound")
     }
 
+    fun testCompletesReferenceTypeNames() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num }
+
+            fn Main() {
+              var point: &<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "Point", "Num", "String")
+    }
+
+    fun testCompletesMembersThroughReferenceTypes() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num }
+
+            impl Point {
+              fn move(this, dx: Num) {
+              }
+            }
+
+            fn Main(point: &Point) {
+              point.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "x", "move")
+    }
+
     fun testCompletesPrimitiveExtensionFunctionsOnMemberAccess() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,

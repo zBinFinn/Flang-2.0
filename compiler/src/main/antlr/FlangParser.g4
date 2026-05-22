@@ -200,7 +200,8 @@ whenCondition
   ;
 
 typeRef
-  : tupleType
+  : AMP typeRef
+  | tupleType
   | simpleType
   ;
 
@@ -260,12 +261,13 @@ callArgList
   ;
 
 callArg
-  : AMP expr
+  : VAR expr
   | expr
   ;
 
 primary
-  : IntegerLiteral
+  : STAR Identifier
+  | IntegerLiteral
   | StringLiteral
   | StyledStringLiteral
   | TRUE

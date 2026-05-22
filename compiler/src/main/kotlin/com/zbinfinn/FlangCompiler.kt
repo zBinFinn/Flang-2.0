@@ -64,6 +64,9 @@ private const val TEMP_PREFIX = "$" + "flang_tmp_"
 private const val INLINE_PREFIX = "$" + "flang_inline_"
 private const val RETURN_VARIABLE_NAME = "$" + "out"
 private const val SELECTION_TYPE_ENUM = "SelectionType"
+private const val MALLOC_FUNCTION_IDENTIFIER = "$" + "malloc(var)"
+private const val PTR_COUNTER_NAME = "$" + "FLANG_PTR_COUNTER"
+private const val PTR_PREFIX = "$" + "PTR_"
 
 private var currentInterfaceImplementations: Set<InterfaceImplementationKey> = emptySet()
 
@@ -139,6 +142,7 @@ object FlangCompiler {
             entries.forEach { entry ->
                 val block = entry as? DfBlock ?: return@forEach
                 if (block.block == "call_func" && block.data != null) {
+                    if (block.data == MALLOC_FUNCTION_IDENTIFIER) return@forEach
                     val dynamicMethod = dynamicInterfaceMethodName(block.data)
                     if (dynamicMethod != null) {
                         interfaceImpls
@@ -185,7 +189,10 @@ object FlangCompiler {
             lowerSignature(signature)
         }
 
-        val loweredFunctions = loweredByIdentifier.values.toList()
+        val loweredFunctions = loweredByIdentifier.values.toMutableList()
+        if (lowering.mallocIntrinsicUsed) {
+            loweredFunctions += lowering.lowerMallocIntrinsic()
+        }
 
         if (loweredFunctions.isEmpty()) {
             throw FlangCompileException("No functions found to compile.")
@@ -344,7 +351,8 @@ object FlangCompiler {
             optimized = result.entries
             result.warnings.forEach { warning ->
                 val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
-                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+                // TODO: Figure out what to do with this, for now leave commented
+//                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
             }
         }
         return optimized
@@ -1149,7 +1157,14 @@ private data class FunctionSignature(
 
 private data class FunctionParameter(val name: String, val mutability: Mutability, val type: FlangType)
 
-private data class Symbol(val name: String, val mutability: Mutability, val type: FlangType)
+private data class Symbol(
+    val name: String,
+    val mutability: Mutability,
+    val type: FlangType,
+    val scope: DfVariableScope = DfVariableScope.LINE,
+) {
+    fun toDfVariable(): DfVariable = DfVariable(scope, name)
+}
 
 private enum class Mutability {
     IMMUTABLE,
@@ -1170,6 +1185,7 @@ private sealed class FlangType(open val sourceName: String) {
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
+    data class REF(val referentType: FlangType) : FlangType("&${referentType.sourceName}")
     data class STRUCT(val name: String) : FlangType(name)
     data class OBJECT(val name: String) : FlangType(name)
     data class ENUM(val name: String) : FlangType(name)
@@ -1190,6 +1206,9 @@ private sealed class FlangType(open val sourceName: String) {
             interfaces: Map<String, InterfaceDefinition> = emptyMap(),
             typeParameters: Set<String> = emptySet(),
         ): FlangType {
+            if (typeRef.AMP() != null) {
+                return REF(fromTypeRef(typeRef.typeRef(), structs, enums, objects, interfaces, typeParameters))
+            }
             typeRef.tupleType()?.let {
                 throw FlangCompileException("Tuple types are not supported in this compiler pass.")
             }
@@ -1294,6 +1313,12 @@ private data class TargetExpression(
     val blocks: List<DfEntry>,
 )
 
+private data class ReferenceTarget(
+    val type: FlangType,
+    val variable: DfVariable,
+    val prelude: List<DfEntry>,
+)
+
 private data class FunctionContext(
     val signature: FunctionSignature,
     val isEvent: Boolean,
@@ -1338,6 +1363,8 @@ private class FunctionLowering(
 ) {
     private var tempCounter = 0
     private var inlineCounter = 0
+    var mallocIntrinsicUsed: Boolean = false
+        private set
     private var currentPackage = ""
     private var currentSourceId = "<unknown>"
     private var currentStatementOrigin: DfSourceOrigin? = null
@@ -1449,6 +1476,47 @@ private class FunctionLowering(
         }
     }
 
+    fun lowerMallocIntrinsic(): LoweredFunction =
+        LoweredFunction(
+            displayIdentifier = MALLOC_FUNCTION_IDENTIFIER,
+            functionIdentifier = MALLOC_FUNCTION_IDENTIFIER,
+            entries = listOf(
+                DfBlock(
+                    block = "func",
+                    data = MALLOC_FUNCTION_IDENTIFIER,
+                    args = DfArgs(
+                        listOf(
+                            DfSlot(0, DfParameterElement(name = RETURN_VARIABLE_NAME, type = "var")),
+                            DfSlot(25, DfHint("function")),
+                            DfSlot(26, DfBlockTag(block = "func", action = "dynamic", tag = "Is Hidden", option = "False")),
+                        ),
+                    ),
+                ),
+                DfBlock(
+                    block = "if_var",
+                    action = "VarExists",
+                    args = DfArgs(listOf(DfSlot(0, DfVariable(DfVariableScope.GAME, PTR_COUNTER_NAME)))),
+                ),
+                DfBracket(direct = "open", type = "norm"),
+                DfBracket(direct = "close", type = "norm"),
+                DfBlock(block = "else"),
+                DfBracket(direct = "open", type = "norm"),
+                setVariableBlock(DfVariable(DfVariableScope.GAME, PTR_COUNTER_NAME), DfNumber("0")),
+                DfBracket(direct = "close", type = "norm"),
+                setVariableActionBlock(
+                    DfVariable(DfVariableScope.LINE, RETURN_VARIABLE_NAME),
+                    "String",
+                    listOf(DfText(PTR_PREFIX), DfVariable(DfVariableScope.GAME, PTR_COUNTER_NAME)),
+                    listOf(DfSlot(26, DfBlockTag(block = "set_var", action = "String", tag = "Text Value Merging", option = "No spaces"))),
+                ),
+                setVariableActionBlock(
+                    DfVariable(DfVariableScope.GAME, PTR_COUNTER_NAME),
+                    "+=",
+                    listOf(DfNumber("1")),
+                ),
+            ),
+        )
+
     private fun lowerStatementWithOrigin(
         stmt: FlangParser.StmtContext,
         symbols: MutableMap<String, Symbol>,
@@ -1542,6 +1610,7 @@ private class FunctionLowering(
                 is FlangType.TYPE_PARAMETER,
                 is FlangType.LIST,
                 is FlangType.DICT,
+                is FlangType.REF,
                 is FlangType.STRUCT,
                 is FlangType.OBJECT,
                 is FlangType.ENUM,
@@ -1857,14 +1926,24 @@ private class FunctionLowering(
     ): List<DfEntry> {
         val assignment = expr.assignment()
         if (assignment.EQ() != null) {
+            val dereferenceTarget = assignment.logicalOr().dereferenceOrNull()
+            if (dereferenceTarget != null) {
+                val target = lowerReferenceTarget(dereferenceTarget, symbols)
+                val value = lowerAssignmentToValue(assignment.assignment(), symbols, target.type)
+                if (!value.type.isAssignableTo(target.type)) {
+                    throw FlangCompileException("Cannot assign ${value.type.sourceName} to '*$dereferenceTarget' of type ${target.type.sourceName}.")
+                }
+                return target.prelude + value.prelude + setVariableBlock(target.variable, value.item)
+            }
+
             val memberTarget = assignment.logicalOr().memberAccessOrNull()
             if (memberTarget != null) {
                 val base = symbols[memberTarget.base]
                     ?: throw FlangCompileException("Cannot assign to member of unknown local '${memberTarget.base}'.")
-                if (base.mutability != Mutability.MUTABLE) {
+                if (base.mutability != Mutability.MUTABLE && base.type !is FlangType.REF) {
                     throw FlangCompileException("Cannot assign member '${memberTarget.field}' on immutable val '${memberTarget.base}'.")
                 }
-                val structType = base.type as? FlangType.STRUCT
+                val structType = base.type.referentOrSelf() as? FlangType.STRUCT
                     ?: throw FlangCompileException("Local '${memberTarget.base}' is not a struct.")
                 val field = structs[structType.name]?.fieldsByName?.get(memberTarget.field)
                     ?: throw FlangCompileException("Struct '${structType.name}' has no field '${memberTarget.field}'.")
@@ -1875,7 +1954,12 @@ private class FunctionLowering(
                 if (!value.type.isAssignableTo(field.type)) {
                     throw FlangCompileException("Cannot assign ${value.type.sourceName} to '${memberTarget.base}.${field.name}' of type ${field.type.sourceName}.")
                 }
-                return value.prelude + setStructFieldBlock(base.name, field, value.item)
+                return if (base.type is FlangType.REF) {
+                    val target = lowerReferenceTarget(memberTarget.base, symbols)
+                    target.prelude + value.prelude + setStructFieldBlock(target.variable, field, value.item)
+                } else {
+                    value.prelude + setStructFieldBlock(base.name, field, value.item)
+                }
             }
 
             val targetName = assignment.logicalOr().plainIdentifierOrNull()
@@ -2295,6 +2379,7 @@ private class FunctionLowering(
         }
         val call = postfix.functionCallOrNull()
         if (call != null) {
+            lowerMallocCallToValue(call, symbols)?.let { return it }
             return lowerFunctionCallToValue(call, symbols, expectedType)
         }
         if (postfix.postfixPart().isNotEmpty()) {
@@ -2313,12 +2398,16 @@ private class FunctionLowering(
             primary.StyledStringLiteral() != null -> ExpressionValue(FlangType.TEXT, DfComponent(primary.StyledStringLiteral().text.drop(1).decodeStringLiteral()))
             primary.TRUE() != null -> ExpressionValue(FlangType.BOOLEAN, DfNumber("1"))
             primary.FALSE() != null -> ExpressionValue(FlangType.BOOLEAN, DfNumber("0"))
+            primary.STAR() != null -> {
+                val target = lowerReferenceTarget(primary.Identifier().text, symbols)
+                ExpressionValue(target.type, target.variable, target.prelude)
+            }
             primary.structLiteral() != null -> lowerToTemp(symbols) { temp -> lowerStructLiteralToTarget(primary.structLiteral(), temp, symbols) }
             primary.enumShorthand() != null -> throw FlangCompileException("Contextual enum literal '${primary.text}' requires an expected enum type.")
             primary.Identifier() != null -> {
                 val name = primary.Identifier().text
                 symbols[name]?.let { symbol ->
-                    ExpressionValue(symbol.type, DfVariable(DfVariableScope.LINE, symbol.name))
+                    ExpressionValue(symbol.type, symbol.toDfVariable())
                 } ?: if (objects.containsKey(name)) {
                     lowerToTemp(symbols) { temp -> lowerObjectValueToTarget(name, temp, symbols) }
                 } else {
@@ -2539,12 +2628,21 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
     ): ExpressionValue {
         val base = symbols[member.base] ?: throw FlangCompileException("Unknown local '${member.base}'.")
-        val structType = base.type as? FlangType.STRUCT
+        val structType = base.type.referentOrSelf() as? FlangType.STRUCT
             ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
         val field = structs[structType.name]?.fieldsByName?.get(member.field)
             ?: throw FlangCompileException("Struct '${structType.name}' has no field '${member.field}'.")
         if (field.isPrivate && structs.getValue(structType.name).packageName != currentPackage) {
             throw FlangCompileException("Field '${member.field}' of struct '${structType.name}' is private.")
+        }
+        if (base.type is FlangType.REF) {
+            val target = lowerReferenceTarget(member.base, symbols)
+            val temp = nextTempName(symbols)
+            return ExpressionValue(
+                type = field.type,
+                item = DfVariable(DfVariableScope.LINE, temp),
+                prelude = target.prelude + getStructFieldBlock(temp, target.variable, field),
+            )
         }
         return ExpressionValue(
             type = field.type,
@@ -2566,8 +2664,8 @@ private class FunctionLowering(
     ): FlangType {
         val arg = postfix.postfixPart().single().callArgList()?.callArg()?.singleOrNull()
             ?: throw FlangCompileException("typeof(...) expects exactly one argument.")
-        if (arg.AMP() != null) {
-            throw FlangCompileException("typeof(...) does not accept mutable references.")
+        if (arg.VAR() != null) {
+            throw FlangCompileException("typeof(...) does not accept mutable arguments.")
         }
         return inferExpressionType(arg.expr(), symbols)
     }
@@ -2722,6 +2820,7 @@ private class FunctionLowering(
         val call = postfix.functionCallOrNull()
         if (call != null) {
             inferGvalCallType(call)?.let { return it }
+            inferMallocCallType(call)?.let { return it }
             return resolveFunctionCall(call, symbols).returnType
                 ?: throw FlangCompileException("Function '${call.name}' does not return a value.")
         }
@@ -2741,6 +2840,12 @@ private class FunctionLowering(
             primary.StringLiteral() != null -> FlangType.STRING
             primary.StyledStringLiteral() != null -> FlangType.TEXT
             primary.TRUE() != null || primary.FALSE() != null -> FlangType.BOOLEAN
+            primary.STAR() != null -> {
+                val name = primary.Identifier().text
+                val refType = symbols[name]?.type as? FlangType.REF
+                    ?: throw FlangCompileException("Cannot dereference non-reference local '$name'.")
+                refType.referentType
+            }
             primary.structLiteral() != null -> {
                 val structName = primary.structLiteral().Identifier().text
                 structs[structName] ?: throw FlangCompileException("Unknown struct '$structName'.")
@@ -2768,6 +2873,61 @@ private class FunctionLowering(
         )
     }
 
+    private fun inferMutableArgumentType(
+        arg: SimpleCallArg,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        val dereferenceName = arg.expr.assignment().logicalOr().dereferenceOrNull()
+        if (dereferenceName != null) {
+            val symbol = symbols[dereferenceName] ?: throw FlangCompileException("Unknown local '$dereferenceName'.")
+            val refType = symbol.type as? FlangType.REF
+                ?: throw FlangCompileException("Cannot dereference non-reference local '$dereferenceName'.")
+            return refType.referentType
+        }
+        val name = arg.expr.assignment().logicalOr().plainIdentifierOrNull()
+            ?: throw FlangCompileException("Mutable arguments must be passed as var identifier or var *ref.")
+        val symbol = symbols[name] ?: throw FlangCompileException("Unknown local '$name'.")
+        if (symbol.mutability != Mutability.MUTABLE) {
+            throw FlangCompileException("Cannot pass immutable val '$name' as a mutable argument.")
+        }
+        return symbol.type
+    }
+
+    private fun lowerMutableArgumentTarget(
+        arg: SimpleCallArg,
+        symbols: Map<String, Symbol>,
+    ): ReferenceTarget {
+        val dereferenceName = arg.expr.assignment().logicalOr().dereferenceOrNull()
+        if (dereferenceName != null) {
+            return lowerReferenceTarget(dereferenceName, symbols)
+        }
+        val name = arg.expr.assignment().logicalOr().plainIdentifierOrNull()
+            ?: throw FlangCompileException("Mutable arguments must be passed as var identifier or var *ref.")
+        val symbol = symbols[name] ?: throw FlangCompileException("Unknown local '$name'.")
+        if (symbol.mutability != Mutability.MUTABLE) {
+            throw FlangCompileException("Cannot pass immutable val '$name' as a mutable argument.")
+        }
+        return ReferenceTarget(symbol.type, symbol.toDfVariable(), emptyList())
+    }
+
+    private fun lowerReferenceTarget(
+        name: String,
+        symbols: Map<String, Symbol>,
+    ): ReferenceTarget {
+        val symbol = symbols[name] ?: throw FlangCompileException("Unknown local '$name'.")
+        val refType = symbol.type as? FlangType.REF
+            ?: throw FlangCompileException("Cannot dereference non-reference local '$name'.")
+        val pointerNameTemp = nextTempName(symbols)
+        return ReferenceTarget(
+            type = refType.referentType,
+            variable = DfVariable(DfVariableScope.GAME, "%var($pointerNameTemp)"),
+            prelude = listOf(getReferencePointerNameBlock(pointerNameTemp, symbol.toDfVariable())),
+        )
+    }
+
+    private fun getReferencePointerNameBlock(targetName: String, refItem: DfItem): DfBlock =
+        setVariableActionBlock(targetName, "GetListValue", listOf(refItem, DfNumber("2")))
+
     private fun nextTempName(symbols: Map<String, Symbol>): String {
         while (true) {
             val candidate = "$TEMP_PREFIX${tempCounter++}"
@@ -2784,6 +2944,118 @@ private class FunctionLowering(
     private fun inferGvalCallType(call: SimpleCall): FlangType? {
         if (!call.isGvalCall()) return null
         return parseGvalCall(call).returnType
+    }
+
+    private fun inferMallocCallType(call: SimpleCall): FlangType? {
+        if (!call.isMallocCall()) return null
+        return FlangType.REF(parseMallocReferentType(call))
+    }
+
+    private fun lowerMallocCallToValue(
+        call: SimpleCall,
+        symbols: Map<String, Symbol>,
+    ): ExpressionValue? {
+        if (!call.isMallocCall()) return null
+        val referentType = parseMallocReferentType(call)
+        val pointerNameTemp = nextTempName(symbols)
+        val refTemp = nextTempName(symbols + (pointerNameTemp to Symbol(pointerNameTemp, Mutability.MUTABLE, FlangType.STRING)))
+        mallocIntrinsicUsed = true
+        val blocks = mutableListOf<DfEntry>()
+        blocks += DfBlock(
+            block = "call_func",
+            data = MALLOC_FUNCTION_IDENTIFIER,
+            args = DfArgs(listOf(DfSlot(0, DfVariable(DfVariableScope.LINE, pointerNameTemp)))),
+        )
+        call.args.getOrNull(1)?.let { initializerArg ->
+            if (initializerArg.isMutableArgument) {
+                throw FlangCompileException("Initial value for 'malloc' must not use var.")
+            }
+            val initialValue = lowerAssignmentToValue(initializerArg.expr.assignment(), symbols, referentType)
+            if (!initialValue.type.isAssignableTo(referentType)) {
+                throw FlangCompileException("Cannot initialize &${referentType.sourceName} with ${initialValue.type.sourceName}.")
+            }
+            blocks += initialValue.prelude
+            blocks += setVariableBlock(DfVariable(DfVariableScope.GAME, "%var($pointerNameTemp)"), initialValue.item)
+        }
+        blocks += setVariableActionBlock(refTemp, "CreateList", listOf(DfText(referentType.sourceName), DfVariable(DfVariableScope.LINE, pointerNameTemp)))
+        return ExpressionValue(
+            type = FlangType.REF(referentType),
+            item = DfVariable(DfVariableScope.LINE, refTemp),
+            prelude = blocks,
+        )
+    }
+
+    private fun parseMallocReferentType(call: SimpleCall): FlangType {
+        if (call.baseName != null || call.baseType != null) {
+            throw FlangCompileException("Built-in function 'malloc' cannot be called as a member function.")
+        }
+        if (call.args.size !in 1..2) {
+            throw FlangCompileException("Built-in function 'malloc' expects arguments (Type) or (Type, initialValue).")
+        }
+        if (call.args.first().isMutableArgument) {
+            throw FlangCompileException("Type argument for 'malloc' must not use var.")
+        }
+        return parseBuiltinTypeName(call.args.first().expr.text, "malloc")
+    }
+
+    private fun parseBuiltinTypeName(text: String, builtinName: String): FlangType {
+        fun invalid(): Nothing =
+            throw FlangCompileException("Built-in function '$builtinName' has unknown type '$text'.")
+
+        fun parse(value: String): FlangType {
+            val trimmed = value.trim()
+            return when {
+                trimmed.startsWith("&") -> FlangType.REF(parse(trimmed.drop(1)))
+                trimmed == FlangType.ANY.sourceName -> FlangType.ANY
+                trimmed == FlangType.NUM.sourceName -> FlangType.NUM
+                trimmed == FlangType.STRING.sourceName -> FlangType.STRING
+                trimmed == FlangType.TEXT.sourceName -> FlangType.TEXT
+                trimmed == FlangType.BOOLEAN.sourceName -> FlangType.BOOLEAN
+                trimmed == FlangType.ITEM.sourceName -> FlangType.ITEM
+                trimmed == FlangType.LOCATION.sourceName -> FlangType.LOCATION
+                trimmed == FlangType.PARTICLE.sourceName -> FlangType.PARTICLE
+                trimmed == FlangType.VECTOR.sourceName -> FlangType.VECTOR
+                trimmed == FlangType.SOUND.sourceName -> FlangType.SOUND
+                trimmed.startsWith("List<") && trimmed.endsWith(">") -> FlangType.LIST(parse(trimmed.substring(5, trimmed.length - 1)))
+                trimmed.startsWith("Dict<") && trimmed.endsWith(">") -> FlangType.DICT(parse(trimmed.substring(5, trimmed.length - 1)))
+                trimmed in structs -> FlangType.STRUCT(trimmed)
+                trimmed in enums -> FlangType.ENUM(trimmed)
+                trimmed in objects -> FlangType.OBJECT(trimmed)
+                trimmed in interfaces -> FlangType.INTERFACE(trimmed)
+                else -> invalid()
+            }
+        }
+
+        return parse(text)
+    }
+
+    private fun lowerFreeCallAsStatement(
+        call: SimpleCall,
+        symbols: Map<String, Symbol>,
+    ): List<DfEntry>? {
+        if (call.baseName != null || call.baseType != null || call.name != "free") return null
+        if (call.args.size != 1) {
+            throw FlangCompileException("Built-in function 'free' expects exactly one &Type argument.")
+        }
+        val arg = call.args.single()
+        if (arg.isMutableArgument) {
+            throw FlangCompileException("Built-in function 'free' does not accept mutable arguments.")
+        }
+        val value = lowerAssignmentToValue(arg.expr.assignment(), symbols)
+        val refType = value.type as? FlangType.REF
+            ?: throw FlangCompileException("Built-in function 'free' expects &Type but got ${value.type.sourceName}.")
+        val pointerNameTemp = nextTempName(symbols)
+        return value.prelude +
+            getReferencePointerNameBlock(pointerNameTemp, value.item) +
+            setVariableActionBlock(
+                DfVariable(DfVariableScope.GAME, "%var($pointerNameTemp)"),
+                "PurgeVars",
+                emptyList(),
+                listOf(
+                    DfSlot(25, DfBlockTag(block = "set_var", action = "PurgeVars", tag = "Match Requirement", option = "Entire name")),
+                    DfSlot(26, DfBlockTag(block = "set_var", action = "PurgeVars", tag = "Ignore Case", option = "False")),
+                ),
+            ).let { listOf(it) }
     }
 
     private fun lowerGvalCallToValue(call: SimpleCall): ExpressionValue? {
@@ -2808,8 +3080,8 @@ private class FunctionLowering(
         if (call.args.size !in 1..2) {
             throw FlangCompileException("Built-in function 'gval' expects arguments (String) or (String, SelectionType).")
         }
-        if (call.args.any { it.isMutableReference }) {
-            throw FlangCompileException("Built-in function 'gval' does not accept mutable reference arguments.")
+        if (call.args.any { it.isMutableArgument }) {
+            throw FlangCompileException("Built-in function 'gval' does not accept mutable arguments.")
         }
         val requestedName = call.args[0].expr.compileTimeStringLiteral()
             ?: throw FlangCompileException("First argument of 'gval' must be a string literal game value name.")
@@ -2868,6 +3140,10 @@ private class FunctionLowering(
     ): List<DfEntry> {
         if (call.baseName == null && call.name == "gval") {
             throw FlangCompileException("Built-in function 'gval' returns a value and cannot be used as a statement.")
+        }
+        lowerFreeCallAsStatement(call, symbols)?.let { return it }
+        if (call.isMallocCall()) {
+            throw FlangCompileException("Built-in function 'malloc' returns a value and cannot be used as a statement.")
         }
         val signature = resolveFunctionCall(call, symbols)
         val outputName = if (signature.returnType != null) nextTempName(symbols) else null
@@ -2978,7 +3254,8 @@ private class FunctionLowering(
 
         val baseSymbol = symbols[baseName]
         if (baseSymbol != null) {
-            val interfaceType = baseSymbol.type as? FlangType.INTERFACE
+            val receiverType = baseSymbol.type.referentOrSelf()
+            val interfaceType = receiverType as? FlangType.INTERFACE
             if (interfaceType != null) {
                 val interfaceDefinition = interfaces[interfaceType.name]
                     ?: throw FlangCompileException("Unknown interface '${interfaceType.name}'.")
@@ -2992,11 +3269,11 @@ private class FunctionLowering(
                 return overloads
             }
             val overloads = signatures.values
-                .filter { it.owner?.substringBefore("<") == baseSymbol.type.sourceName.substringBefore("<") && it.name == call.name }
+                .filter { it.owner?.substringBefore("<") == receiverType.sourceName.substringBefore("<") && it.name == call.name }
                 .filter { it.hasReceiver }
                 .filter { canAccessSignature(it) }
             if (overloads.isEmpty()) {
-                throw FlangCompileException("Unknown member function '${baseSymbol.type.sourceName}.${call.name}'.")
+                throw FlangCompileException("Unknown member function '${receiverType.sourceName}.${call.name}'.")
             }
             return overloads
         }
@@ -3045,10 +3322,8 @@ private class FunctionLowering(
         arg: SimpleCallArg,
         symbols: Map<String, Symbol>,
     ): FlangType =
-        if (arg.isMutableReference) {
-            val name = arg.mutableReferenceName
-                ?: throw FlangCompileException("Mutable reference arguments must be plain &identifier values.")
-            symbols[name]?.type ?: throw FlangCompileException("Unknown local '$name'.")
+        if (arg.isMutableArgument) {
+            inferMutableArgumentType(arg, symbols)
         } else {
             inferExpressionType(arg.expr, symbols)
         }
@@ -3075,7 +3350,7 @@ private class FunctionLowering(
         val params = if (signature.hasReceiver) {
             val receiverName = call.baseName ?: return null
             val receiver = symbols[receiverName] ?: return null
-            if (!inferGenericBindings(signature.params.first().type, receiver.type, bindings)) return null
+            if (!inferGenericBindings(signature.params.first().type, receiver.type.referentOrSelf(), bindings)) return null
             signature.params.drop(1)
         } else {
             signature.params
@@ -3084,15 +3359,10 @@ private class FunctionLowering(
         val ok = params.zip(call.args).all { (param, arg) ->
             val expected = param.type.substitute(bindings)
             if (param.mutability == Mutability.MUTABLE) {
-                if (arg.isMutableReference) {
-                    val referencedName = arg.mutableReferenceName ?: return@all false
-                    val actual = symbols[referencedName]?.type ?: return@all false
-                    inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
-                } else {
-                    val actual = inferExpressionType(arg.expr, symbols)
-                    inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
-                }
-            } else if (arg.isMutableReference) {
+                if (!arg.isMutableArgument) return@all false
+                val actual = inferMutableArgumentType(arg, symbols)
+                inferGenericBindings(param.type, actual, bindings) && actual.isAssignableTo(expected.substitute(bindings))
+            } else if (arg.isMutableArgument) {
                 false
             } else {
                 val enumType = param.type as? FlangType.ENUM
@@ -3138,35 +3408,40 @@ private class FunctionLowering(
             val receiverName = call.baseName ?: throw FlangCompileException("Member function '${signature.sourceName}' requires a receiver.")
             val receiver = symbols[receiverName] ?: throw FlangCompileException("Unknown local '$receiverName'.")
             val receiverParam = signature.params.first()
-            if (!receiver.type.isAssignableTo(receiverParam.type)) {
-                throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiver.type.sourceName}.")
+            val receiverType = receiver.type.referentOrSelf()
+            if (!receiverType.isAssignableTo(receiverParam.type)) {
+                throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiverType.sourceName}.")
             }
-            if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE) {
+            if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE && receiver.type !is FlangType.REF) {
                 throw FlangCompileException("Cannot call mutable member function '${signature.sourceName}' on immutable val '$receiverName'.")
             }
-            if (receiver.type is FlangType.INTERFACE) {
-                dynamicReceiverTypePlaceholder = interfaceRuntimeTypePlaceholder(receiver.name, receiver.type.name)
+            if (receiverType is FlangType.INTERFACE) {
+                dynamicReceiverTypePlaceholder = interfaceRuntimeTypePlaceholder(receiver.name, receiverType.name)
             }
-            items += DfSlot(slot++, DfVariable(DfVariableScope.LINE, receiver.name))
+            if (receiver.type is FlangType.REF) {
+                val target = lowerReferenceTarget(receiverName, symbols)
+                blocks += target.prelude
+                items += DfSlot(slot++, target.variable)
+            } else {
+                items += DfSlot(slot++, receiver.toDfVariable())
+            }
             signature.params.drop(1)
         } else {
             signature.params
         }
         params.zip(call.args).forEachIndexed { index, (param, arg) ->
             if (param.mutability == Mutability.MUTABLE) {
-                val referencedName = arg.mutableReferenceName
-                    ?: throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of '${call.name}' must be passed as &identifier.")
-                val symbol = symbols[referencedName]
-                    ?: throw FlangCompileException("Unknown local '$referencedName'.")
-                if (symbol.mutability != Mutability.MUTABLE) {
-                    throw FlangCompileException("Cannot pass immutable val '$referencedName' as a mutable reference.")
+                if (!arg.isMutableArgument) {
+                    throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of '${call.name}' must be passed as var identifier or var *ref.")
                 }
-                if (!symbol.type.isAssignableTo(param.type)) {
-                    throw FlangCompileException("Cannot pass ${symbol.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
+                val target = lowerMutableArgumentTarget(arg, symbols)
+                if (!target.type.isAssignableTo(param.type)) {
+                    throw FlangCompileException("Cannot pass ${target.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                 }
-                items += DfSlot(slot++, DfVariable(DfVariableScope.LINE, symbol.name))
-            } else if (arg.isMutableReference) {
-                throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use &.")
+                blocks += target.prelude
+                items += DfSlot(slot++, target.variable)
+            } else if (arg.isMutableArgument) {
+                throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use var.")
             } else {
                 val value = lowerAssignmentToValue(arg.expr.assignment(), symbols, param.type)
                 if (!value.type.isAssignableTo(param.type)) {
@@ -3220,30 +3495,35 @@ private class FunctionLowering(
                 val receiverName = call.baseName ?: throw FlangCompileException("Member function '${signature.sourceName}' requires a receiver.")
                 val receiver = symbols[receiverName] ?: throw FlangCompileException("Unknown local '$receiverName'.")
                 val receiverParam = signature.params.first()
-                if (!receiver.type.isAssignableTo(receiverParam.type)) {
-                    throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiver.type.sourceName}.")
+                val receiverType = receiver.type.referentOrSelf()
+                if (!receiverType.isAssignableTo(receiverParam.type)) {
+                    throw FlangCompileException("Cannot call '${signature.sourceName}' on ${receiverType.sourceName}.")
                 }
-                if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE) {
+                if (receiverParam.mutability == Mutability.MUTABLE && receiver.mutability != Mutability.MUTABLE && receiver.type !is FlangType.REF) {
                     throw FlangCompileException("Cannot call mutable member function '${signature.sourceName}' on immutable val '$receiverName'.")
                 }
-                inlineSymbols[receiverParam.name] = Symbol(receiver.name, receiverParam.mutability, receiverParam.type)
+                if (receiver.type is FlangType.REF) {
+                    val target = lowerReferenceTarget(receiverName, symbols)
+                    blocks += target.prelude
+                    inlineSymbols[receiverParam.name] = Symbol(target.variable.name, receiverParam.mutability, receiverParam.type, target.variable.scope)
+                } else {
+                    inlineSymbols[receiverParam.name] = Symbol(receiver.name, receiverParam.mutability, receiverParam.type, receiver.scope)
+                }
             }
 
             explicitParams.zip(call.args).forEachIndexed { index, (param, arg) ->
                 if (param.mutability == Mutability.MUTABLE) {
-                    val referencedName = arg.mutableReferenceName
-                        ?: throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of '${call.name}' must be passed as &identifier.")
-                    val symbol = symbols[referencedName]
-                        ?: throw FlangCompileException("Unknown local '$referencedName'.")
-                    if (symbol.mutability != Mutability.MUTABLE) {
-                        throw FlangCompileException("Cannot pass immutable val '$referencedName' as a mutable reference.")
+                    if (!arg.isMutableArgument) {
+                        throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of '${call.name}' must be passed as var identifier or var *ref.")
                     }
-                    if (!symbol.type.isAssignableTo(param.type)) {
-                        throw FlangCompileException("Cannot pass ${symbol.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
+                    val target = lowerMutableArgumentTarget(arg, symbols)
+                    if (!target.type.isAssignableTo(param.type)) {
+                        throw FlangCompileException("Cannot pass ${target.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
                     }
-                    inlineSymbols[param.name] = Symbol(symbol.name, param.mutability, param.type)
-                } else if (arg.isMutableReference) {
-                    throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use &.")
+                    blocks += target.prelude
+                    inlineSymbols[param.name] = Symbol(target.variable.name, param.mutability, param.type, target.variable.scope)
+                } else if (arg.isMutableArgument) {
+                    throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of '${call.name}' must not use var.")
                 } else {
                     val value = lowerAssignmentToValue(arg.expr.assignment(), symbols, param.type)
                     if (!value.type.isAssignableTo(param.type)) {
@@ -3341,7 +3621,10 @@ private class FunctionLowering(
     }
 
     private fun setVariableBlock(name: String, value: DfItem): DfBlock =
-        setVariableActionBlock(name, "=", listOf(value))
+        setVariableActionBlock(DfVariable(DfVariableScope.LINE, name), "=", listOf(value))
+
+    private fun setVariableBlock(target: DfVariable, value: DfItem): DfBlock =
+        setVariableActionBlock(target, "=", listOf(value))
 
     private fun returnBlock(): DfBlock =
         DfBlock(block = "control", action = "Return")
@@ -3403,11 +3686,14 @@ private class FunctionLowering(
         )
 
     private fun setVariableActionBlock(name: String, action: String, values: List<DfItem>, tags: List<DfSlot> = emptyList()): DfBlock =
+        setVariableActionBlock(DfVariable(DfVariableScope.LINE, name), action, values, tags)
+
+    private fun setVariableActionBlock(target: DfVariable, action: String, values: List<DfItem>, tags: List<DfSlot> = emptyList()): DfBlock =
         DfBlock(
             block = "set_var",
             action = action,
             args = DfArgs(
-                listOf(DfSlot(slot = 0, item = DfVariable(DfVariableScope.LINE, name))) +
+                listOf(DfSlot(slot = 0, item = target)) +
                     values.mapIndexed { index, item -> DfSlot(slot = index + 1, item = item) } +
                     tags,
             ),
@@ -3541,6 +3827,7 @@ private class FunctionLowering(
             is FlangType.TYPE_PARAMETER -> null
             is FlangType.LIST -> null
             is FlangType.DICT -> null
+            is FlangType.REF -> null
             is FlangType.STRUCT -> null
             is FlangType.OBJECT -> null
             is FlangType.ENUM -> null
@@ -3549,28 +3836,34 @@ private class FunctionLowering(
     }
 
     private fun getStructFieldBlock(targetName: String, structName: String, field: StructField): DfBlock =
+        getStructFieldBlock(targetName, DfVariable(DfVariableScope.LINE, structName), field)
+
+    private fun getStructFieldBlock(targetName: String, structVariable: DfVariable, field: StructField): DfBlock =
         when (structMode) {
             StructMode.LIST -> setVariableActionBlock(
                 targetName,
                 "GetListValue",
-                listOf(DfVariable(DfVariableScope.LINE, structName), DfNumber(field.listIndex.toString())),
+                listOf(structVariable, DfNumber(field.listIndex.toString())),
             )
             StructMode.DICT -> setVariableActionBlock(
                 targetName,
                 "GetDictValue",
-                listOf(DfVariable(DfVariableScope.LINE, structName), DfText(field.name)),
+                listOf(structVariable, DfText(field.name)),
             )
         }
 
     private fun setStructFieldBlock(structName: String, field: StructField, value: DfItem): DfBlock =
+        setStructFieldBlock(DfVariable(DfVariableScope.LINE, structName), field, value)
+
+    private fun setStructFieldBlock(structVariable: DfVariable, field: StructField, value: DfItem): DfBlock =
         when (structMode) {
             StructMode.LIST -> setVariableActionBlock(
-                structName,
+                structVariable,
                 "SetListValue",
                 listOf(DfNumber(field.listIndex.toString()), value),
             )
             StructMode.DICT -> setVariableActionBlock(
-                structName,
+                structVariable,
                 "SetDictValue",
                 listOf(DfText(field.name), value),
             )
@@ -3777,8 +4070,7 @@ private data class ParsedGvalCall(
 
 private data class SimpleCallArg(
     val expr: FlangParser.ExprContext,
-    val isMutableReference: Boolean,
-    val mutableReferenceName: String?,
+    val isMutableArgument: Boolean,
 )
 
 private data class PostfixCallSegment(
@@ -3791,6 +4083,7 @@ private data class MemberAccess(val base: String, val field: String)
 private data class EnumHelperCall(val baseName: String, val fieldName: String)
 
 private fun SimpleCall.isGvalCall(): Boolean = baseName == null && name == "gval"
+private fun SimpleCall.isMallocCall(): Boolean = baseName == null && baseType == null && name == "malloc"
 
 private fun FlangParser.FunctionDeclContext.declaredName(): String =
     functionName().Identifier().text
@@ -3828,11 +4121,16 @@ private fun FlangType.substitute(bindings: Map<String, FlangType>): FlangType =
         is FlangType.TYPE_PARAMETER -> bindings[name] ?: this
         is FlangType.LIST -> FlangType.LIST(elementType.substitute(bindings))
         is FlangType.DICT -> FlangType.DICT(valueType.substitute(bindings))
+        is FlangType.REF -> FlangType.REF(referentType.substitute(bindings))
         else -> this
     }
 
+private fun FlangType.referentOrSelf(): FlangType =
+    (this as? FlangType.REF)?.referentType ?: this
+
 private fun parseSignatureType(text: String): FlangType =
     when {
+        text.startsWith("&") -> FlangType.REF(parseSignatureType(text.drop(1)))
         text == "Any" -> FlangType.ANY
         text == "Num" -> FlangType.NUM
         text == "String" -> FlangType.STRING
@@ -3857,6 +4155,7 @@ private fun parseReceiverType(
     interfaces: Map<String, InterfaceDefinition> = emptyMap(),
 ): FlangType =
     when {
+        owner.startsWith("&") -> parseSignatureType(owner)
         owner.startsWith("List<") || owner.startsWith("Dict<") -> parseSignatureType(owner)
         owner in setOf("Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound") -> parseSignatureType(owner)
         owner in structs -> FlangType.STRUCT(owner)
@@ -3927,7 +4226,8 @@ private fun FlangType.isAssignableTo(expected: FlangType): Boolean =
         this is FlangType.STRUCT && expected is FlangType.INTERFACE && InterfaceImplementationKey(expected.name, this.name) in currentInterfaceImplementations ||
         this is FlangType.OBJECT && expected is FlangType.INTERFACE && InterfaceImplementationKey(expected.name, this.name) in currentInterfaceImplementations ||
         this is FlangType.LIST && expected is FlangType.LIST && this.elementType.isAssignableTo(expected.elementType) ||
-        this is FlangType.DICT && expected is FlangType.DICT && this.valueType.isAssignableTo(expected.valueType)
+        this is FlangType.DICT && expected is FlangType.DICT && this.valueType.isAssignableTo(expected.valueType) ||
+        this is FlangType.REF && expected is FlangType.REF && this.referentType.isAssignableTo(expected.referentType)
 
 private fun inferGenericBindings(
     expected: FlangType,
@@ -3949,6 +4249,7 @@ private fun inferGenericBindings(
         FlangType.ANY -> true
         is FlangType.LIST -> actual is FlangType.LIST && inferGenericBindings(expected.elementType, actual.elementType, bindings)
         is FlangType.DICT -> actual is FlangType.DICT && inferGenericBindings(expected.valueType, actual.valueType, bindings)
+        is FlangType.REF -> actual is FlangType.REF && inferGenericBindings(expected.referentType, actual.referentType, bindings)
         else -> actual.isAssignableTo(expected)
     }
 
@@ -4074,11 +4375,9 @@ private fun FlangParser.PostfixPartContext.simpleCallArgs(): List<SimpleCallArg>
     callArgList()?.callArg().orEmpty().map { it.toSimpleCallArg() }
 
 private fun FlangParser.CallArgContext.toSimpleCallArg(): SimpleCallArg {
-    val isMutableReference = AMP() != null
     return SimpleCallArg(
         expr = expr(),
-        isMutableReference = isMutableReference,
-        mutableReferenceName = if (isMutableReference) expr().assignment().logicalOr().plainIdentifierOrNull() else null,
+        isMutableArgument = VAR() != null,
     )
 }
 
@@ -4093,6 +4392,14 @@ private fun FlangParser.LogicalOrContext.plainIdentifierOrNull(): String? =
         ?.primary()
         ?.Identifier()
         ?.text
+
+private fun FlangParser.LogicalOrContext.dereferenceOrNull(): String? {
+    val primary = singlePostfixOrNull()
+        ?.takeIf { it.postfixPart().isEmpty() }
+        ?.primary()
+        ?: return null
+    return if (primary.STAR() != null) primary.Identifier().text else null
+}
 
 private fun FlangParser.LogicalOrContext.memberAccessOrNull(): MemberAccess? =
     singlePostfixOrNull()?.memberAccessOrNull()

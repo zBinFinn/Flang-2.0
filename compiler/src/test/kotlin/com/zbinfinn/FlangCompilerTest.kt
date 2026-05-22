@@ -601,7 +601,7 @@ class FlangCompilerTest {
 
             fn Main() {
               var value = 4;
-              val result = test(1, &value);
+              val result = test(1, var value);
             }
             """.trimIndent(),
         )
@@ -712,7 +712,7 @@ class FlangCompilerTest {
 
             fn Main() {
               var number = 4;
-              increment(&number);
+              increment(var number);
               var box = Box { value: 5 };
               box.add(3);
             }
@@ -1613,7 +1613,7 @@ class FlangCompilerTest {
     }
 
     @Test
-    fun rejectsMutableReferencesToMembers() {
+    fun rejectsMutableArgumentsToMembers() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -1624,13 +1624,13 @@ class FlangCompilerTest {
 
                 fn Main() {
                   var data = PlayerData { money: 5 };
-                  takesVar(&data.money);
+                  takesVar(var data.money);
                 }
                 """.trimIndent(),
             )
         }
 
-        assertTrue(error.message!!.contains("plain &identifier"))
+        assertTrue(error.message!!.contains("var identifier or var *ref"))
     }
 
     @Test
@@ -2297,14 +2297,14 @@ class FlangCompilerTest {
 
             fn Test() {
               var mutable = 1;
-              takesVar(&mutable);
+              takesVar(var mutable);
             }
             """.trimIndent(),
         )
     }
 
     @Test
-    fun rejectsMutableFunctionArgumentsWithoutAmpersand() {
+    fun rejectsMutableFunctionArgumentsWithoutVar() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -2319,11 +2319,11 @@ class FlangCompilerTest {
             )
         }
 
-        assertTrue(error.message!!.contains("must be passed as &"))
+        assertTrue(error.message!!.contains("No overload") || error.message!!.contains("must be passed as var identifier or var *ref"))
     }
 
     @Test
-    fun rejectsAmpersandOnValsForMutableFunctionArguments() {
+    fun rejectsValsForMutableFunctionArguments() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -2332,13 +2332,118 @@ class FlangCompilerTest {
 
                 fn Test() {
                   val immutable = 1;
-                  takesVar(&immutable);
+                  takesVar(var immutable);
                 }
                 """.trimIndent(),
             )
         }
 
         assertTrue(error.message!!.contains("immutable val 'immutable'"))
+    }
+
+    @Test
+    fun lowersReferenceAllocationDereferenceAssignmentMutableArgsAndFree() {
+        val result = FlangCompiler.compile(
+            """
+            struct Point { x: Num }
+
+            fn takesPoint(var point: Point) {
+              point.x = 7;
+            }
+
+            fn Main() {
+              var point: &Point = malloc(Point, Point { x: 1 });
+              val first = point.x;
+              point.x = 3;
+              *point = Point { x: 2 };
+              takesPoint(var *point);
+              free(point);
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(result.templates.any { it.displayIdentifier == "${ '$' }malloc(var)" })
+        val mainBlocks = result.templates.first { it.displayIdentifier == "Main()" }.templateJson
+            .let { Json.parseToJsonElement(it).jsonObject["blocks"]!!.jsonArray.map { block -> block.jsonObject } }
+
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]?.jsonPrimitive?.content == "${ '$' }malloc(var)" })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["action"]?.jsonPrimitive?.content == "CreateList" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "Point"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["action"]?.jsonPrimitive?.content == "GetListValue" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "2"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.first().jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]?.jsonPrimitive?.content == "unsaved" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.first().jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content?.startsWith("%var(") == true
+        })
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]?.jsonPrimitive?.content == "takesPoint(Point)" })
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "set_var" && it["action"]?.jsonPrimitive?.content == "PurgeVars" })
+    }
+
+    @Test
+    fun validatesReferenceTypeErrorsAndNewMutableArgSyntax() {
+        listOf(
+            """
+            fn Test() {
+              val bad = malloc(Missing);
+            }
+            """.trimIndent() to "unknown type 'Missing'",
+            """
+            struct Point { x: Num }
+            fn Test() {
+              var point: &Point = malloc(Point, "nope");
+            }
+            """.trimIndent() to "Cannot initialize &Point with String",
+            """
+            fn Test() {
+              val value = 1;
+              free(value);
+            }
+            """.trimIndent() to "expects &Type",
+            """
+            fn Test() {
+              val value = 1;
+              *value = 2;
+            }
+            """.trimIndent() to "Cannot dereference non-reference",
+            """
+            struct A { x: Num }
+            struct B { x: Num }
+            fn Test() {
+              var a: &A = malloc(A);
+              var b: &B = a;
+            }
+            """.trimIndent() to "Cannot assign &A",
+            """
+            struct Point { x: Num }
+            fn Test() {
+              var point: &Point = malloc(Point);
+              val missing = point.y;
+            }
+            """.trimIndent() to "has no field 'y'",
+            """
+            fn takesVar(var x: Num) {}
+            fn Test() {
+              var x = 1;
+              takesVar(&x);
+            }
+            """.trimIndent() to "Syntax error",
+        ).forEach { (source, expectedMessage) ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+            assertTrue(error.message!!.contains(expectedMessage), "Expected '$expectedMessage' in '${error.message}'")
+        }
     }
 
     @Test

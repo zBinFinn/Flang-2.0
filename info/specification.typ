@@ -78,12 +78,12 @@ fn example() {
   var mutable = 1;
   val immutable = 2;
 
-  increment(&mutable); // Required when passing to a var parameter
-  increment(mutable); // Error: mutable parameter requires &
-  increment(&immutable); // Error: vals cannot be passed as mutable references
-  increment(&someStruct.member); // Error: mutable references must be plain identifiers in V1
+  increment(var mutable); // Required when passing to a var parameter
+  increment(mutable); // Error: mutable parameter requires var
+  increment(var immutable); // Error: vals cannot be passed as mutable references
+  increment(var someStruct.member); // Error: mutable references must be plain identifiers in V1
 
-  val result = test(1, &mutable); // Returning calls are expressions
+  val result = test(1, var mutable); // Returning calls are expressions
   print(1); // Calls `print(Num)`
   print("hello"); // Calls `print(String)`
 }
@@ -92,7 +92,7 @@ fn example() {
 There will need to be consideration on how struct members are handled, will they always be cloned on intialization? Otherwise local variables could escape their context and that'd break things.
 
 Function parameters are immutable by default: `value: Num`. Mutable parameters
-are written as `var value: Num` and must be called with `&identifier`.
+are written as `var value: Num` and must be called with `var identifier`.
 The older `val value: Num` parameter syntax is not valid.
 
 Functions with `-> Type` get an implicit DiamondFire `$out` variable parameter.
@@ -110,8 +110,9 @@ first parameter is `this` is a member function and is called as
 `value.name(...)`; `var this` requires the receiver to be stored in a `var`.
 The receiver parameter is untyped because the impl target supplies the type.
 
-For now mutable references only work with plain local identifiers. Supporting
-`&someStruct.member` needs a separate design for member storage and escaping and
+For now mutable arguments only work with plain local identifiers or reference
+dereferences like `var *ptr`. Supporting
+`var someStruct.member` needs a separate design for member storage and escaping and
 is intentionally a future problem.
 
 Maybe you can only have references to GAME variables? idk man
@@ -450,8 +451,31 @@ fn savePlayerData(data: PlayerData) {
 
 = Pointers
 ```rust
-Have to store variable name?
+struct Point {
+  x: Num
+}
+
+fn example() {
+  var ptr: &Point = malloc(Point, Point { x: 1 });
+  ptr.x = 2; // Automatically dereferences and writes $PTR_n.x
+  *ptr = Point { x: 3 }; // Replaces the whole pointed-to game variable
+  takesMutablePoint(var *ptr); // Passes the pointed-to game variable
+  free(ptr); // Purges the pointed-to game variable
+}
 ```
+
+Reference values use the compiler-known type `&Type` and are always represented
+as a list:
+```
+["Type", "$PTR_0"]
+```
+Index `1` is the referent type name and index `2` is the DiamondFire game
+variable name. `malloc(Type)` allocates a new pointer name using the game
+variable `$FLANG_PTR_COUNTER`; `malloc(Type, value)` also initializes the
+pointed-to game variable. `free(ref)` purges the pointed-to game variable with
+the set-variable purge action. The local reference may be `val`; that only
+prevents changing which pointer the reference stores, not mutating the pointed-to
+game variable.
 
 #pagebreak()
 
