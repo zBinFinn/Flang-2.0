@@ -28,7 +28,12 @@ class FlangSyntaxHighlighter : SyntaxHighlighter {
             FlangTokenTypes.LINE_COMMENT, FlangTokenTypes.BLOCK_COMMENT -> COMMENT_KEYS
             FlangTokenTypes.OPERATOR -> OPERATOR_KEYS
             FlangTokenTypes.PUNCTUATION -> PUNCTUATION_KEYS
-            FlangTokenTypes.BRACE, FlangTokenTypes.PAREN, FlangTokenTypes.BRACKET -> BRACES_KEYS
+            FlangTokenTypes.LBRACE,
+            FlangTokenTypes.RBRACE,
+            FlangTokenTypes.LPAREN,
+            FlangTokenTypes.RPAREN,
+            FlangTokenTypes.LBRACKET,
+            FlangTokenTypes.RBRACKET -> BRACES_KEYS
             FlangTokenTypes.ANNOTATION -> ANNOTATION_KEYS
             FlangTokenTypes.ENUM_SHORTHAND -> ENUM_KEYS
             FlangTokenTypes.EMIT_CONTENT -> EMIT_KEYS

@@ -26,6 +26,30 @@ class FlangSyntaxHighlighterTest {
     }
 
     @Test
+    fun tokenizesOpeningAndClosingDelimitersSeparately() {
+        val lexer = FlangLexerAdapter()
+        lexer.start("{}()[]")
+        val tokenTypes = buildList {
+            while (lexer.tokenType != null) {
+                add(lexer.tokenType)
+                lexer.advance()
+            }
+        }
+
+        assertEquals(
+            listOf(
+                FlangTokenTypes.LBRACE,
+                FlangTokenTypes.RBRACE,
+                FlangTokenTypes.LPAREN,
+                FlangTokenTypes.RPAREN,
+                FlangTokenTypes.LBRACKET,
+                FlangTokenTypes.RBRACKET,
+            ),
+            tokenTypes,
+        )
+    }
+
+    @Test
     fun highlightsEnumShorthandSeparately() {
         val highlighter = FlangSyntaxHighlighter()
 
@@ -33,5 +57,21 @@ class FlangSyntaxHighlighterTest {
             FlangSyntaxHighlighter.ENUM,
             highlighter.getTokenHighlights(FlangTokenTypes.ENUM_SHORTHAND).single(),
         )
+    }
+
+    @Test
+    fun highlightsAllDelimitersAsBraces() {
+        val highlighter = FlangSyntaxHighlighter()
+
+        listOf(
+            FlangTokenTypes.LBRACE,
+            FlangTokenTypes.RBRACE,
+            FlangTokenTypes.LPAREN,
+            FlangTokenTypes.RPAREN,
+            FlangTokenTypes.LBRACKET,
+            FlangTokenTypes.RBRACKET,
+        ).forEach { tokenType ->
+            assertEquals(FlangSyntaxHighlighter.BRACES, highlighter.getTokenHighlights(tokenType).single())
+        }
     }
 }
