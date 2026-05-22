@@ -2199,6 +2199,208 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersGameEventFromProviderObjectAnnotation() {
+        val result = FlangCompiler.compile(
+            """
+            @GameEventProvider("PlotStartup")
+            object PlotStartupEvent;
+
+            @Event
+            fn Startup(event: PlotStartupEvent) {}
+            """.trimIndent(),
+        )
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("game_event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("PlotStartup", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun lowersObjectVariablesToGameVariables() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+
+            fn bump(var value: Num) {
+              value = value + 1;
+            }
+
+            fn Main() {
+              val local = GameState.count;
+              GameState.count = local + 2;
+              bump(var GameState.count);
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "Main()" }.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["slot"]!!.jsonPrimitive.content == "0" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.count" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "call_func" &&
+                block.jsonObject["data"]?.jsonPrimitive?.content == "bump(Num)" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.count" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+    }
+
+    @Test
+    fun lowersObjectVariableMemberCalls() {
+        val result = FlangCompiler.compile(
+            """
+            struct Box { value: Num }
+
+            object GameState {
+              var box: Box = Box { value: 1 };
+            }
+
+            impl Box {
+              fn inc(var this) {
+                this.value = this.value + 1;
+              }
+            }
+
+            fn Main() {
+              GameState.box.inc();
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "Main()" }.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "call_func" &&
+                block.jsonObject["data"]?.jsonPrimitive?.content == "Box.inc(Box)" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.box" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+    }
+
+    @Test
+    fun generatesObjectInitializerAndStartupEvent() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(result.templates.any { it.displayIdentifier == "${ '$' }initObjects()" })
+        val startup = result.templates.single { it.displayIdentifier == "${ '$' }objectStartup" }
+        val blocks = Json.parseToJsonElement(startup.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("game_event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("PlotStartup", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+        assertEquals("call_func", blocks[1].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("${ '$' }initObjects()", blocks[1].jsonObject["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun insertsObjectInitializerIntoExistingStartupEvent() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+
+            @GameEventProvider("PlotStartup")
+            object PlotStartupEvent;
+
+            @Event
+            fn startup(event: PlotStartupEvent) {
+              emit `control "Wait" args(1)`;
+            }
+            """.trimIndent(),
+        )
+
+        val startupTemplates = result.templates.filter { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.first().jsonObject["block"]!!.jsonPrimitive.content == "game_event"
+        }
+        assertEquals(1, startupTemplates.size)
+        val blocks = Json.parseToJsonElement(startupTemplates.single().templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("call_func", blocks[1].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("${ '$' }initObjects()", blocks[1].jsonObject["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun rejectsInvalidObjectVariableBodies() {
+        val valError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  val count: Num = 1;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(valError.message!!.contains("mutable var declarations"))
+
+        val stmtError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  emit `control "Wait" args(1)`;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(stmtError.message!!.contains("only supports variable declarations"))
+
+        val duplicateError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                  var count: Num = 2;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(duplicateError.message!!.contains("Duplicate object variable"))
+    }
+
+    @Test
+    fun rejectsInvalidObjectVariableReferences() {
+        val unknownField = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                }
+                fn Main() {
+                  val local = GameState.missing;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(unknownField.message!!.contains("Object 'GameState' has no variable 'missing'"))
+
+        val typeMismatch = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                }
+                fn Main() {
+                  GameState.count = "bad";
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(typeMismatch.message!!.contains("Cannot assign String"))
+    }
+
+    @Test
     fun rejectsEventWithoutProviderTypedFirstParameter() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(

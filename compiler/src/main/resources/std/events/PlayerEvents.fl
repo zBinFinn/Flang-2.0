@@ -8,14 +8,25 @@ interface CancellableEvent {
     }
 }
 
+// Player Events
+
 @PlayerEventProvider("Join")
 object PlayerJoinEvent;
-
 impl PlayerJoinEvent {
     inline fn getPlayer(this) -> Player {
         return Player.default();
     }
 }
 
-impl CancellableEvent for PlayerJoinEvent {}
+@PlayerEventProvider("RightClick")
+object PlayerRightClickEvent;
+impl PlayerRightClickEvent {
+    inline fn getPlayer(this) -> Player {
+        return Player.default();
+    }
+}
+impl CancellableEvent for PlayerRightClickEvent {}
 
+// Game Events
+@GameEventProvider("PlotStartup")
+object PlotStartupEvent;

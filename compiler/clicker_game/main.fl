@@ -6,14 +6,39 @@ object GameState {
     var playerData: Dict<&PlayerData> = Dict.new();
 }
 
+impl GameState {
+    fn registerPlayer(player: Player) {
+        val data = malloc(PlayerData, PlayerData.load(player));
+        GameState.playerData.set(player.uuid, data);
+    }
+
+    fn unregisterPlayer(player: Player) {
+        val data = GameState.playerData.get(player.uuid);
+        free(data);
+        GameState.playerData.remove(player.uuid);
+    }
+
+    fn getData(player: Player) -> &PlayerData {
+        return GameState.playerData.get(player.uuid);
+    }
+}
+
+@Event
+fn startup(var event: PlotStartupEvent) {
+
+}
+
 @Event
 fn join(var event: PlayerJoinEvent) {
     var player = event.getPlayer();
-    player.sendMessage(s"<green>Hello World!");
-    PlayerData.createForPlayer(player);
-    var data = PlayerData.getForPlayer(player);
-    data.clicks = 5;
-    PlayerData.setForPlayer(player, data);
+}
+
+@Event
+fn rightClick(var event: PlayerRightClickEvent) {
+    var player = event.getPlayer();
+    val data = GameState.getData();
+    data.clicks = data.clicks + 1;
+    player.sendActionBar(s"<green>Your Clicks: ".concat(data.clicks));
 }
 
 struct PlayerData {
@@ -21,27 +46,23 @@ struct PlayerData {
 }
 
 impl PlayerData {
-    inline fn createForPlayer(player: Player) {
-        val uuid = player.uuid;
-        GameVars.set(uuid.concat("-data"), PlayerData {
-            clicks: 0
-        });
-    }
-
-    inline fn getForPlayer(player: Player) -> PlayerData {
-        val uuid = player.uuid;
-        GameVars.get(uuid.concat("-data")) as PlayerData;
-    }
-
-    inline fn setForPlayer(player: Player, data: PlayerData) {
-        val uuid = player.uuid;
-        GameVars.set(uuid.concat("-data"), data);
+    fn load(player: Player) -> PlayerData {
+        // todo:
+        return PlayerData {
+            clicks: 5
+        }
     }
 }
 
 fn String.concat(this, other: String) -> String {
     var out: String;
     emit `set_variable "String" args($out$, $this$, $other$)`;
+    return out;
+}
+
+fn Text.concat(this, other: Any) -> Text {
+    var out: Text;
+    emit `set_variable "StyledText" args($out$, $this$, $other$) tags(..)`;
     return out;
 }
 

@@ -65,6 +65,7 @@ private const val INLINE_PREFIX = "$" + "flang_inline_"
 private const val RETURN_VARIABLE_NAME = "$" + "out"
 private const val SELECTION_TYPE_ENUM = "SelectionType"
 private const val MALLOC_FUNCTION_IDENTIFIER = "$" + "malloc(var)"
+private const val INIT_OBJECTS_FUNCTION_IDENTIFIER = "$" + "initObjects()"
 private const val PTR_COUNTER_NAME = "$" + "FLANG_PTR_COUNTER"
 private const val PTR_PREFIX = "$" + "PTR_"
 
@@ -111,7 +112,7 @@ object FlangCompiler {
     ): CompileResult {
         val enums = buildEnumTable(units)
         val structs = buildStructTable(units, enums)
-        val objects = buildObjectTable(units)
+        val objects = buildObjectTable(units, structs, enums)
         val interfaces = buildInterfaceTable(units, structs, enums, objects)
         val interfaceImpls = buildInterfaceImplementationTable(units, interfaces, structs, objects)
         currentInterfaceImplementations = interfaceImpls.map { InterfaceImplementationKey(it.interfaceName, it.implementorName) }.toSet()
@@ -143,6 +144,7 @@ object FlangCompiler {
                 val block = entry as? DfBlock ?: return@forEach
                 if (block.block == "call_func" && block.data != null) {
                     if (block.data == MALLOC_FUNCTION_IDENTIFIER) return@forEach
+                    if (block.data == INIT_OBJECTS_FUNCTION_IDENTIFIER) return@forEach
                     val dynamicMethod = dynamicInterfaceMethodName(block.data)
                     if (dynamicMethod != null) {
                         interfaceImpls
@@ -168,6 +170,14 @@ object FlangCompiler {
             enqueueCalls(lowered.entries)
         }
 
+        val hasObjectInitializers = objects.values.any { objectDefinition ->
+            objectDefinition.variables.any { it.initializer != null }
+        }
+        val hasPlotStartupEvent = declarations.values.any { declaration ->
+            declaration.annotations.any { it.Identifier().text == "Event" } &&
+                lowering.eventActionForDeclaration(declaration) == "PlotStartup"
+        }
+
         units.firstOrNull()?.takeIf { it.kind == SourceKind.FL }?.let { unit ->
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
@@ -179,6 +189,15 @@ object FlangCompiler {
                         lowerSignature(lowering.signatureForDeclaration(function, impl.implementorName(), packageName = unit.packageName))
                     }
                 }
+            }
+        }
+
+        if (hasObjectInitializers) {
+            val loweredInitObjects = lowering.lowerObjectInitFunction()
+            loweredByIdentifier[INIT_OBJECTS_FUNCTION_IDENTIFIER] = loweredInitObjects
+            enqueueCalls(loweredInitObjects.entries)
+            if (!hasPlotStartupEvent) {
+                loweredByIdentifier["$" + "objectStartup"] = lowering.lowerGeneratedObjectStartupEvent()
             }
         }
 
@@ -351,8 +370,7 @@ object FlangCompiler {
             optimized = result.entries
             result.warnings.forEach { warning ->
                 val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
-                // TODO: Figure out what to do with this, for now leave commented
-//                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
             }
         }
         return optimized
@@ -905,7 +923,15 @@ object FlangCompiler {
         return enums
     }
 
-    private fun buildObjectTable(units: List<SourceUnit>): Map<String, ObjectDefinition> {
+    private fun buildObjectTable(
+        units: List<SourceUnit>,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+    ): Map<String, ObjectDefinition> {
+        val objectNames = units.filter { it.kind == SourceKind.FL }
+            .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
+            .toSet()
+        val placeholders = objectNames.associateWith { name -> ObjectDefinition(name, provider = null, variables = emptyList()) }
         val objects = linkedMapOf<String, ObjectDefinition>()
         units.filter { it.kind == SourceKind.FL }.forEach { unit ->
             unit.file.item().forEach { item ->
@@ -918,7 +944,34 @@ object FlangCompiler {
                 if (providerAnnotations.size > 1) {
                     throw FlangCompileException("Object '$name' can only declare one event provider annotation.")
                 }
-                objects[name] = ObjectDefinition(name, providerAnnotations.singleOrNull())
+                val variableNames = mutableSetOf<String>()
+                val variables = objectDecl.block()?.stmt().orEmpty().map { stmt ->
+                    val varDecl = stmt.varDecl()
+                        ?: throw FlangCompileException("Object '$name' body only supports variable declarations.")
+                    if (varDecl.VAL() != null) {
+                        throw FlangCompileException("Object '$name' body only supports mutable var declarations.")
+                    }
+                    val variableName = varDecl.Identifier().text
+                    if (!variableNames.add(variableName)) {
+                        throw FlangCompileException("Duplicate object variable '$variableName' in object '$name'.")
+                    }
+                    if (variableName.startsWith(TEMP_PREFIX) || variableName.startsWith(INLINE_PREFIX)) {
+                        throw FlangCompileException("Object variable '$name.$variableName' uses a reserved compiler prefix.")
+                    }
+                    if (varDecl.typeRef() == null && varDecl.expr() == null) {
+                        throw FlangCompileException("Object variable '$name.$variableName' requires a type or initializer.")
+                    }
+                    ObjectVariableDefinition(
+                        name = variableName,
+                        declaredTypeRef = varDecl.typeRef(),
+                        initializer = varDecl.expr(),
+                        packageName = unit.packageName,
+                        sourceId = unit.id,
+                        line = varDecl.start.line,
+                        column = varDecl.start.charPositionInLine + 1,
+                    )
+                }
+                objects[name] = ObjectDefinition(name, providerAnnotations.singleOrNull(), variables)
             }
         }
         return objects
@@ -1052,6 +1105,19 @@ private data class LoweredFunction(
 private data class ObjectDefinition(
     val name: String,
     val provider: EventProviderAnnotation?,
+    val variables: List<ObjectVariableDefinition> = emptyList(),
+) {
+    val variablesByName: Map<String, ObjectVariableDefinition> = variables.associateBy { it.name }
+}
+
+private data class ObjectVariableDefinition(
+    val name: String,
+    val declaredTypeRef: FlangParser.TypeRefContext?,
+    val initializer: FlangParser.ExprContext?,
+    val packageName: String,
+    val sourceId: String,
+    val line: Int,
+    val column: Int,
 )
 
 private data class InterfaceDefinition(
@@ -1373,10 +1439,17 @@ private class FunctionLowering(
         signatures.values.filter { it.owner == null }.groupBy { it.name }
     private val implOverloadsByOwnerAndName: Map<Pair<String, String>, List<FunctionSignature>> =
         signatures.values.filter { it.owner != null }.groupBy { it.owner!! to it.name }
+    private val objectVariableTypes = mutableMapOf<Pair<String, String>, FlangType>()
+    private val resolvingObjectVariableTypes = mutableSetOf<Pair<String, String>>()
 
     init {
         actionDump.gameValueTypeOverrides().forEach { (name, type) ->
             parseGameValueOverrideType(type, name)
+        }
+        objects.values.forEach { objectDefinition ->
+            objectDefinition.variables.forEach { variable ->
+                resolveObjectVariableType(objectDefinition.name, variable)
+            }
         }
     }
 
@@ -1435,9 +1508,10 @@ private class FunctionLowering(
             throw FlangCompileException("Event function '$functionName' cannot declare a return type.")
         }
         val context = FunctionContext(signature = signature, isEvent = isEvent)
-        val eventAction = if (isEvent) resolveEventAction(functionName, signature) else null
+        val eventProvider = if (isEvent) resolveEventProvider(functionName, signature) else null
+        val eventAction = eventProvider?.action
         val header = if (isEvent) {
-            DfBlock(block = "event", action = eventAction, args = DfArgs(emptyList()))
+            DfBlock(block = eventBlockId(eventProvider!!), action = eventAction, args = DfArgs(emptyList()))
         } else {
             DfBlock(block = "func", data = signature.fullIdentifier, args = functionArgs(signature))
         }
@@ -1456,6 +1530,9 @@ private class FunctionLowering(
         }
 
         val entries = mutableListOf<DfEntry>(header)
+        if (isEvent && eventAction == "PlotStartup" && objects.values.any { it.variables.any { variable -> variable.initializer != null } }) {
+            entries += callFunctionBlock(INIT_OBJECTS_FUNCTION_IDENTIFIER)
+        }
         function.block().stmt().forEach { stmt ->
             entries += lowerStatementWithOrigin(stmt, symbols, context)
         }
@@ -1475,6 +1552,67 @@ private class FunctionLowering(
             currentStatementOrigin = previousStatementOrigin
         }
     }
+
+    fun eventActionForDeclaration(declaration: FunctionDeclaration): String? {
+        if (declaration.annotations.none { it.Identifier().text == "Event" }) return null
+        val signature = signatureForDeclaration(declaration.function, declaration.owner, declaration.packageName)
+        return try {
+            resolveEventProvider(declaration.function.declaredName(), signature).action
+        } catch (_: FlangCompileException) {
+            null
+        }
+    }
+
+    fun lowerObjectInitFunction(): LoweredFunction {
+        tempCounter = 0
+        val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
+        val previousStatementOrigin = currentStatementOrigin
+        val entries = mutableListOf<DfEntry>(
+            DfBlock(
+                block = "func",
+                data = INIT_OBJECTS_FUNCTION_IDENTIFIER,
+                args = DfArgs(
+                    listOf(
+                        DfSlot(25, DfHint("function")),
+                        DfSlot(26, DfBlockTag(block = "func", action = "dynamic", tag = "Is Hidden", option = "True")),
+                    ),
+                ),
+            ),
+        )
+        try {
+            objects.values.forEach { objectDefinition ->
+                objectDefinition.variables.forEach { variable ->
+                    val initializer = variable.initializer ?: return@forEach
+                    currentPackage = variable.packageName
+                    currentSourceId = variable.sourceId
+                    currentStatementOrigin = DfSourceOrigin(variable.sourceId, variable.line, variable.column)
+                    val type = resolveObjectVariableType(objectDefinition.name, variable)
+                    val value = lowerAssignmentToValue(initializer.assignment(), emptyMap(), type)
+                    if (!value.type.isAssignableTo(type)) {
+                        throw FlangCompileException("Cannot assign ${value.type.sourceName} to object variable '${objectDefinition.name}.${variable.name}' declared as ${type.sourceName}.")
+                    }
+                    entries += value.prelude
+                    entries += setVariableBlock(objectVariableDfVariable(objectDefinition.name, variable.name), value.item)
+                }
+            }
+        } finally {
+            currentPackage = previousPackage
+            currentSourceId = previousSourceId
+            currentStatementOrigin = previousStatementOrigin
+        }
+        return LoweredFunction(INIT_OBJECTS_FUNCTION_IDENTIFIER, entries, INIT_OBJECTS_FUNCTION_IDENTIFIER)
+    }
+
+    fun lowerGeneratedObjectStartupEvent(): LoweredFunction =
+        LoweredFunction(
+            displayIdentifier = "$" + "objectStartup",
+            functionIdentifier = "$" + "objectStartup",
+            entries = listOf(
+                DfBlock(block = "game_event", action = "PlotStartup", args = DfArgs(emptyList())),
+                callFunctionBlock(INIT_OBJECTS_FUNCTION_IDENTIFIER),
+            ),
+        )
 
     fun lowerMallocIntrinsic(): LoweredFunction =
         LoweredFunction(
@@ -1535,18 +1673,25 @@ private class FunctionLowering(
         }
     }
 
-    private fun resolveEventAction(
+    private fun resolveEventProvider(
         functionName: String,
         signature: FunctionSignature,
-    ): String {
+    ): EventProviderAnnotation {
         val firstParam = signature.params.firstOrNull()
             ?: throw FlangCompileException("Event function '$functionName' must declare a first parameter typed as an event provider object.")
         val providerType = firstParam.type as? FlangType.OBJECT
             ?: throw FlangCompileException("Event function '$functionName' must declare a first parameter typed as an event provider object.")
         val provider = objects[providerType.name]?.provider
             ?: throw FlangCompileException("Object '${providerType.name}' is not an event provider object.")
-        return provider.action
+        return provider
     }
+
+    private fun eventBlockId(provider: EventProviderAnnotation): String =
+        when (provider.kind) {
+            EventProviderKind.PLAYER -> "event"
+            EventProviderKind.ENTITY -> "entity_event"
+            EventProviderKind.GAME -> "game_event"
+        }
 
     fun signatureForDeclaration(function: FlangParser.FunctionDeclContext, owner: String?, packageName: String = ""): FunctionSignature {
         val name = function.declaredName()
@@ -1938,6 +2083,14 @@ private class FunctionLowering(
 
             val memberTarget = assignment.logicalOr().memberAccessOrNull()
             if (memberTarget != null) {
+                objectVariable(memberTarget)?.let { (objectDefinition, variableDefinition) ->
+                    val type = resolveObjectVariableType(objectDefinition.name, variableDefinition)
+                    val value = lowerAssignmentToValue(assignment.assignment(), symbols, type)
+                    if (!value.type.isAssignableTo(type)) {
+                        throw FlangCompileException("Cannot assign ${value.type.sourceName} to '${objectDefinition.name}.${variableDefinition.name}' of type ${type.sourceName}.")
+                    }
+                    return value.prelude + setVariableBlock(objectVariableDfVariable(objectDefinition.name, variableDefinition.name), value.item)
+                }
                 val base = symbols[memberTarget.base]
                     ?: throw FlangCompileException("Cannot assign to member of unknown local '${memberTarget.base}'.")
                 if (base.mutability != Mutability.MUTABLE && base.type !is FlangType.REF) {
@@ -2542,6 +2695,50 @@ private class FunctionLowering(
         )
     }
 
+    private fun resolveObjectVariableType(objectName: String, variable: ObjectVariableDefinition): FlangType {
+        val key = objectName to variable.name
+        objectVariableTypes[key]?.let { return it }
+        variable.declaredTypeRef?.let { typeRef ->
+            val declared = FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces)
+            objectVariableTypes[key] = declared
+            return declared
+        }
+        val initializer = variable.initializer
+            ?: throw FlangCompileException("Object variable '$objectName.${variable.name}' requires a type or initializer.")
+        if (!resolvingObjectVariableTypes.add(key)) {
+            throw FlangCompileException("Object variable '$objectName.${variable.name}' has a recursive inferred type.")
+        }
+        val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
+        val previousStatementOrigin = currentStatementOrigin
+        return try {
+            currentPackage = variable.packageName
+            currentSourceId = variable.sourceId
+            currentStatementOrigin = DfSourceOrigin(variable.sourceId, variable.line, variable.column)
+            inferExpressionType(initializer, emptyMap()).also { inferred ->
+                objectVariableTypes[key] = inferred
+            }
+        } finally {
+            resolvingObjectVariableTypes.remove(key)
+            currentPackage = previousPackage
+            currentSourceId = previousSourceId
+            currentStatementOrigin = previousStatementOrigin
+        }
+    }
+
+    private fun objectVariable(member: MemberAccess): Pair<ObjectDefinition, ObjectVariableDefinition>? {
+        val objectDefinition = objects[member.base] ?: return null
+        val variable = objectDefinition.variablesByName[member.field]
+            ?: throw FlangCompileException("Object '${objectDefinition.name}' has no variable '${member.field}'.")
+        return objectDefinition to variable
+    }
+
+    private fun objectVariableDfVariable(objectName: String, variableName: String): DfVariable =
+        DfVariable(DfVariableScope.GAME, objectVariableName(objectName, variableName))
+
+    private fun objectVariableName(objectName: String, variableName: String): String =
+        "$objectName.$variableName"
+
     private fun lowerEnumHelperCallToPlaceholder(call: EnumHelperCall, symbols: Map<String, Symbol>): ExpressionValue {
         val base = symbols[call.baseName] ?: throw FlangCompileException("Unknown local '${call.baseName}'.")
         val placeholder = enumFieldPlaceholder(base.name, call.fieldName)
@@ -2627,6 +2824,10 @@ private class FunctionLowering(
         member: MemberAccess,
         symbols: Map<String, Symbol>,
     ): ExpressionValue {
+        objectVariable(member)?.let { (objectDefinition, variableDefinition) ->
+            val type = resolveObjectVariableType(objectDefinition.name, variableDefinition)
+            return ExpressionValue(type, objectVariableDfVariable(objectDefinition.name, variableDefinition.name))
+        }
         val base = symbols[member.base] ?: throw FlangCompileException("Unknown local '${member.base}'.")
         val structType = base.type.referentOrSelf() as? FlangType.STRUCT
             ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
@@ -2810,6 +3011,9 @@ private class FunctionLowering(
 
         val member = postfix.memberAccessOrNull()
         if (member != null) {
+            objectVariable(member)?.let { (objectDefinition, variableDefinition) ->
+                return resolveObjectVariableType(objectDefinition.name, variableDefinition)
+            }
             val base = symbols[member.base] ?: throw FlangCompileException("Unknown local '${member.base}'.")
             val structType = base.type as? FlangType.STRUCT
                 ?: throw FlangCompileException("Local '${member.base}' is not a struct.")
@@ -2884,6 +3088,11 @@ private class FunctionLowering(
                 ?: throw FlangCompileException("Cannot dereference non-reference local '$dereferenceName'.")
             return refType.referentType
         }
+        arg.expr.assignment().logicalOr().memberAccessOrNull()?.let { member ->
+            objectVariable(member)?.let { (objectDefinition, variableDefinition) ->
+                return resolveObjectVariableType(objectDefinition.name, variableDefinition)
+            }
+        }
         val name = arg.expr.assignment().logicalOr().plainIdentifierOrNull()
             ?: throw FlangCompileException("Mutable arguments must be passed as var identifier or var *ref.")
         val symbol = symbols[name] ?: throw FlangCompileException("Unknown local '$name'.")
@@ -2900,6 +3109,15 @@ private class FunctionLowering(
         val dereferenceName = arg.expr.assignment().logicalOr().dereferenceOrNull()
         if (dereferenceName != null) {
             return lowerReferenceTarget(dereferenceName, symbols)
+        }
+        arg.expr.assignment().logicalOr().memberAccessOrNull()?.let { member ->
+            objectVariable(member)?.let { (objectDefinition, variableDefinition) ->
+                return ReferenceTarget(
+                    resolveObjectVariableType(objectDefinition.name, variableDefinition),
+                    objectVariableDfVariable(objectDefinition.name, variableDefinition.name),
+                    emptyList(),
+                )
+            }
         }
         val name = arg.expr.assignment().logicalOr().plainIdentifierOrNull()
             ?: throw FlangCompileException("Mutable arguments must be passed as var identifier or var *ref.")
@@ -3154,15 +3372,32 @@ private class FunctionLowering(
         postfix: FlangParser.PostfixContext,
         symbols: Map<String, Symbol>,
     ): List<DfEntry> {
-        val segments = postfix.postfixPart().callSegmentsOrNull()
+        val workingSymbols = LinkedHashMap(symbols)
+        val blocks = mutableListOf<DfEntry>()
+        var currentReceiverName = postfix.primary().Identifier()?.text
+        var callParts = postfix.postfixPart()
+
+        val initialReceiverName = currentReceiverName
+        if (initialReceiverName != null && callParts.firstOrNull()?.let { it.DOT() != null && it.LPAREN() == null } == true) {
+            val objectMember = MemberAccess(initialReceiverName, callParts.first().Identifier().text)
+            objectVariable(objectMember)?.let { (objectDefinition, variableDefinition) ->
+                val receiverAlias = nextTempName(workingSymbols)
+                workingSymbols[receiverAlias] = Symbol(
+                    name = objectVariableName(objectDefinition.name, variableDefinition.name),
+                    mutability = Mutability.MUTABLE,
+                    type = resolveObjectVariableType(objectDefinition.name, variableDefinition),
+                    scope = DfVariableScope.GAME,
+                )
+                currentReceiverName = receiverAlias
+                callParts = callParts.drop(1)
+            }
+        }
+
+        val segments = callParts.callSegmentsOrNull()
             ?: throw FlangCompileException("Unsupported expression statement in this compiler pass.")
         if (segments.isEmpty() || !segments.last().isMemberCall) {
             throw FlangCompileException("Unsupported expression statement in this compiler pass.")
         }
-
-        val workingSymbols = LinkedHashMap(symbols)
-        val blocks = mutableListOf<DfEntry>()
-        var currentReceiverName = postfix.primary().Identifier()?.text
 
         postfix.primary().typeStaticCall()?.let { staticCall ->
             val value = lowerFunctionCallToValue(staticCall.toSimpleCall(), workingSymbols)
@@ -3628,6 +3863,9 @@ private class FunctionLowering(
 
     private fun returnBlock(): DfBlock =
         DfBlock(block = "control", action = "Return")
+
+    private fun callFunctionBlock(functionIdentifier: String): DfBlock =
+        DfBlock(block = "call_func", data = functionIdentifier)
 
     private fun stopRepeatBlock(): DfBlock =
         DfBlock(block = "control", action = "StopRepeat")

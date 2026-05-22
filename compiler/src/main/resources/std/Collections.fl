@@ -106,6 +106,10 @@ inline fn Dict<T>.set(var this, key: String, value: T) {
     emit `set_variable "SetDictValue" args($this$, $key$, $value$)`;
 }
 
+inline fn Dict<T>.remove(var this, key: String) {
+    emit `set_variable "RemoveDictEntry" args($this$, $key$)`;
+}
+
 inline fn Dict<T>.keys(this) -> List<String> {
     var out: List<String>;
     emit `set_variable "GetDictKeys" args($out$, $this$)`;

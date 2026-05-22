@@ -38,6 +38,12 @@ impl Player {
         this.deselect();
     }
 
+    inline fn sendActionBar(this, message: Text) {
+        this.select();
+        emit `player_action "ActionBar" args($message$) tags(..)`;
+        this.deselect();
+    }
+
     inline fn giveItem(var this, item: Item) {
         this.select();
         emit `player_action "GiveItems" args($item$)`;
