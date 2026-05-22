@@ -20,6 +20,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Base64
 import java.util.zip.GZIPOutputStream
+import kotlin.io.path.relativeTo
+import kotlin.io.path.relativeToOrSelf
 
 data class CompileOptions(
     val templateNameOverride: String? = null,
@@ -35,6 +37,7 @@ enum class StructMode {
 
 enum class Optimization {
     ELIDE_REDUNDANT_SELECT_RESET,
+    ELIDE_REDUNDANT_VAR_HANDOFF,
 }
 
 data class CompiledTemplate(
@@ -156,7 +159,7 @@ object FlangCompiler {
             if (signature.isInline || loweredByIdentifier.containsKey(signature.fullIdentifier)) return
             val declaration = declarations[signature.fullIdentifier]
                 ?: throw FlangCompileException("Function '${signature.fullIdentifier}' has no declaration.")
-            val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName)
+            val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName, declaration.sourceId)
             loweredByIdentifier[signature.fullIdentifier] = lowered
             enqueueCalls(lowered.entries)
         }
@@ -189,7 +192,7 @@ object FlangCompiler {
         }
 
         val templates = loweredFunctions.map { lowered ->
-            val optimizedEntries = optimize(lowered.entries, options.optimizations)
+            val optimizedEntries = optimize(lowered.entries, options.optimizations, lowered.functionIdentifier)
             val template = DfTemplate(optimizedEntries)
             val templateJson = json.encodeToString(JsonElement.serializer(), template.toJson())
             val displayName = templateName(options, lowered.displayIdentifier, loweredFunctions.size)
@@ -214,12 +217,13 @@ object FlangCompiler {
         lateinit var loadImport: (String, List<Path>) -> SourceUnit
 
         fun loadPath(path: Path, moduleName: String?, expectedPackage: String?): SourceUnit {
-            val normalized = path.toAbsolutePath().normalize()
+            val normalized = path.toAbsolutePath().normalize();
             val key = moduleName ?: "file:${normalized}"
             loaded[key]?.let { return it }
             val source = Files.readString(normalized)
             val kind = sourceKind(normalized.toString())
-            val unit = sourceUnit(normalized.toString(), moduleName, kind, parse(source), expectedPackage)
+            // TODO: normalized.last().toString() is horrible
+            val unit = sourceUnit(normalized.last().toString(), moduleName, kind, parse(source), expectedPackage)
             val existing = loaded[key]
             if (existing != null) {
                 if (existing.id != unit.id) {
@@ -330,10 +334,19 @@ object FlangCompiler {
         return Regex("""\)\.([A-Za-z_][A-Za-z0-9_]*)\(""").find(identifier)?.groupValues?.get(1)
     }
 
-    private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>): List<DfEntry> {
+    private fun optimize(entries: List<DfEntry>, optimizations: Set<Optimization>, functionIdentifier: String): List<DfEntry> {
         var optimized = entries
         if (Optimization.ELIDE_REDUNDANT_SELECT_RESET in optimizations) {
             optimized = elideRedundantSelectReset(optimized)
+        }
+        if (Optimization.ELIDE_REDUNDANT_VAR_HANDOFF in optimizations) {
+            val result = elideRedundantVarHandoffs(optimized)
+            optimized = result.entries
+            result.warnings.forEach { warning ->
+                val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
+//                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
+                // TODO
+            }
         }
         return optimized
     }
@@ -353,6 +366,125 @@ object FlangCompiler {
 
     private fun DfEntry?.isSelectObject(): Boolean =
         this is DfBlock && block == "select_obj"
+
+    private data class VariableOccurrence(
+        val key: ScopedVar,
+        val entryIndex: Int,
+        val slot: Int,
+    )
+
+    private data class ScopedVar(
+        val scope: DfVariableScope,
+        val name: String,
+    )
+
+    private data class VarHandoffWarning(
+        val elidedVariable: String,
+        val rewiredVariable: String,
+        val origin: DfSourceOrigin?,
+    )
+
+    private data class VarHandoffOptimizationResult(
+        val entries: List<DfEntry>,
+        val warnings: List<VarHandoffWarning>,
+    )
+
+    private fun elideRedundantVarHandoffs(entries: List<DfEntry>): VarHandoffOptimizationResult {
+        val occurrencesByVar = linkedMapOf<ScopedVar, MutableList<VariableOccurrence>>()
+
+        entries.forEachIndexed { entryIndex, entry ->
+            val block = entry as? DfBlock ?: return@forEachIndexed
+            block.args.items.forEach { slot ->
+                val variable = slot.item as? DfVariable ?: return@forEach
+                occurrencesByVar
+                    .getOrPut(ScopedVar(variable.scope, variable.name)) { mutableListOf() }
+                    .add(VariableOccurrence(ScopedVar(variable.scope, variable.name), entryIndex, slot.slot))
+            }
+        }
+
+        val removed = mutableSetOf<Int>()
+        val rewrittenTargets = mutableMapOf<Int, DfVariable>()
+        val warnings = mutableListOf<VarHandoffWarning>()
+
+        occurrencesByVar.forEach { (candidate, occurrences) ->
+            if (occurrences.size != 2) return@forEach
+            val first = occurrences[0]
+            val second = occurrences[1]
+            if (first.entryIndex + 1 != second.entryIndex) return@forEach
+            if (first.slot != 0 || second.slot != 1) return@forEach
+            if (first.entryIndex in removed || second.entryIndex in removed) return@forEach
+
+            val producer = entries.getOrNull(first.entryIndex) as? DfBlock ?: return@forEach
+            val copy = entries.getOrNull(second.entryIndex) as? DfBlock ?: return@forEach
+
+            if (producer.block != "set_var") return@forEach
+            if (copy.block != "set_var" || copy.action != "=") return@forEach
+            if (containsSuspiciousDynamicVarReference(entries, candidate.name)) return@forEach
+
+            val producerTarget = producer.slotVariable(0) ?: return@forEach
+            if (producerTarget.scope != candidate.scope || producerTarget.name != candidate.name) return@forEach
+            if (producer.referencesVariableBeyondSlot(candidate, allowedSlot = 0)) return@forEach
+
+            val copyTarget = copy.slotVariable(0) ?: return@forEach
+            val copySource = copy.slotVariable(1) ?: return@forEach
+            if (copySource.scope != candidate.scope || copySource.name != candidate.name) return@forEach
+
+            rewrittenTargets[first.entryIndex] = copyTarget
+            removed += second.entryIndex
+            warnings += VarHandoffWarning(
+                elidedVariable = candidate.name,
+                rewiredVariable = copyTarget.name,
+                origin = producer.sourceOrigin,
+            )
+        }
+
+        val optimized = buildList {
+            entries.forEachIndexed { index, entry ->
+                if (index in removed) return@forEachIndexed
+                val rewritten = rewrittenTargets[index]
+                if (rewritten != null) {
+                    val block = entry as DfBlock
+                    add(block.withSlotVariable(0, rewritten))
+                } else {
+                    add(entry)
+                }
+            }
+        }
+        return VarHandoffOptimizationResult(entries = optimized, warnings = warnings)
+    }
+
+    private fun containsSuspiciousDynamicVarReference(entries: List<DfEntry>, variableName: String): Boolean {
+        val placeholder = "%var($variableName)"
+        return entries.any { entry ->
+            val block = entry as? DfBlock ?: return@any false
+            block.args.items.any { slot ->
+                when (val item = slot.item) {
+                    is DfText -> item.value.contains(placeholder)
+                    is DfVariable -> item.name.contains(placeholder)
+                    else -> false
+                }
+            }
+        }
+    }
+
+    private fun DfBlock.slotVariable(slot: Int): DfVariable? =
+        args.items.firstOrNull { it.slot == slot }?.item as? DfVariable
+
+    private fun DfBlock.referencesVariableBeyondSlot(variable: ScopedVar, allowedSlot: Int): Boolean =
+        args.items.any { slot ->
+            if (slot.slot == allowedSlot) return@any false
+            val item = slot.item as? DfVariable ?: return@any false
+            item.scope == variable.scope && item.name == variable.name
+        }
+
+    private fun DfBlock.withSlotVariable(slot: Int, replacement: DfVariable): DfBlock {
+        val matches = args.items.filter { it.slot == slot }
+        if (matches.size != 1) return this
+        val rewrittenItems = args.items.map {
+            if (it.slot == slot) DfSlot(slot = slot, item = replacement) else it
+        }
+        return copy(args = DfArgs(rewrittenItems))
+    }
 
     private fun templateName(
         options: CompileOptions,
@@ -505,13 +637,13 @@ object FlangCompiler {
                 item.functionDecl()?.let { function ->
                     val owner = function.functionName().typeRef()?.text
                     val signature = signatureForFunctionDeclaration(function, owner = owner, packageName = unit.packageName, signatures)
-                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName)
+                    declarations[signature.fullIdentifier] = FunctionDeclaration(item.annotation(), function, owner = owner, packageName = unit.packageName, sourceId = unit.id)
                 }
                 item.implDecl()?.let { impl ->
                     val owner = impl.implementorName()
                     impl.functionDecl().forEach { function ->
                         val signature = signatureForFunctionDeclaration(function, owner, packageName = unit.packageName, signatures)
-                        declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName)
+                        declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = owner, packageName = unit.packageName, sourceId = unit.id)
                     }
                 }
             }
@@ -521,7 +653,13 @@ object FlangCompiler {
             interfaceDefinition.methods.filter { it.isDefault && implementation.specializedMethodKeys.none { key -> key.matches(it) } }.forEach { method ->
                 val function = method.function ?: throw FlangCompileException("Interface method '${method.name}' has no default body.")
                 val signature = signatureForInterfaceDefault(function, implementation.implementorName, implementation.implementorPackage, signatures)
-                declarations[signature.fullIdentifier] = FunctionDeclaration(emptyList(), function, owner = implementation.implementorName, packageName = implementation.implementorPackage)
+                declarations[signature.fullIdentifier] = FunctionDeclaration(
+                    emptyList(),
+                    function,
+                    owner = implementation.implementorName,
+                    packageName = implementation.implementorPackage,
+                    sourceId = "<interface-default:${implementation.interfaceName}>",
+                )
             }
         }
         return declarations
@@ -870,7 +1008,11 @@ object FlangCompiler {
     }
 }
 
-private data class LoweredFunction(val displayIdentifier: String, val entries: List<DfEntry>)
+private data class LoweredFunction(
+    val displayIdentifier: String,
+    val entries: List<DfEntry>,
+    val functionIdentifier: String,
+)
 
 private data class ObjectDefinition(
     val name: String,
@@ -954,6 +1096,7 @@ private data class FunctionDeclaration(
     val function: FlangParser.FunctionDeclContext,
     val owner: String?,
     val packageName: String,
+    val sourceId: String,
 )
 
 private data class FunctionSignature(
@@ -1169,6 +1312,8 @@ private class FunctionLowering(
     private var tempCounter = 0
     private var inlineCounter = 0
     private var currentPackage = ""
+    private var currentSourceId = "<unknown>"
+    private var currentStatementOrigin: DfSourceOrigin? = null
     private val inlineCallStack = mutableListOf<String>()
     private val overloadsByName: Map<String, List<FunctionSignature>> =
         signatures.values.filter { it.owner == null }.groupBy { it.name }
@@ -1216,12 +1361,17 @@ private class FunctionLowering(
         function: FlangParser.FunctionDeclContext,
         owner: String? = null,
         packageName: String = "",
+        sourceId: String = "<unknown>",
     ): LoweredFunction {
         tempCounter = 0
         val functionName = function.declaredName()
         val signature = signatureForDeclaration(function, owner, packageName)
         val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
+        val previousStatementOrigin = currentStatementOrigin
         currentPackage = signature.packageName
+        currentSourceId = sourceId
+        currentStatementOrigin = null
         try {
         val isEvent = annotations.any { it.Identifier().text == "Event" }
         if (isEvent && signature.isInline) {
@@ -1253,7 +1403,7 @@ private class FunctionLowering(
 
         val entries = mutableListOf<DfEntry>(header)
         function.block().stmt().forEach { stmt ->
-            entries += lowerStatement(stmt, symbols, context)
+            entries += lowerStatementWithOrigin(stmt, symbols, context)
         }
         if (signature.returnType != null && !context.sawReturn) {
             throw FlangCompileException("Function '$functionName' declares return type ${signature.returnType.sourceName} but has no return statement.")
@@ -1264,9 +1414,29 @@ private class FunctionLowering(
         } else {
             signature.fullIdentifier
         }
-        return LoweredFunction(displayIdentifier, entries)
+        return LoweredFunction(displayIdentifier, entries, signature.fullIdentifier)
         } finally {
             currentPackage = previousPackage
+            currentSourceId = previousSourceId
+            currentStatementOrigin = previousStatementOrigin
+        }
+    }
+
+    private fun lowerStatementWithOrigin(
+        stmt: FlangParser.StmtContext,
+        symbols: MutableMap<String, Symbol>,
+        context: FunctionContext,
+    ): List<DfEntry> {
+        val previousOrigin = currentStatementOrigin
+        currentStatementOrigin = DfSourceOrigin(
+            fileId = currentSourceId,
+            line = stmt.start.line,
+            column = stmt.start.charPositionInLine + 1,
+        )
+        try {
+            return lowerStatement(stmt, symbols, context)
+        } finally {
+            currentStatementOrigin = previousOrigin
         }
     }
 
@@ -1400,7 +1570,7 @@ private class FunctionLowering(
         )
         val entries = mutableListOf<DfEntry>()
         block.stmt().forEach { stmt ->
-            entries += lowerStatement(stmt, branchSymbols, branchContext)
+            entries += lowerStatementWithOrigin(stmt, branchSymbols, branchContext)
         }
         return LoweredBranch(entries, branchContext.sawReturn)
     }
@@ -2948,11 +3118,13 @@ private class FunctionLowering(
 
         inlineCallStack += signature.fullIdentifier
         val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
         currentPackage = signature.packageName
         try {
             val prefix = inlinePrefix(signature)
             val blocks = mutableListOf<DfEntry>()
             val inlineSymbols = linkedMapOf<String, Symbol>()
+            currentSourceId = declaration.sourceId
             val explicitParams = if (signature.hasReceiver) signature.params.drop(1) else signature.params
 
             if (signature.hasReceiver) {
@@ -3007,7 +3179,7 @@ private class FunctionLowering(
                 inlineReturnMode = returnMode,
             )
             declaration.function.block().stmt().forEach { stmt ->
-                blocks += lowerStatement(stmt, inlineSymbols, context)
+                blocks += lowerStatementWithOrigin(stmt, inlineSymbols, context)
             }
 
             return if (returnMode == InlineReturnMode.STOP_REPEAT) {
@@ -3019,6 +3191,7 @@ private class FunctionLowering(
             }
         } finally {
             currentPackage = previousPackage
+            currentSourceId = previousSourceId
             inlineCallStack.removeAt(inlineCallStack.lastIndex)
         }
     }
@@ -3149,6 +3322,7 @@ private class FunctionLowering(
                     values.mapIndexed { index, item -> DfSlot(slot = index + 1, item = item) } +
                     tags,
             ),
+            sourceOrigin = currentStatementOrigin,
         )
 
     private fun parseCastType(typeRef: FlangParser.TypeRefContext): FlangType =

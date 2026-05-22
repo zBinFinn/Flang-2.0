@@ -9,6 +9,8 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.PrintStream
 import java.nio.file.Files
 import java.util.Base64
 import java.util.zip.GZIPInputStream
@@ -2460,6 +2462,160 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun doesNotElideVarHandoffByDefault() {
+        val result = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            fn Test() {
+              val temp = Pair { a: 1, b: 2 };
+              val real = temp;
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[1].jsonObject, "temp", "CreateList")
+        assertSetVar(blocks[2].jsonObject, "real", "var", "temp")
+    }
+
+    @Test
+    fun elidesImmediateVarHandoffForNonTempNames() {
+        val result = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            fn Test() {
+              val temp = Pair { a: 1, b: 2 };
+              val real = temp;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals(2, blocks.size)
+        assertSetVarAction(blocks[1].jsonObject, "real", "CreateList")
+    }
+
+    @Test
+    fun elidesAfterInlineLowering() {
+        val result = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            inline fn makePair() -> Pair {
+              val temp = Pair { a: 1, b: 2 };
+              return temp;
+            }
+
+            fn Main() {
+              val real = makePair();
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.none {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                it.jsonObject["action"]?.jsonPrimitive?.content == "=" &&
+                it.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["slot"]!!.jsonPrimitive.content == "1" &&
+                        slot.jsonObject["item"]!!.jsonObject["id"]!!.jsonPrimitive.content == "var" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content.contains("makePair")
+                }
+        })
+        assertTrue(blocks.any {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                it.jsonObject["action"]?.jsonPrimitive?.content == "CreateList"
+        })
+    }
+
+    @Test
+    fun doesNotElideWhenOccurrenceCountNotTwoOrNotAdjacent() {
+        val nonAdjacent = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            fn Test() {
+              val temp = Pair { a: 1, b: 2 };
+              val middle = 1;
+              val real = temp;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+        val nonAdjacentBlocks = Json.parseToJsonElement(nonAdjacent.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(nonAdjacentBlocks[1].jsonObject, "temp", "CreateList")
+        assertSetVar(nonAdjacentBlocks[3].jsonObject, "real", "var", "temp")
+
+        val extraUse = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            fn Test() {
+              val temp = Pair { a: 1, b: 2 };
+              val keep = temp;
+              val real = temp;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+        val extraUseBlocks = Json.parseToJsonElement(extraUse.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(extraUseBlocks[1].jsonObject, "temp", "CreateList")
+        assertSetVar(extraUseBlocks[2].jsonObject, "keep", "var", "temp")
+        assertSetVar(extraUseBlocks[3].jsonObject, "real", "var", "temp")
+    }
+
+    @Test
+    fun doesNotElideOnSuspiciousDynamicNameUsage() {
+        val result = FlangCompiler.compile(
+            """
+            struct Pair { a: Num, b: Num }
+
+            fn Test() {
+              val temp = Pair { a: 1, b: 2 };
+              val real = temp;
+              emit `player_action "SendMessage" args("%var(temp)")`;
+            }
+            """.trimIndent(),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertSetVarAction(blocks[1].jsonObject, "temp", "CreateList")
+        assertSetVar(blocks[2].jsonObject, "real", "var", "temp")
+    }
+
+    @Test
+    fun printsWarningWithBestOriginOnElision() {
+        val output = captureStdout {
+            FlangCompiler.compile(
+                """
+                struct Pair { a: Num, b: Num }
+
+                fn Test() {
+                  val temp = Pair { a: 1, b: 2 };
+                  val real = temp;
+                }
+                """.trimIndent(),
+                CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+            )
+        }
+
+        assertTrue(output.contains("warning: optimized away variable 'temp'"))
+        assertTrue(Regex("""<source>:\d+:\d+""").containsMatchIn(output))
+        assertTrue(output.contains("rewired to 'real'"))
+    }
+
+    @Test
+    fun parsesTempCopyOptimizationCliFlag() {
+        val cliOptions = parseCliArgs(arrayOf("-Otemp-copy", "source.fl"))
+        assertEquals(setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF), cliOptions.compileOptions.optimizations)
+    }
+
+    @Test
     fun parsesOptimizationCliFlags() {
         val cliOptions = parseCliArgs(arrayOf("-Oall", "-ds", "source.fl"))
 
@@ -2476,6 +2632,7 @@ class FlangCompilerTest {
 
         assertTrue(error.message!!.contains("-Oall"))
         assertTrue(error.message!!.contains("-Oselect-reset"))
+        assertTrue(error.message!!.contains("-Otemp-copy"))
         assertTrue(error.message!!.contains("--dictstructs"))
     }
 
@@ -2853,5 +3010,17 @@ class FlangCompilerTest {
         val code = Json.parseToJsonElement(metadata).jsonObject["code"]!!.jsonPrimitive.content
         val bytes = Base64.getDecoder().decode(code)
         return GZIPInputStream(ByteArrayInputStream(bytes)).bufferedReader().use { it.readText() }
+    }
+
+    private fun captureStdout(block: () -> Unit): String {
+        val originalOut = System.out
+        val buffer = ByteArrayOutputStream()
+        System.setOut(PrintStream(buffer, true, Charsets.UTF_8))
+        return try {
+            block()
+            buffer.toString(Charsets.UTF_8)
+        } finally {
+            System.setOut(originalOut)
+        }
     }
 }
