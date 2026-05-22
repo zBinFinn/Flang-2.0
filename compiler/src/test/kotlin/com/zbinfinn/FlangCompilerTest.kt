@@ -2068,6 +2068,61 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersChainedEventPlayerSendMessageCall() {
+        val result = FlangCompiler.compileFile(writeTempSource(
+            """
+            package main;
+            import std.prelude;
+
+            @Event
+            fn join(var event: PlayerJoinEvent) {
+                event.getPlayer().sendMessage(s"<green>Hello World!");
+            }
+            """.trimIndent(),
+        ))
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("Join", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+        assertTrue(blocks.any {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "player_action" &&
+            it.jsonObject["action"]?.jsonPrimitive?.content == "SendMessage"
+        }, blocks.toString())
+    }
+
+    @Test
+    fun elidesSingleUseInlineSendMessageLiteralParameter() {
+        val result = FlangCompiler.compileFile(
+            writeTempSource(
+                """
+                package main;
+                import std.prelude;
+
+                @Event
+                fn join(var event: PlayerJoinEvent) {
+                    event.getPlayer().sendMessage(s"<green>Hello World!");
+                }
+                """.trimIndent(),
+            ),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        val sendMessage = blocks.single {
+            it.jsonObject["block"]?.jsonPrimitive?.content == "player_action" &&
+                it.jsonObject["action"]?.jsonPrimitive?.content == "SendMessage"
+        }.jsonObject
+        assertSlotItem(sendMessage, 0, "comp", "<green>Hello World!")
+        assertTrue(blocks.none { block ->
+            block.jsonObject["args"]?.jsonObject?.get("items")?.jsonArray?.any { slot ->
+                val item = slot.jsonObject["item"]!!.jsonObject
+                item["id"]!!.jsonPrimitive.content == "var" &&
+                    item["data"]!!.jsonObject["name"]!!.jsonPrimitive.content.contains("std_Player_sendMessage_Player_Text__message")
+            } == true
+        })
+    }
+
+    @Test
     fun lowersObjectValueAsTypeDict() {
         val result = FlangCompiler.compile(
             """

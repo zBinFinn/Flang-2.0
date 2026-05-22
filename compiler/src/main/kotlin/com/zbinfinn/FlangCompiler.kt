@@ -344,8 +344,7 @@ object FlangCompiler {
             optimized = result.entries
             result.warnings.forEach { warning ->
                 val location = warning.origin?.let { "${it.fileId}:${it.line}:${it.column}" } ?: "<unknown origin> in $functionIdentifier"
-//                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
-                // TODO
+                println("warning: optimized away variable '${warning.elidedVariable}' at $location (rewired to '${warning.rewiredVariable}')")
             }
         }
         return optimized
@@ -404,26 +403,34 @@ object FlangCompiler {
 
         val removed = mutableSetOf<Int>()
         val rewrittenTargets = mutableMapOf<Int, DfVariable>()
+        val rewrittenItems = mutableMapOf<VariableOccurrence, DfItem>()
         val warnings = mutableListOf<VarHandoffWarning>()
 
         occurrencesByVar.forEach { (candidate, occurrences) ->
             if (occurrences.size != 2) return@forEach
             val first = occurrences[0]
             val second = occurrences[1]
-            if (first.entryIndex + 1 != second.entryIndex) return@forEach
-            if (first.slot != 0 || second.slot != 1) return@forEach
             if (first.entryIndex in removed || second.entryIndex in removed) return@forEach
 
             val producer = entries.getOrNull(first.entryIndex) as? DfBlock ?: return@forEach
-            val copy = entries.getOrNull(second.entryIndex) as? DfBlock ?: return@forEach
 
             if (producer.block != "set_var") return@forEach
-            if (copy.block != "set_var" || copy.action != "=") return@forEach
             if (containsSuspiciousDynamicVarReference(entries, candidate.name)) return@forEach
 
             val producerTarget = producer.slotVariable(0) ?: return@forEach
             if (producerTarget.scope != candidate.scope || producerTarget.name != candidate.name) return@forEach
             if (producer.referencesVariableBeyondSlot(candidate, allowedSlot = 0)) return@forEach
+
+            if (first.entryIndex + 1 != second.entryIndex || first.slot != 0 || second.slot != 1) {
+                val inlineLiteral = producer.slotItem(1)?.takeIf { candidate.name.startsWith(INLINE_PREFIX) && it.isStableInlineCopyItem() }
+                    ?: return@forEach
+                rewrittenItems[second] = inlineLiteral
+                removed += first.entryIndex
+                return@forEach
+            }
+
+            val copy = entries.getOrNull(second.entryIndex) as? DfBlock ?: return@forEach
+            if (copy.block != "set_var" || copy.action != "=") return@forEach
 
             val copyTarget = copy.slotVariable(0) ?: return@forEach
             val copySource = copy.slotVariable(1) ?: return@forEach
@@ -441,6 +448,12 @@ object FlangCompiler {
         val optimized = buildList {
             entries.forEachIndexed { index, entry ->
                 if (index in removed) return@forEachIndexed
+                val itemRewrite = rewrittenItems.filterKeys { it.entryIndex == index }
+                if (itemRewrite.isNotEmpty()) {
+                    val block = entry as DfBlock
+                    add(block.withSlotItems(itemRewrite.mapKeys { it.key.slot }))
+                    return@forEachIndexed
+                }
                 val rewritten = rewrittenTargets[index]
                 if (rewritten != null) {
                     val block = entry as DfBlock
@@ -470,6 +483,12 @@ object FlangCompiler {
     private fun DfBlock.slotVariable(slot: Int): DfVariable? =
         args.items.firstOrNull { it.slot == slot }?.item as? DfVariable
 
+    private fun DfBlock.slotItem(slot: Int): DfItem? =
+        args.items.firstOrNull { it.slot == slot }?.item
+
+    private fun DfItem.isStableInlineCopyItem(): Boolean =
+        this is DfNumber || this is DfText || this is DfComponent
+
     private fun DfBlock.referencesVariableBeyondSlot(variable: ScopedVar, allowedSlot: Int): Boolean =
         args.items.any { slot ->
             if (slot.slot == allowedSlot) return@any false
@@ -482,6 +501,14 @@ object FlangCompiler {
         if (matches.size != 1) return this
         val rewrittenItems = args.items.map {
             if (it.slot == slot) DfSlot(slot = slot, item = replacement) else it
+        }
+        return copy(args = DfArgs(rewrittenItems))
+    }
+
+    private fun DfBlock.withSlotItems(replacements: Map<Int, DfItem>): DfBlock {
+        if (replacements.isEmpty()) return this
+        val rewrittenItems = args.items.map { slot ->
+            replacements[slot.slot]?.let { DfSlot(slot = slot.slot, item = it) } ?: slot
         }
         return copy(args = DfArgs(rewrittenItems))
     }
@@ -1866,8 +1893,13 @@ private class FunctionLowering(
         }
 
         val call = assignment.simpleFunctionCallOrNull()
+        if (call != null) {
+            return lowerFunctionCallAsStatement(call, symbols)
+        }
+
+        val postfix = assignment.logicalOr().singlePostfixOrNull()
             ?: throw FlangCompileException("Unsupported expression statement in this compiler pass.")
-        return lowerFunctionCallAsStatement(call, symbols)
+        return lowerChainedFunctionCallAsStatement(postfix, symbols)
     }
 
     private fun lowerReturn(
@@ -2842,6 +2874,63 @@ private class FunctionLowering(
         return lowerFunctionCallBlocks(call, signature, symbols, outputName)
     }
 
+    private fun lowerChainedFunctionCallAsStatement(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+    ): List<DfEntry> {
+        val segments = postfix.postfixPart().callSegmentsOrNull()
+            ?: throw FlangCompileException("Unsupported expression statement in this compiler pass.")
+        if (segments.isEmpty() || !segments.last().isMemberCall) {
+            throw FlangCompileException("Unsupported expression statement in this compiler pass.")
+        }
+
+        val workingSymbols = LinkedHashMap(symbols)
+        val blocks = mutableListOf<DfEntry>()
+        var currentReceiverName = postfix.primary().Identifier()?.text
+
+        postfix.primary().typeStaticCall()?.let { staticCall ->
+            val value = lowerFunctionCallToValue(staticCall.toSimpleCall(), workingSymbols)
+            blocks += value.prelude
+            val tempName = (value.item as? DfVariable)?.name
+                ?: throw FlangCompileException("Unsupported chained call receiver in this compiler pass.")
+            workingSymbols[tempName] = Symbol(tempName, Mutability.IMMUTABLE, value.type)
+            currentReceiverName = tempName
+        }
+
+        if (currentReceiverName == null) {
+            throw FlangCompileException("Unsupported chained call receiver in this compiler pass.")
+        }
+
+        segments.dropLast(1).forEachIndexed { index, segment ->
+            val call = when {
+                segment.isMemberCall -> SimpleCall(
+                    name = segment.name,
+                    args = segment.args,
+                    baseName = currentReceiverName!!,
+                )
+                index == 0 && postfix.primary().Identifier() != null -> SimpleCall(
+                    name = currentReceiverName!!,
+                    args = segment.args,
+                )
+                else -> throw FlangCompileException("Unsupported chained call receiver in this compiler pass.")
+            }
+            val value = lowerFunctionCallToValue(call, workingSymbols)
+            blocks += value.prelude
+            val tempName = (value.item as? DfVariable)?.name
+                ?: throw FlangCompileException("Unsupported chained call receiver in this compiler pass.")
+            workingSymbols[tempName] = Symbol(tempName, Mutability.IMMUTABLE, value.type)
+            currentReceiverName = tempName
+        }
+
+        val finalSegment = segments.last()
+        val finalCall = SimpleCall(
+            name = finalSegment.name,
+            args = finalSegment.args,
+            baseName = currentReceiverName!!,
+        )
+        return blocks + lowerFunctionCallAsStatement(finalCall, workingSymbols)
+    }
+
     private fun resolveFunctionCall(
         call: SimpleCall,
         symbols: Map<String, Symbol>,
@@ -3692,6 +3781,12 @@ private data class SimpleCallArg(
     val mutableReferenceName: String?,
 )
 
+private data class PostfixCallSegment(
+    val name: String,
+    val args: List<SimpleCallArg>,
+    val isMemberCall: Boolean,
+)
+
 private data class MemberAccess(val base: String, val field: String)
 private data class EnumHelperCall(val baseName: String, val fieldName: String)
 
@@ -3888,26 +3983,8 @@ private fun FlangParser.PostfixContext.functionCallOrNull(): SimpleCall? =
 
 private fun FlangParser.PostfixContext.simpleCallOrNull(): SimpleCall? {
     primary().typeStaticCall()?.let { staticCall ->
-        val args = staticCall.callArgList()?.callArg().orEmpty().map { arg ->
-            val isMutableReference = arg.AMP() != null
-            SimpleCallArg(
-                expr = arg.expr(),
-                isMutableReference = isMutableReference,
-                mutableReferenceName = if (isMutableReference) arg.expr().assignment().logicalOr().plainIdentifierOrNull() else null,
-            )
-        }
-        if (staticCall.simpleType().typeRef().isEmpty()) {
-            return SimpleCall(
-                name = staticCall.Identifier().text,
-                args = args,
-                baseName = staticCall.simpleType().Identifier().text,
-            )
-        }
-        return SimpleCall(
-            name = staticCall.Identifier().text,
-            args = args,
-            baseType = parseSignatureType(staticCall.simpleType().text),
-        )
+        if (postfixPart().isNotEmpty()) return null
+        return staticCall.toSimpleCall()
     }
     val primaryName = primary().Identifier()?.text ?: return null
     val parts = postfixPart()
@@ -3932,15 +4009,77 @@ private fun FlangParser.PostfixContext.simpleCallOrNull(): SimpleCall? {
         }
         else -> return null
     }
-    val args = argPart.callArgList()?.callArg().orEmpty().map { arg ->
-        val isMutableReference = arg.AMP() != null
-        SimpleCallArg(
-            expr = arg.expr(),
-            isMutableReference = isMutableReference,
-            mutableReferenceName = if (isMutableReference) arg.expr().assignment().logicalOr().plainIdentifierOrNull() else null,
+    val args = argPart.simpleCallArgs()
+    return SimpleCall(name = name, args = args, baseName = baseName)
+}
+
+private fun FlangParser.TypeStaticCallContext.toSimpleCall(): SimpleCall {
+    val args = simpleCallArgs()
+    if (simpleType().typeRef().isEmpty()) {
+        return SimpleCall(
+            name = Identifier().text,
+            args = args,
+            baseName = simpleType().Identifier().text,
         )
     }
-    return SimpleCall(name = name, args = args, baseName = baseName)
+    return SimpleCall(
+        name = Identifier().text,
+        args = args,
+        baseType = parseSignatureType(simpleType().text),
+    )
+}
+
+private fun List<FlangParser.PostfixPartContext>.callSegmentsOrNull(): List<PostfixCallSegment>? {
+    val segments = mutableListOf<PostfixCallSegment>()
+    var index = 0
+    while (index < size) {
+        val part = this[index]
+        when {
+            part.DOT() != null && part.LPAREN() != null -> {
+                segments += PostfixCallSegment(
+                    name = part.Identifier().text,
+                    args = part.simpleCallArgs(),
+                    isMemberCall = true,
+                )
+                index++
+            }
+            part.DOT() != null && part.LPAREN() == null -> {
+                val argsPart = getOrNull(index + 1) ?: return null
+                if (argsPart.DOT() != null || argsPart.LPAREN() == null) return null
+                segments += PostfixCallSegment(
+                    name = part.Identifier().text,
+                    args = argsPart.simpleCallArgs(),
+                    isMemberCall = true,
+                )
+                index += 2
+            }
+            part.DOT() == null && part.LPAREN() != null -> {
+                segments += PostfixCallSegment(
+                    name = "",
+                    args = part.simpleCallArgs(),
+                    isMemberCall = false,
+                )
+                index++
+            }
+            else -> return null
+        }
+    }
+    return segments
+}
+
+private fun FlangParser.TypeStaticCallContext.simpleCallArgs(): List<SimpleCallArg> =
+    callArgList()?.callArg().orEmpty().map { it.toSimpleCallArg() }
+
+private fun FlangParser.PostfixPartContext.simpleCallArgs(): List<SimpleCallArg> =
+    callArgList()?.callArg().orEmpty().map { it.toSimpleCallArg() }
+
+private fun FlangParser.CallArgContext.toSimpleCallArg(): SimpleCallArg {
+    val isMutableReference = AMP() != null
+    return SimpleCallArg(
+        expr = expr(),
+        isMutableReference = isMutableReference,
+        mutableReferenceName = if (isMutableReference) expr().assignment().logicalOr().plainIdentifierOrNull() else null,
+    )
 }
 
 private fun FlangParser.AssignmentContext.plainPrimaryOrNull(): FlangParser.PrimaryContext? {
