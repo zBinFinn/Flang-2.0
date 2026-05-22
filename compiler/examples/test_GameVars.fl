@@ -1,16 +1,24 @@
+package main;
+
+import std.prelude;
+
 @Event
 fn join(var event: PlayerJoinEvent) {
-
+    SaveVars.save("Hello", 5);
+    val test = SaveVars.load("Hello") as Num;
+    emit `player_action "SendMessage" args($test$)`;
 }
 
-object GameVars;
+object SaveVars;
 
-impl GameVars {
-    fn set(key: String, value: Any) {
-
+impl SaveVars {
+    inline fn save(key: String, value: Any) {
+        emit `set_variable "=" args(SAVE %var($key$), $value$)`;
     }
 
-    fn get(key: String, var out: Any) {
-        
+    fn load(key: String) -> Any {
+        var out: Any;
+        emit `set_variable "=" args($out$, SAVE %var($key$))`;
+        return out;
     }
 }

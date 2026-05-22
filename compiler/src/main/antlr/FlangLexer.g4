@@ -18,6 +18,7 @@ FOR     : 'for';
 IN      : 'in';
 WHILE   : 'while';
 WHEN    : 'when';
+AS      : 'as';
 STRUCT  : 'struct';
 INTERFACE : 'interface';
 ENUM    : 'enum';

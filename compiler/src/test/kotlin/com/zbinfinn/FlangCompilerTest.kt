@@ -625,6 +625,20 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersImmutableAnyParametersAsAnyValueParameterElements() {
+        val result = FlangCompiler.compile(
+            """
+            fn takeAny(value: Any, var mutable: Any) {
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertParameter(blocks[0].jsonObject, 0, "value", "any")
+        assertParameter(blocks[0].jsonObject, 1, "mutable", "var")
+    }
+
+    @Test
     fun lowersInlineFunctionsAtCallSiteWithoutSeparateTemplate() {
         val result = FlangCompiler.compile(
             """
@@ -2534,6 +2548,145 @@ class FlangCompilerTest {
             }
             """.trimIndent(),
         )
+    }
+
+    @Test
+    fun supportsAsFromAnyAndErasedCollections() {
+        FlangCompiler.compile(
+            """
+            fn Test(a: Any, list: List<Any>, dict: Dict<Any>) {
+              val n: Num = a as Num;
+              val s: String = a as String;
+              val nums: List<Num> = list as List<Num>;
+              val names: Dict<String> = dict as Dict<String>;
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun rejectsAsFromNonAnySources() {
+        val error = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                fn Test(x: Num) {
+                  val y = x as String;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(error.message!!.contains("Only Any, List<Any>, and Dict<Any> can be cast"))
+    }
+
+    @Test
+    fun doesNotEmitPanicBlocksForAsByDefault() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test(a: Any) {
+              val n: Num = a as Num;
+            }
+            """.trimIndent(),
+        )
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.none { it.jsonObject["block"]?.jsonPrimitive?.content == "control" && it.jsonObject["action"]?.jsonPrimitive?.content == "PrintDebug" })
+        assertTrue(blocks.none { it.jsonObject["block"]?.jsonPrimitive?.content == "control" && it.jsonObject["action"]?.jsonPrimitive?.content == "EndAllThreads" })
+    }
+
+    @Test
+    fun emitsPanicBlocksForAsWhenFlagEnabled() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test(a: Any) {
+              val n: Num = a as Num;
+            }
+            """.trimIndent(),
+            CompileOptions(panicOnBadAs = true),
+        )
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(blocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "if_var" && it.jsonObject["action"]?.jsonPrimitive?.content == "VarIsType" })
+        assertTrue(blocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "control" && it.jsonObject["action"]?.jsonPrimitive?.content == "PrintDebug" })
+        assertTrue(blocks.any { it.jsonObject["block"]?.jsonPrimitive?.content == "control" && it.jsonObject["action"]?.jsonPrimitive?.content == "EndAllThreads" })
+    }
+
+    @Test
+    fun lowersDynamicPercentVarEmitArgWithDefaultLineScope() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val variable = "money";
+              emit `set_variable "=" args(%var(${ '$' }variable${ '$' }), 5)`;
+            }
+            """.trimIndent(),
+        )
+        val emitBlock = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+            .map { it.jsonObject }
+            .first { block ->
+                block["block"]?.jsonPrimitive?.content == "set_var" &&
+                    block["action"]?.jsonPrimitive?.content == "=" &&
+                    block["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "%var(variable)"
+                    }
+            }
+        assertVariable(emitBlock["args"]!!.jsonObject["items"]!!.jsonArray.first { it.jsonObject["slot"]!!.jsonPrimitive.content == "0" }.jsonObject, "%var(variable)", "line")
+    }
+
+    @Test
+    fun lowersDynamicPercentVarEmitArgWithExplicitScopes() {
+        val result = FlangCompiler.compile(
+            """
+            fn Test() {
+              val variable = "money";
+              emit `set_variable "=" args(SAVE %var(${ '$' }variable${ '$' }), GAME %var(${ '$' }variable${ '$' }))`;
+            }
+            """.trimIndent(),
+        )
+        val emitBlock = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+            .map { it.jsonObject }
+            .first { block ->
+                block["block"]?.jsonPrimitive?.content == "set_var" &&
+                    block["action"]?.jsonPrimitive?.content == "=" &&
+                    block["args"]!!.jsonObject["items"]!!.jsonArray.count { slot ->
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "%var(variable)"
+                    } == 2
+            }
+        val items = emitBlock["args"]!!.jsonObject["items"]!!.jsonArray
+        assertVariable(items.first { it.jsonObject["slot"]!!.jsonPrimitive.content == "0" }.jsonObject, "%var(variable)", "saved")
+        assertVariable(items.first { it.jsonObject["slot"]!!.jsonPrimitive.content == "1" }.jsonObject, "%var(variable)", "unsaved")
+    }
+
+    @Test
+    fun lowersSaveVarsDynamicScopeExample() {
+        val result = FlangCompiler.compile(
+            """
+            object SaveVars;
+
+            impl SaveVars {
+                fn save(key: String, value: Any) {
+                    emit `set_variable "=" args(SAVE %var(${ '$' }key${ '$' }), ${ '$' }value${ '$' })`;
+                }
+
+                fn load(key: String) -> Any {
+                    var out: Any;
+                    emit `set_variable "=" args(${ '$' }out${ '$' }, SAVE %var(${ '$' }key${ '$' }))`;
+                    return out;
+                }
+            }
+            """.trimIndent(),
+        )
+        val blocksByFunction = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+            .map { it.jsonObject }
+        val saveBlock = blocksByFunction.first { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.first { it.jsonObject["slot"]!!.jsonPrimitive.content == "0" }
+                    .jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "%var(key)"
+        }
+        assertVariable(saveBlock["args"]!!.jsonObject["items"]!!.jsonArray.first { it.jsonObject["slot"]!!.jsonPrimitive.content == "0" }.jsonObject, "%var(key)", "saved")
+    }
+
+    @Test
+    fun parsesPanicOnBadAsCliFlag() {
+        val cliOptions = parseCliArgs(arrayOf("--panic-on-bad-as", "source.fl"))
+        assertTrue(cliOptions.compileOptions.panicOnBadAs)
     }
 
     private fun assertVariable(slot: kotlinx.serialization.json.JsonObject, name: String, scope: String) {

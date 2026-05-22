@@ -1,3 +1,5 @@
+package std;
+
 struct Entity {
     uuid: String
 }

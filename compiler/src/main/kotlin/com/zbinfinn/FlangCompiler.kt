@@ -24,6 +24,7 @@ import java.util.zip.GZIPOutputStream
 data class CompileOptions(
     val templateNameOverride: String? = null,
     val structMode: StructMode = StructMode.LIST,
+    val panicOnBadAs: Boolean = false,
     val optimizations: Set<Optimization> = emptySet(),
 )
 
@@ -110,7 +111,17 @@ object FlangCompiler {
         currentInterfaceImplementations = interfaceImpls.map { InterfaceImplementationKey(it.interfaceName, it.implementorName) }.toSet()
         val signatures = buildFunctionSignatures(units, structs, enums, objects, interfaces, interfaceImpls)
         val declarations = buildFunctionDeclarations(units, signatures, interfaces, interfaceImpls)
-        val lowering = FunctionLowering(ActionDump.loadFromResources(), signatures, declarations, structs, enums, objects, interfaces, options.structMode)
+        val lowering = FunctionLowering(
+            actionDump = ActionDump.loadFromResources(),
+            signatures = signatures,
+            declarations = declarations,
+            structs = structs,
+            enums = enums,
+            objects = objects,
+            interfaces = interfaces,
+            structMode = options.structMode,
+            panicOnBadAs = options.panicOnBadAs,
+        )
         declarations.values.forEach { declaration ->
             val signature = lowering.signatureForDeclaration(declaration.function, declaration.owner, declaration.packageName)
             if (declaration.annotations.any { it.Identifier().text == "Event" } && signature.isInline) {
@@ -1153,6 +1164,7 @@ private class FunctionLowering(
     private val objects: Map<String, ObjectDefinition>,
     private val interfaces: Map<String, InterfaceDefinition>,
     private val structMode: StructMode,
+    private val panicOnBadAs: Boolean,
 ) {
     private var tempCounter = 0
     private var inlineCounter = 0
@@ -1317,11 +1329,11 @@ private class FunctionLowering(
     }
 
     private fun parameterElementType(param: FunctionParameter): String =
-        if (param.mutability == Mutability.MUTABLE || param.type.isVariableBacked) {
+        if (param.mutability == Mutability.MUTABLE) {
             "var"
         } else {
             when (param.type) {
-                is FlangType.ANY -> "var"
+                is FlangType.ANY -> "any"
                 is FlangType.NUM, FlangType.BOOLEAN -> "num"
                 is FlangType.STRING -> "txt"
                 is FlangType.TEXT -> "comp"
@@ -1330,12 +1342,12 @@ private class FunctionLowering(
                 is FlangType.PARTICLE -> "part"
                 is FlangType.VECTOR -> "vec"
                 is FlangType.SOUND -> "snd"
-                is FlangType.TYPE_PARAMETER -> "var"
-                is FlangType.LIST -> "var"
-                is FlangType.DICT -> "var"
-                is FlangType.STRUCT -> "var"
-                is FlangType.OBJECT -> "var"
-                is FlangType.ENUM -> "var"
+                is FlangType.TYPE_PARAMETER,
+                is FlangType.LIST,
+                is FlangType.DICT,
+                is FlangType.STRUCT,
+                is FlangType.OBJECT,
+                is FlangType.ENUM,
                 is FlangType.INTERFACE -> "var"
             }
         }
@@ -2032,6 +2044,37 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
         expectedType: FlangType? = null,
     ): ExpressionValue {
+        val castTargets = postfix.typeRef()
+        if (castTargets.isNotEmpty()) {
+            var current = lowerPostfixWithoutCastsToItem(postfix, symbols, expectedType)
+            castTargets.forEach { castTypeRef ->
+                val castType = parseCastType(castTypeRef)
+                if (!current.type.isAllowedAsSourceForAsCast()) {
+                    throw FlangCompileException("Cannot cast ${current.type.sourceName} with 'as'. Only Any, List<Any>, and Dict<Any> can be cast.")
+                }
+                if (!current.type.isAllowedAsSourceForAsCastTo(castType)) {
+                    throw FlangCompileException("Cannot cast ${current.type.sourceName} to ${castType.sourceName} with 'as'.")
+                }
+                val prelude = current.prelude.toMutableList()
+                if (panicOnBadAs) {
+                    prelude += asCastRuntimeGuard(current.item, current.type, castType)
+                }
+                current = ExpressionValue(
+                    type = castType,
+                    item = current.item,
+                    prelude = prelude,
+                )
+            }
+            return current
+        }
+        return lowerPostfixWithoutCastsToItem(postfix, symbols, expectedType)
+    }
+
+    private fun lowerPostfixWithoutCastsToItem(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+        expectedType: FlangType? = null,
+    ): ExpressionValue {
         val enumLiteral = postfix.enumLiteralOrNull(expectedType)
         if (enumLiteral != null) {
             return lowerToTemp(symbols) { temp -> lowerEnumLiteralToTarget(enumLiteral, temp) }
@@ -2427,6 +2470,28 @@ private class FunctionLowering(
     }
 
     private fun inferPostfixType(
+        postfix: FlangParser.PostfixContext,
+        symbols: Map<String, Symbol>,
+    ): FlangType {
+        val castTargets = postfix.typeRef()
+        if (castTargets.isNotEmpty()) {
+            var current = inferPostfixTypeWithoutCasts(postfix, symbols)
+            castTargets.forEach { castTypeRef ->
+                val castType = parseCastType(castTypeRef)
+                if (!current.isAllowedAsSourceForAsCast()) {
+                    throw FlangCompileException("Cannot cast ${current.sourceName} with 'as'. Only Any, List<Any>, and Dict<Any> can be cast.")
+                }
+                if (!current.isAllowedAsSourceForAsCastTo(castType)) {
+                    throw FlangCompileException("Cannot cast ${current.sourceName} to ${castType.sourceName} with 'as'.")
+                }
+                current = castType
+            }
+            return current
+        }
+        return inferPostfixTypeWithoutCasts(postfix, symbols)
+    }
+
+    private fun inferPostfixTypeWithoutCasts(
         postfix: FlangParser.PostfixContext,
         symbols: Map<String, Symbol>,
     ): FlangType {
@@ -3086,6 +3151,88 @@ private class FunctionLowering(
             ),
         )
 
+    private fun parseCastType(typeRef: FlangParser.TypeRefContext): FlangType =
+        FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces, emptySet())
+
+    private fun FlangType.isAllowedAsSourceForAsCast(): Boolean =
+        this == FlangType.ANY ||
+            (this is FlangType.LIST && this.elementType == FlangType.ANY) ||
+            (this is FlangType.DICT && this.valueType == FlangType.ANY)
+
+    private fun FlangType.isAllowedAsSourceForAsCastTo(target: FlangType): Boolean =
+        when {
+            this == FlangType.ANY -> true
+            this is FlangType.LIST && this.elementType == FlangType.ANY && target is FlangType.LIST -> true
+            this is FlangType.DICT && this.valueType == FlangType.ANY && target is FlangType.DICT -> true
+            else -> false
+        }
+
+    private fun asCastRuntimeGuard(
+        value: DfItem,
+        sourceType: FlangType,
+        targetType: FlangType,
+    ): List<DfEntry> {
+        val typeOption = runtimeTypeOptionForCast(sourceType, targetType)
+        return listOf(
+            DfBlock(
+                block = "if_var",
+                action = "VarIsType",
+                args = DfArgs(
+                    listOf(
+                        DfSlot(slot = 0, item = value),
+                        DfSlot(
+                            slot = 26,
+                            item = DfBlockTag(
+                                block = "if_var",
+                                action = "VarIsType",
+                                tag = "Variable Type",
+                                option = typeOption,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            DfBracket(direct = "open", type = "norm"),
+            DfBracket(direct = "close", type = "norm"),
+            DfBlock(block = "else"),
+            DfBracket(direct = "open", type = "norm"),
+            DfBlock(
+                block = "control",
+                action = "PrintDebug",
+                args = DfArgs(listOf(DfSlot(0, DfText("Cast failed: expected ${targetType.sourceName}, got ${sourceType.sourceName}")))),
+            ),
+            DfBlock(block = "control", action = "EndAllThreads"),
+            DfBracket(direct = "close", type = "norm"),
+        )
+    }
+
+    private fun runtimeTypeOptionForCast(sourceType: FlangType, targetType: FlangType): String =
+        when (targetType) {
+            FlangType.NUM, FlangType.BOOLEAN -> "Number"
+            FlangType.STRING -> "String"
+            FlangType.TEXT -> "Styled Text"
+            FlangType.ITEM -> "Item"
+            FlangType.LOCATION -> "Location"
+            FlangType.PARTICLE -> "Particle"
+            FlangType.VECTOR -> "Vector"
+            FlangType.SOUND -> "Sound"
+            is FlangType.LIST -> "List"
+            is FlangType.DICT -> "Dictionary"
+            FlangType.ANY -> when (sourceType) {
+                is FlangType.LIST -> "List"
+                is FlangType.DICT -> "Dictionary"
+                FlangType.TEXT -> "Styled Text"
+                FlangType.STRING -> "String"
+                FlangType.ITEM -> "Item"
+                FlangType.LOCATION -> "Location"
+                FlangType.PARTICLE -> "Particle"
+                FlangType.VECTOR -> "Vector"
+                FlangType.SOUND -> "Sound"
+                else -> "Number"
+            }
+            else -> throw FlangCompileException("Runtime panic checks for 'as ${targetType.sourceName}' are not supported.")
+        }
+
     private fun structFieldPlaceholder(structName: String, field: StructField): String =
         when (structMode) {
             StructMode.LIST -> "%index($structName,${field.listIndex})"
@@ -3297,6 +3444,17 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
     ): LoweredEmitArg =
         when {
+            arg.PERCENT() != null -> {
+                val scope = arg.Identifier().firstOrNull()?.text?.let { DfVariableScope.fromSource(it) } ?: DfVariableScope.LINE
+                val dynamicNameExpr = arg.expr()
+                val value = lowerExpressionToTempBackedValue(dynamicNameExpr, symbols)
+                val varName = when (value.item) {
+                    is DfVariable -> "%var(${value.item.name})"
+                    is DfText -> value.item.value
+                    else -> throw FlangCompileException("Dynamic %var(...) names must resolve to a variable or string value.")
+                }
+                LoweredEmitArg(DfVariable(scope, varName), value.prelude)
+            }
             arg.DOLLAR(0) != null -> {
                 val value = lowerExpressionToTempBackedValue(arg.expr(), symbols)
                 LoweredEmitArg(value.item, value.prelude)
