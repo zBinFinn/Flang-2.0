@@ -17,8 +17,9 @@ class FlangSyntaxHighlighterTest {
             }
         }
 
-        assertTrue(FlangTokenTypes.ANNOTATION in tokenTypes)
-        assertTrue(FlangTokenTypes.KEYWORD in tokenTypes)
+        assertTrue(FlangTokenTypes.AT in tokenTypes)
+        assertTrue(FlangTokenTypes.FN in tokenTypes)
+        assertTrue(FlangTokenTypes.VAL in tokenTypes)
         assertTrue(FlangTokenTypes.STYLED_STRING in tokenTypes)
         assertTrue(FlangTokenTypes.LINE_COMMENT in tokenTypes)
         assertTrue(FlangTokenTypes.ENUM_SHORTHAND in tokenTypes)

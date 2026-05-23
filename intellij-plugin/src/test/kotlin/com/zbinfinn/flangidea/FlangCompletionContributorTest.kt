@@ -1,8 +1,6 @@
 package com.zbinfinn.flangidea
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
-import com.zbinfinn.frontend.FlangCompletionRequest
-import com.zbinfinn.frontend.FlangFrontend
 import java.nio.file.Path
 
 class FlangCompletionContributorTest : BasePlatformTestCase() {
@@ -202,14 +200,263 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertContainsElements(completionLookups(), "bump")
     }
 
+    fun testCompletesStaticStructFunctionsAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num }
+
+            impl Point {
+              fn origin() -> Point {
+                return Point { x: 0 };
+              }
+            }
+
+            fn Main() {
+              Point.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "origin")
+    }
+
+    fun testCompletesObjectVariablesAndFunctionsAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            object GameState {
+              var score: Num;
+            }
+
+            impl GameState {
+              fn reset() {
+              }
+            }
+
+            fn Main() {
+              GameState.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "score", "reset")
+    }
+
+    fun testCompletesObjectVariableChainedMembersAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.prelude;
+
+            object GameState {
+              var player: Player;
+            }
+
+            fn Main() {
+              GameState.player.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "sendMessage", "damage")
+    }
+
+    fun testCompletesEnumEntriesAndValueHelpersAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            enum Choice { One, Two }
+
+            fn Main(choice: Choice) {
+              Choice.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "One", "Two")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            enum Choice { One, Two }
+
+            fn Main(choice: Choice) {
+              choice.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "ordinal", "name")
+    }
+
+    fun testCompletesInterfaceReceiverMethodsAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            interface Thing {
+              fn act(this, amount: Num);
+            }
+
+            fn Main(thing: Thing) {
+              thing.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "act")
+    }
+
+    fun testCompletesChainedCallAndFieldReceiversAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.prelude;
+
+            struct Holder { player: Player }
+
+            fn makeHolder() -> Holder {
+              return Holder { player: Player };
+            }
+
+            fn Main(holder: Holder) {
+              holder.player.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "sendMessage", "damage")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num }
+
+            fn makePoint() -> Point {
+              return Point { x: 1 };
+            }
+
+            fn Main() {
+              makePoint().<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "x")
+    }
+
+    fun testCompletesReferenceDereferenceReceiverAfterDot() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num }
+
+            fn Main(ptr: &Point) {
+              (*ptr).<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "x")
+    }
+
+    fun testCompletesImportPaths() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.<caret>
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "std.prelude", "std.Player", "std.Collections")
+    }
+
+    fun testCompletesTopLevelAndStatementKeywords() {
+        myFixture.configureByText(FlangFileType.INSTANCE, "<caret>")
+        assertContainsElements(completionLookups(), "fn", "struct", "import")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              <caret>
+            }
+            """.trimIndent(),
+        )
+        assertContainsElements(completionLookups(), "val", "return", "emit")
+    }
+
+    fun testCompletesStructLiteralFieldsExcludingProvidedFields() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct Point { x: Num, y: Num }
+
+            fn Main() {
+              val point = Point { x: 1, <caret> }
+            }
+            """.trimIndent(),
+        )
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "y")
+        assertDoesntContain(lookups, "x")
+    }
+
+    fun testCompletesGameValueNames() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              val value = gval("<caret>");
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "Name", "UUID")
+    }
+
+    fun testCompletesEmitBlocksActionsAndTags() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              emit `<caret>`;
+            }
+            """.trimIndent(),
+        )
+        assertContainsElements(completionLookups(), "player_action", "game_action")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              emit `player_action <caret>`;
+            }
+            """.trimIndent(),
+        )
+        assertContainsElements(completionLookups(), "SendMessage", "Damage")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              emit `player_action "SendMessage" tags(<caret>)`;
+            }
+            """.trimIndent(),
+        )
+        assertContainsElements(completionLookups(), "Text Value Merging")
+    }
+
     private fun completionLookups(): List<String> {
         val file = myFixture.file
-        return FlangFrontend.completions(
-            FlangCompletionRequest(
+        return FlangCompletionEngine.complete(
+            FlangCompletionContext(
                 source = file.text,
                 offset = myFixture.caretOffset,
                 filePath = file.virtualFile?.path?.let { Path.of(it) },
                 projectRoots = listOfNotNull(project.basePath?.let { Path.of(it) }),
+                project = project,
             ),
         ).map { it.lookup }
     }

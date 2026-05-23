@@ -10,16 +10,29 @@ import kotlinx.serialization.json.jsonPrimitive
 
 data class DfTagDefault(val name: String, val defaultOption: String, val slot: Int)
 data class DfGameValue(val name: String, val returnType: String, val category: String)
+data class DfActionInfo(val codeblockName: String, val name: String, val aliases: List<String>, val tags: List<DfTagInfo>)
+data class DfTagInfo(val name: String, val defaultOption: String, val slot: Int, val options: List<String>)
 
 class ActionDump private constructor(
     private val codeblockNamesById: Map<String, String>,
     private val actionTags: Map<ActionKey, List<DfTagDefault>>,
     private val gameValuesByName: Map<String, DfGameValue>,
     private val gameValueTypeOverrides: Map<String, String>,
+    private val actionsByCodeblockName: Map<String, List<DfActionInfo>>,
 ) {
     fun codeblockName(blockId: String): String? = codeblockNamesById[blockId]
 
-    fun gameValue(name: String): DfGameValue? = gameValuesByName[name]
+    fun codeblockIds(): Set<String> = codeblockNamesById.keys
+
+    fun actionsForBlockId(blockId: String): List<DfActionInfo> =
+        codeblockName(blockId)?.let { actionsByCodeblockName[it] }.orEmpty()
+
+    fun gameValues(): List<DfGameValue> = gameValuesByName.values.distinctBy { it.name }
+
+    fun gameValueNames(): List<String> = (gameValuesByName.keys + gameValuesByName.keys.map { it.trim() }).distinct()
+
+    fun gameValue(name: String): DfGameValue? =
+        gameValuesByName[name] ?: gameValuesByName[name.trim()] ?: gameValuesByName.entries.firstOrNull { it.key.trim() == name.trim() }?.value
 
     fun gameValueTypeOverride(name: String): String? = gameValueTypeOverrides[name]
 
@@ -63,6 +76,23 @@ class ActionDump private constructor(
                 }
                 key to tags
             }
+            val actionInfos = actions.map { action ->
+                val codeblockName = action.string("codeblockName")
+                DfActionInfo(
+                    codeblockName = codeblockName,
+                    name = action.string("name"),
+                    aliases = action.array("aliases").mapNotNull { it.stringOrName()?.takeIf(String::isNotBlank) },
+                    tags = action.array("tags").map { tag ->
+                        val tagObject = tag.jsonObject
+                        DfTagInfo(
+                            name = tagObject.string("name"),
+                            defaultOption = tagObject.stringOrNull("defaultOption").orEmpty(),
+                            slot = tagObject.intOrNull("slot") ?: 0,
+                            options = tagObject.array("options").mapNotNull { it.stringOrName()?.takeIf(String::isNotBlank) },
+                        )
+                    },
+                )
+            }.groupBy { it.codeblockName }
             val gameValues = root.array("gameValues")
                 .flatMap { element ->
                     val obj = element.jsonObject
@@ -73,7 +103,7 @@ class ActionDump private constructor(
                         .map { it to value }
                 }
                 .toMap()
-            return ActionDump(codeblocks, actionTags, gameValues, parseGameValueTypeOverrides(gameValueTypeOverridesText))
+            return ActionDump(codeblocks, actionTags, gameValues, parseGameValueTypeOverrides(gameValueTypeOverridesText), actionInfos)
         }
 
         private fun parseGameValueTypeOverrides(text: String?): Map<String, String> {
@@ -122,6 +152,12 @@ private fun JsonObject.string(name: String): String =
 private fun JsonObject.stringOrNull(name: String): String? =
     (this[name] as? JsonPrimitive)?.jsonPrimitive?.content
 
+private fun kotlinx.serialization.json.JsonElement.stringOrName(): String? =
+    (this as? JsonPrimitive)?.content ?: runCatching { jsonObject.stringOrNull("name") }.getOrNull()
+
 private fun JsonObject.int(name: String): Int =
     (this[name] as? JsonPrimitive)?.jsonPrimitive?.content?.toIntOrNull()
         ?: throw FlangCompileException("Missing integer '$name' in action dump.")
+
+private fun JsonObject.intOrNull(name: String): Int? =
+    (this[name] as? JsonPrimitive)?.jsonPrimitive?.content?.toIntOrNull()

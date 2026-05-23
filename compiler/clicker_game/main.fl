@@ -39,9 +39,6 @@ impl PlayerData {
     fn save(this, player: Player) {
         val uuid = player.uuid;
         SavedVars.save(uuid + " clicks", this.clicks); // %uuid clicks = clicks;
-
-        var bucket = (...);
-        bucket.save("clicks", this.clicks);
     }
 }
 

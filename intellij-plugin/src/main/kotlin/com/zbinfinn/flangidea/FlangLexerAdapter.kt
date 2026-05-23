@@ -49,7 +49,7 @@ class FlangLexerAdapter : LexerBase() {
             c == '`' -> scanEmitContent()
             c == '@' -> {
                 tokenEnd = tokenStart + 1
-                tokenType = FlangTokenTypes.ANNOTATION
+                tokenType = FlangTokenTypes.AT
             }
             c == '.' && peek(1)?.let { it == '_' || it.isLetter() } == true -> scanIdentifier(FlangTokenTypes.ENUM_SHORTHAND, tokenStart + 1)
             c.isDigit() -> scanNumber()
@@ -60,7 +60,9 @@ class FlangLexerAdapter : LexerBase() {
             c == ')' -> single(FlangTokenTypes.RPAREN)
             c == '[' -> single(FlangTokenTypes.LBRACKET)
             c == ']' -> single(FlangTokenTypes.RBRACKET)
-            c in ",;:" -> single(FlangTokenTypes.PUNCTUATION)
+            c == ',' -> single(FlangTokenTypes.COMMA)
+            c == ';' -> single(FlangTokenTypes.SEMI)
+            c == ':' -> single(FlangTokenTypes.COLON)
             c in ".=+-*/%<>!&|$" -> scanOperator()
             else -> single(TokenType.BAD_CHARACTER)
         }
@@ -117,9 +119,7 @@ class FlangLexerAdapter : LexerBase() {
     private fun scanIdentifier(forcedType: IElementType?, from: Int) {
         tokenEnd = from + 1
         while (tokenEnd < endOffset && buffer[tokenEnd].let { it == '_' || it.isLetterOrDigit() }) tokenEnd++
-        tokenType = forcedType ?: if (buffer.subSequence(tokenStart, tokenEnd).toString() in keywords) {
-            FlangTokenTypes.KEYWORD
-        } else {
+        tokenType = forcedType ?: keywordTypes[buffer.subSequence(tokenStart, tokenEnd).toString()] ?: run {
             FlangTokenTypes.IDENTIFIER
         }
     }
@@ -128,9 +128,14 @@ class FlangLexerAdapter : LexerBase() {
         tokenEnd = tokenStart + 1
         if (tokenEnd < endOffset) {
             val two = buffer.subSequence(tokenStart, tokenEnd + 1).toString()
-            if (two in setOf("->", "==", "!=", "<=", ">=", "&&", "||", "..")) tokenEnd++
+            val twoType = operatorTypes[two]
+            if (twoType != null) {
+                tokenEnd++
+                tokenType = twoType
+                return
+            }
         }
-        tokenType = FlangTokenTypes.OPERATOR
+        tokenType = operatorTypes[buffer.subSequence(tokenStart, tokenEnd).toString()] ?: FlangTokenTypes.OPERATOR
     }
 
     private fun single(type: IElementType) {
@@ -141,9 +146,54 @@ class FlangLexerAdapter : LexerBase() {
     private fun peek(delta: Int): Char? = buffer.getOrNull(tokenStart + delta)?.takeIf { tokenStart + delta < endOffset }
 
     companion object {
-        private val keywords = setOf(
-            "inline", "package", "import", "private", "fn", "emit", "val", "var", "true", "false",
-            "return", "if", "else", "for", "in", "while", "when", "struct", "interface", "default", "enum", "impl", "object", "args", "tags",
+        private val keywordTypes = mapOf(
+            "inline" to FlangTokenTypes.INLINE,
+            "package" to FlangTokenTypes.PACKAGE,
+            "import" to FlangTokenTypes.IMPORT,
+            "private" to FlangTokenTypes.PRIVATE,
+            "fn" to FlangTokenTypes.FN,
+            "emit" to FlangTokenTypes.EMIT,
+            "val" to FlangTokenTypes.VAL,
+            "var" to FlangTokenTypes.VAR,
+            "true" to FlangTokenTypes.TRUE,
+            "false" to FlangTokenTypes.FALSE,
+            "return" to FlangTokenTypes.RETURN,
+            "if" to FlangTokenTypes.IF,
+            "else" to FlangTokenTypes.ELSE,
+            "for" to FlangTokenTypes.FOR,
+            "in" to FlangTokenTypes.IN,
+            "while" to FlangTokenTypes.WHILE,
+            "when" to FlangTokenTypes.WHEN,
+            "as" to FlangTokenTypes.AS,
+            "struct" to FlangTokenTypes.STRUCT,
+            "interface" to FlangTokenTypes.INTERFACE,
+            "enum" to FlangTokenTypes.ENUM,
+            "impl" to FlangTokenTypes.IMPL,
+            "object" to FlangTokenTypes.OBJECT,
+            "args" to FlangTokenTypes.ARGS,
+            "tags" to FlangTokenTypes.TAGS,
+        )
+
+        private val operatorTypes = mapOf(
+            "->" to FlangTokenTypes.ARROW,
+            "==" to FlangTokenTypes.EQ_EQ,
+            "!=" to FlangTokenTypes.NOT_EQ,
+            "<=" to FlangTokenTypes.LT_EQ,
+            ">=" to FlangTokenTypes.GT_EQ,
+            "&&" to FlangTokenTypes.AND_AND,
+            "||" to FlangTokenTypes.OR_OR,
+            ".." to FlangTokenTypes.DOT_DOT,
+            "=" to FlangTokenTypes.EQ,
+            "&" to FlangTokenTypes.AMP,
+            "+" to FlangTokenTypes.PLUS,
+            "-" to FlangTokenTypes.MINUS,
+            "*" to FlangTokenTypes.STAR,
+            "/" to FlangTokenTypes.SLASH,
+            "%" to FlangTokenTypes.PERCENT,
+            "." to FlangTokenTypes.DOT,
+            "<" to FlangTokenTypes.LT,
+            ">" to FlangTokenTypes.GT,
+            "$" to FlangTokenTypes.DOLLAR,
         )
     }
 }

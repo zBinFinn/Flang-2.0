@@ -3,11 +3,10 @@ package com.zbinfinn.flangidea
 import com.intellij.codeInsight.completion.CompletionContributor
 import com.intellij.codeInsight.completion.CompletionParameters
 import com.intellij.codeInsight.completion.CompletionResultSet
+import com.intellij.codeInsight.completion.InsertHandler
+import com.intellij.codeInsight.lookup.LookupElement
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.openapi.vfs.VirtualFile
-import com.zbinfinn.frontend.FlangCompletionKind
-import com.zbinfinn.frontend.FlangCompletionRequest
-import com.zbinfinn.frontend.FlangFrontend
 import java.nio.file.Path
 
 class FlangCompletionContributor : CompletionContributor() {
@@ -19,24 +18,46 @@ class FlangCompletionContributor : CompletionContributor() {
         val offset = cleaned.offset
         val prefix = identifierPrefix(text, offset)
         val matcher = result.withPrefixMatcher(prefix)
-        val request = FlangCompletionRequest(
+        val context = FlangCompletionContext(
             source = text,
             offset = offset,
             filePath = file.virtualFile?.toPath(),
             projectRoots = listOfNotNull(file.project.basePath?.let { Path.of(it) }),
+            project = file.project,
         )
 
-        FlangFrontend.completions(request).forEach { completion ->
+        FlangCompletionEngine.complete(context).forEach { completion ->
             val element = LookupElementBuilder
                 .create(completion.insertText)
                 .withLookupString(completion.lookup)
                 .withPresentableText(completion.lookup)
                 .withTailText(completion.tailText, true)
                 .withTypeText(completion.typeText, true)
-                .withBoldness(completion.kind == FlangCompletionKind.ENUM_ENTRY)
+                .withBoldness(completion.kind == FlangIdeaCompletionKind.ENUM_ENTRY)
+                .withInsertHandler(insertHandler(completion))
             matcher.addElement(element)
         }
     }
+
+    private fun insertHandler(completion: FlangIdeaCompletion): InsertHandler<LookupElement>? =
+        when (completion.kind) {
+            FlangIdeaCompletionKind.FUNCTION -> InsertHandler { context, _ ->
+                if (completion.insertText.endsWith("()") && completion.tailText != "()") {
+                    context.editor.caretModel.moveToOffset((context.tailOffset - 1).coerceAtLeast(context.startOffset))
+                }
+            }
+            FlangIdeaCompletionKind.IMPORT -> InsertHandler { context, _ ->
+                val document = context.document
+                val tail = context.tailOffset
+                if (document.charsSequence.getOrNull(tail) == ';') {
+                    document.deleteString(tail, tail + 1)
+                }
+            }
+            FlangIdeaCompletionKind.EMIT_TAG -> InsertHandler { context, _ ->
+                context.editor.caretModel.moveToOffset(context.tailOffset)
+            }
+            else -> null
+        }
 
     private fun VirtualFile.toPath(): Path? =
         runCatching { Path.of(path) }.getOrNull()

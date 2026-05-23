@@ -165,6 +165,21 @@ data class FlangInterfaceDefinition(
     val methods: List<FlangFunctionSignature>,
 )
 
+data class FlangObjectDefinition(
+    val name: String,
+    val packageName: String,
+    val variables: List<FlangObjectVariable>,
+) {
+    val variablesByName: Map<String, FlangObjectVariable> = variables.associateBy { it.name }
+}
+
+data class FlangObjectVariable(
+    val name: String,
+    val type: FlangType,
+    val mutability: FlangMutability,
+    val packageName: String,
+)
+
 data class FlangCompletion(
     val lookup: String,
     val kind: FlangCompletionKind,
@@ -180,6 +195,7 @@ data class FlangFrontendModel(
     val functions: List<FlangFunctionSignature>,
     val objects: Set<String>,
     val interfaces: Map<String, FlangInterfaceDefinition>,
+    val objectDefinitions: Map<String, FlangObjectDefinition> = emptyMap(),
 ) {
     val functionsByName: Map<String, List<FlangFunctionSignature>> =
         functions.filter { it.owner == null }.groupBy { it.name }
@@ -212,12 +228,11 @@ object FlangFrontend {
         val units = loadSourceGraph(source, filePath, projectRoots)
         val enums = buildEnumTable(units)
         val structs = buildStructTable(units, enums)
-        val objects = units.filter { it.kind == FlangSourceKind.FL }
-            .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
-            .toSet()
+        val objectDefinitions = buildObjectTable(units, structs, enums)
+        val objects = objectDefinitions.keys
         val interfaces = buildInterfaceTable(units, structs, enums, objects)
         val functions = buildFunctionSignatures(units, structs, enums, objects, interfaces.keys)
-        return FlangFrontendModel(units, structs, enums, functions, objects, interfaces)
+        return FlangFrontendModel(units, structs, enums, functions, objects, interfaces, objectDefinitions)
     }
 
     fun completions(request: FlangCompletionRequest): List<FlangCompletion> {
@@ -405,6 +420,65 @@ object FlangFrontend {
             decl.Identifier().text to FlangStructDefinition(decl.Identifier().text, unit.packageName, fields)
         }
     }
+
+    private fun buildObjectTable(
+        units: List<FlangSourceUnit>,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+    ): Map<String, FlangObjectDefinition> {
+        val names = units.filter { it.kind == FlangSourceKind.FL }
+            .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
+            .toSet()
+        return units.filter { it.kind == FlangSourceKind.FL }
+            .flatMap { unit ->
+                unit.file.item().mapNotNull { item ->
+                    val decl = item.objectDecl() ?: return@mapNotNull null
+                    val objectName = decl.Identifier().text
+                    val variables = decl.block()?.stmt().orEmpty().mapNotNull { stmt ->
+                        val varDecl = stmt.varDecl() ?: return@mapNotNull null
+                        val type = varDecl.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, names) }
+                            ?: varDecl.expr()?.let { inferObjectInitializerType(it.text, structs, enums, names) }
+                            ?: return@mapNotNull null
+                        FlangObjectVariable(
+                            name = varDecl.Identifier().text,
+                            type = type,
+                            mutability = if (varDecl.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
+                            packageName = unit.packageName,
+                        )
+                    }
+                    objectName to FlangObjectDefinition(objectName, unit.packageName, variables)
+                }
+            }
+            .toMap()
+    }
+
+    private fun inferObjectInitializerType(
+        text: String,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+    ): FlangType? {
+        val trimmed = text.trim()
+        if (trimmed.matches(Regex("\\d+"))) return FlangType.NUM
+        if (trimmed.startsWith("s\"")) return FlangType.TEXT
+        if (trimmed.startsWith("\"")) return FlangType.STRING
+        if (trimmed == "true" || trimmed == "false") return FlangType.BOOLEAN
+        if (trimmed in objects) return FlangType.OBJECT(trimmed)
+        Regex("""^List(?:<([^>]+)>)?\.of\(""").find(trimmed)?.let { match ->
+            return FlangType.LIST(match.groupValues[1].takeIf { it.isNotBlank() }?.let { FlangType.fromSourceName(it, structs, enums, objects) } ?: FlangType.ANY)
+        }
+        Regex("""^Dict(?:<([^>]+)>)?\.new\(""").find(trimmed)?.let { match ->
+            return FlangType.DICT(match.groupValues[1].takeIf { it.isNotBlank() }?.let { FlangType.fromSourceName(it, structs, enums, objects) } ?: FlangType.ANY)
+        }
+        structs.keys.firstOrNull { trimmed.startsWith("$it {") || trimmed.startsWith("$it{") }?.let { return FlangType.STRUCT(it) }
+        Regex("""^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$""").matchEntire(trimmed)?.let { match ->
+            modelEnumEntryType(match.groupValues[1], match.groupValues[2], enums)?.let { return it }
+        }
+        return null
+    }
+
+    private fun modelEnumEntryType(base: String, member: String, enums: Map<String, FlangEnumDefinition>): FlangType? =
+        if (enums[base]?.entriesByName?.containsKey(member) == true) FlangType.ENUM(base) else null
 
     private fun buildInterfaceTable(
         units: List<FlangSourceUnit>,
