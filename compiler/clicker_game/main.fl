@@ -42,14 +42,19 @@ impl PlayerData {
     }
 }
 
+pc test(money: Num) {
+    val x = money;
+}
+
 @Event
 fn startup(var event: PlotStartupEvent) {
-
+    start test(5);
 }
 
 @Event
 fn join(var event: PlayerJoinEvent) {
     var player = event.getPlayer();
+    player.damage(5);
     GameState.registerPlayer(player);
     var item = Item.of("emerald");
     item.setName(s"<green>Click Me");
@@ -65,6 +70,18 @@ fn rightClick(var event: PlayerRightClickEvent) {
 }
 
 // Should be Stdlib
+
+object SavedVars;
+
+impl SavedVars {
+    fn save(key: String, value: Any) {
+
+    }
+
+    fn load(key: String) -> Any {
+        return "Hello";
+    }
+}
 
 inline fn Item.of(id: String) -> Item {
     var item: Item;

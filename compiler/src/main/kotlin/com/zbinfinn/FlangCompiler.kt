@@ -118,10 +118,14 @@ object FlangCompiler {
         currentInterfaceImplementations = interfaceImpls.map { InterfaceImplementationKey(it.interfaceName, it.implementorName) }.toSet()
         val signatures = buildFunctionSignatures(units, structs, enums, objects, interfaces, interfaceImpls)
         val declarations = buildFunctionDeclarations(units, signatures, interfaces, interfaceImpls)
+        val processSignatures = buildProcessSignatures(units, structs, enums, objects, interfaces)
+        val processDeclarations = buildProcessDeclarations(units, processSignatures)
         val lowering = FunctionLowering(
             actionDump = ActionDump.loadFromResources(),
             signatures = signatures,
             declarations = declarations,
+            processSignatures = processSignatures,
+            processDeclarations = processDeclarations,
             structs = structs,
             enums = enums,
             objects = objects,
@@ -138,6 +142,7 @@ object FlangCompiler {
 
         val loweredByIdentifier = linkedMapOf<String, LoweredFunction>()
         val pendingCalls = ArrayDeque<String>()
+        val pendingProcesses = ArrayDeque<String>()
 
         fun enqueueCalls(entries: List<DfEntry>) {
             entries.forEach { entry ->
@@ -158,6 +163,9 @@ object FlangCompiler {
                         pendingCalls += block.data
                     }
                 }
+                if (block.block == "start_process" && block.data != null) {
+                    pendingProcesses += block.data
+                }
             }
         }
 
@@ -166,6 +174,15 @@ object FlangCompiler {
             val declaration = declarations[signature.fullIdentifier]
                 ?: throw FlangCompileException("Function '${signature.fullIdentifier}' has no declaration.")
             val lowered = lowering.lowerFunction(declaration.annotations, declaration.function, declaration.owner, declaration.packageName, declaration.sourceId)
+            loweredByIdentifier[signature.fullIdentifier] = lowered
+            enqueueCalls(lowered.entries)
+        }
+
+        fun lowerProcessSignature(signature: FunctionSignature) {
+            if (loweredByIdentifier.containsKey(signature.fullIdentifier)) return
+            val declaration = processDeclarations[signature.fullIdentifier]
+                ?: throw FlangCompileException("Process '${signature.fullIdentifier}' has no declaration.")
+            val lowered = lowering.lowerProcess(declaration.process, declaration.packageName, declaration.sourceId)
             loweredByIdentifier[signature.fullIdentifier] = lowered
             enqueueCalls(lowered.entries)
         }
@@ -182,6 +199,9 @@ object FlangCompiler {
             unit.file.item().forEach { item ->
                 item.functionDecl()?.let { function ->
                     lowerSignature(lowering.signatureForDeclaration(function, owner = extensionOwner(function, structs, enums, objects, interfaces), packageName = unit.packageName))
+                }
+                item.processDecl()?.let { process ->
+                    lowerProcessSignature(lowering.signatureForProcessDeclaration(process, packageName = unit.packageName))
                 }
                 item.implDecl()?.let { impl ->
                     if (impl.interfaceNameOrNull() != null) return@let
@@ -201,11 +221,19 @@ object FlangCompiler {
             }
         }
 
-        while (pendingCalls.isNotEmpty()) {
-            val identifier = pendingCalls.removeFirst()
-            val signature = signatures[identifier]
-                ?: throw FlangCompileException("Unknown function template '$identifier'.")
-            lowerSignature(signature)
+        while (pendingCalls.isNotEmpty() || pendingProcesses.isNotEmpty()) {
+            while (pendingCalls.isNotEmpty()) {
+                val identifier = pendingCalls.removeFirst()
+                val signature = signatures[identifier]
+                    ?: throw FlangCompileException("Unknown function template '$identifier'.")
+                lowerSignature(signature)
+            }
+            while (pendingProcesses.isNotEmpty()) {
+                val identifier = pendingProcesses.removeFirst()
+                val signature = processSignatures[identifier]
+                    ?: throw FlangCompileException("Unknown process template '$identifier'.")
+                lowerProcessSignature(signature)
+            }
         }
 
         val loweredFunctions = loweredByIdentifier.values.toMutableList()
@@ -723,6 +751,51 @@ object FlangCompiler {
         return declarations
     }
 
+    private fun buildProcessSignatures(
+        units: List<SourceUnit>,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+        objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
+    ): Map<String, FunctionSignature> {
+        val signatures = linkedMapOf<String, FunctionSignature>()
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            unit.file.item().forEach { item ->
+                item.processDecl()?.let { process ->
+                    val params = parseProcessParameters(process, structs, enums, objects, interfaces)
+                    val signature = FunctionSignature(
+                        name = process.Identifier().text,
+                        owner = null,
+                        packageName = unit.packageName,
+                        params = params,
+                        returnType = null,
+                    )
+                    if (signatures.containsKey(signature.fullIdentifier)) {
+                        throw FlangCompileException("Duplicate process signature '${signature.fullIdentifier}'.")
+                    }
+                    signatures[signature.fullIdentifier] = signature
+                }
+            }
+        }
+        return signatures
+    }
+
+    private fun buildProcessDeclarations(
+        units: List<SourceUnit>,
+        signatures: Map<String, FunctionSignature>,
+    ): Map<String, ProcessDeclaration> {
+        val declarations = linkedMapOf<String, ProcessDeclaration>()
+        units.filter { it.kind == SourceKind.FL }.forEach { unit ->
+            unit.file.item().forEach { item ->
+                item.processDecl()?.let { process ->
+                    val signature = signatureForProcessDeclaration(process, unit.packageName, signatures)
+                    declarations[signature.fullIdentifier] = ProcessDeclaration(process, unit.packageName, unit.id)
+                }
+            }
+        }
+        return declarations
+    }
+
     private fun signatureForInterfaceDefault(
         function: FlangParser.FunctionDeclContext,
         owner: String,
@@ -808,6 +881,44 @@ object FlangCompiler {
                 )
             }
         }
+    }
+
+    private fun parseProcessParameters(
+        process: FlangParser.ProcessDeclContext,
+        structs: Map<String, StructDefinition>,
+        enums: Map<String, EnumDefinition>,
+        objects: Map<String, ObjectDefinition>,
+        interfaces: Map<String, InterfaceDefinition>,
+    ): List<FunctionParameter> {
+        val processName = process.Identifier().text
+        val paramNames = mutableSetOf<String>()
+        return process.paramList()?.param().orEmpty().map { param ->
+            val paramName = param.Identifier().text
+            if (!paramNames.add(paramName)) {
+                throw FlangCompileException("Duplicate parameter '$paramName' in process '$processName'.")
+            }
+            val typeRef = param.typeRef()
+                ?: throw FlangCompileException("Parameter '$paramName' in process '$processName' requires a type.")
+            if (paramName == "this") {
+                throw FlangCompileException("Receiver parameter 'this' is not valid in process '$processName'.")
+            }
+            FunctionParameter(
+                name = paramName,
+                mutability = if (param.VAR() != null) Mutability.MUTABLE else Mutability.IMMUTABLE,
+                type = FlangType.fromTypeRef(typeRef, structs, enums, objects, interfaces),
+            )
+        }
+    }
+
+    private fun signatureForProcessDeclaration(
+        process: FlangParser.ProcessDeclContext,
+        packageName: String,
+        signatures: Map<String, FunctionSignature>,
+    ): FunctionSignature {
+        val parameterTypes = process.paramList()?.param().orEmpty()
+            .joinToString(",") { it.typeRef()!!.text }
+        val fullIdentifier = functionIdentifier(packageName, process.Identifier().text, parameterTypes)
+        return signatures[fullIdentifier] ?: throw FlangCompileException("Unknown process signature '$fullIdentifier'.")
     }
 
     private fun FlangParser.FunctionDeclContext.declaredName(): String =
@@ -1205,6 +1316,12 @@ private data class FunctionDeclaration(
     val sourceId: String,
 )
 
+private data class ProcessDeclaration(
+    val process: FlangParser.ProcessDeclContext,
+    val packageName: String,
+    val sourceId: String,
+)
+
 private data class FunctionSignature(
     val name: String,
     val owner: String? = null,
@@ -1393,6 +1510,7 @@ private data class ReferenceTarget(
 private data class FunctionContext(
     val signature: FunctionSignature,
     val isEvent: Boolean,
+    val isProcess: Boolean = false,
     val inlinePrefix: String? = null,
     val inlineOutputName: String? = null,
     val inlineReturnMode: InlineReturnMode? = null,
@@ -1425,6 +1543,8 @@ private class FunctionLowering(
     private val actionDump: ActionDump,
     private val signatures: Map<String, FunctionSignature>,
     private val declarations: Map<String, FunctionDeclaration>,
+    private val processSignatures: Map<String, FunctionSignature>,
+    private val processDeclarations: Map<String, ProcessDeclaration>,
     private val structs: Map<String, StructDefinition>,
     private val enums: Map<String, EnumDefinition>,
     private val objects: Map<String, ObjectDefinition>,
@@ -1442,6 +1562,8 @@ private class FunctionLowering(
     private val inlineCallStack = mutableListOf<String>()
     private val overloadsByName: Map<String, List<FunctionSignature>> =
         signatures.values.filter { it.owner == null }.groupBy { it.name }
+    private val processOverloadsByName: Map<String, List<FunctionSignature>> =
+        processSignatures.values.groupBy { it.name }
     private val implOverloadsByOwnerAndName: Map<Pair<String, String>, List<FunctionSignature>> =
         signatures.values.filter { it.owner != null }.groupBy { it.owner!! to it.name }
     private val objectVariableTypes = mutableMapOf<Pair<String, String>, FlangType>()
@@ -1565,6 +1687,45 @@ private class FunctionLowering(
             resolveEventProvider(declaration.function.declaredName(), signature).action
         } catch (_: FlangCompileException) {
             null
+        }
+    }
+
+    fun lowerProcess(
+        process: FlangParser.ProcessDeclContext,
+        packageName: String = "",
+        sourceId: String = "<unknown>",
+    ): LoweredFunction {
+        tempCounter = 0
+        val processName = process.Identifier().text
+        val signature = signatureForProcessDeclaration(process, packageName)
+        val previousPackage = currentPackage
+        val previousSourceId = currentSourceId
+        val previousStatementOrigin = currentStatementOrigin
+        currentPackage = signature.packageName
+        currentSourceId = sourceId
+        currentStatementOrigin = null
+        try {
+            val context = FunctionContext(signature = signature, isEvent = false, isProcess = true)
+            val symbols = linkedMapOf<String, Symbol>()
+            signature.params.forEach { param ->
+                declareSymbol(
+                    symbols = symbols,
+                    name = param.name,
+                    mutability = param.mutability,
+                    type = param.type,
+                )
+            }
+            val entries = mutableListOf<DfEntry>(
+                DfBlock(block = "process", data = signature.fullIdentifier, args = processArgs(signature)),
+            )
+            process.block().stmt().forEach { stmt ->
+                entries += lowerStatementWithOrigin(stmt, symbols, context)
+            }
+            return LoweredFunction(signature.fullIdentifier, entries, signature.fullIdentifier)
+        } finally {
+            currentPackage = previousPackage
+            currentSourceId = previousSourceId
+            currentStatementOrigin = previousStatementOrigin
         }
     }
 
@@ -1719,6 +1880,17 @@ private class FunctionLowering(
         return signatures[fullIdentifier] ?: throw FlangCompileException("Unknown function signature '$fullIdentifier'.")
     }
 
+    fun signatureForProcessDeclaration(process: FlangParser.ProcessDeclContext, packageName: String = ""): FunctionSignature {
+        val parameterTypes = process.paramList()?.param().orEmpty()
+            .joinToString(",") { it.typeRef()!!.text }
+        val fullIdentifier = if (packageName.isEmpty()) {
+            "${process.Identifier().text}($parameterTypes)"
+        } else {
+            "$packageName.${process.Identifier().text}($parameterTypes)"
+        }
+        return processSignatures[fullIdentifier] ?: throw FlangCompileException("Unknown process signature '$fullIdentifier'.")
+    }
+
     private fun functionArgs(signature: FunctionSignature): DfArgs {
         val slots = mutableListOf<DfSlot>()
         var slot = 0
@@ -1739,6 +1911,25 @@ private class FunctionLowering(
         slots += DfSlot(
             26,
             DfBlockTag(block = "func", action = "dynamic", tag = "Is Hidden", option = "False"),
+        )
+        return DfArgs(slots)
+    }
+
+    private fun processArgs(signature: FunctionSignature): DfArgs {
+        val slots = mutableListOf<DfSlot>()
+        signature.params.forEachIndexed { index, param ->
+            slots += DfSlot(
+                index,
+                DfParameterElement(
+                    name = param.name,
+                    type = parameterElementType(param),
+                    optional = false,
+                ),
+            )
+        }
+        slots += DfSlot(
+            26,
+            DfBlockTag(block = "process", action = "dynamic", tag = "Is Hidden", option = "False"),
         )
         return DfArgs(slots)
     }
@@ -1791,6 +1982,7 @@ private class FunctionLowering(
     ): List<DfEntry> =
         when {
             stmt.emitStmt() != null -> lowerEmit(stmt.emitStmt(), symbols).entries
+            stmt.startProcessStmt() != null -> lowerStartProcess(stmt.startProcessStmt(), symbols)
             stmt.varDecl() != null -> lowerVarDecl(stmt.varDecl(), symbols, context)
             stmt.returnStmt() != null -> lowerReturn(stmt.returnStmt(), symbols, context)
             stmt.ifEmitStmt() != null -> lowerIfEmit(stmt.ifEmitStmt(), symbols, context)
@@ -1798,7 +1990,7 @@ private class FunctionLowering(
             stmt.forStmt() != null -> lowerFor(stmt.forStmt(), symbols, context)
             stmt.whileStmt() != null -> lowerWhile(stmt.whileStmt(), symbols, context)
             stmt.exprStmt() != null -> lowerExprStmt(stmt.exprStmt(), symbols)
-            else -> throw FlangCompileException("Raw Emit V1 only supports emit, if, for, while, val/var, reassignment, return, and function calls inside functions.")
+            else -> throw FlangCompileException("Raw Emit V1 only supports emit, start, if, for, while, val/var, reassignment, return, and function calls inside functions.")
         }
 
     private fun lowerBlock(
@@ -1810,6 +2002,7 @@ private class FunctionLowering(
         val branchContext = FunctionContext(
             signature = context.signature,
             isEvent = context.isEvent,
+            isProcess = context.isProcess,
             inlinePrefix = context.inlinePrefix,
             inlineOutputName = context.inlineOutputName,
             inlineReturnMode = context.inlineReturnMode,
@@ -2149,6 +2342,9 @@ private class FunctionLowering(
         symbols: Map<String, Symbol>,
         context: FunctionContext,
     ): List<DfEntry> {
+        if (context.isProcess) {
+            throw FlangCompileException("Process '${context.signature.name}' cannot return.")
+        }
         val returnType = context.signature.returnType
         val expr = returnStmt.expr()
         if (returnType == null) {
@@ -3564,6 +3760,45 @@ private class FunctionLowering(
         return lowerFunctionCallBlocks(call, signature, symbols, outputName)
     }
 
+    private fun lowerStartProcess(
+        startProcess: FlangParser.StartProcessStmtContext,
+        symbols: Map<String, Symbol>,
+    ): List<DfEntry> {
+        val call = SimpleCall(
+            name = startProcess.Identifier().text,
+            args = startProcess.callArgList()?.simpleCallArgs().orEmpty(),
+        )
+        val signature = resolveProcessCall(call, symbols)
+        val blocks = mutableListOf<DfEntry>()
+        val items = mutableListOf<DfSlot>()
+        signature.params.zip(call.args).forEachIndexed { index, (param, arg) ->
+            if (param.mutability == Mutability.MUTABLE) {
+                if (!arg.isMutableArgument) {
+                    throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of process '${call.name}' must be passed as var identifier or var *ref.")
+                }
+                val target = lowerMutableArgumentTarget(arg, symbols)
+                if (!target.type.isAssignableTo(param.type)) {
+                    throw FlangCompileException("Cannot pass ${target.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
+                }
+                blocks += target.prelude
+                items += DfSlot(index, target.variable)
+            } else if (arg.isMutableArgument) {
+                throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of process '${call.name}' must not use var.")
+            } else {
+                val value = lowerAssignmentToValue(arg.expr.assignment(), symbols, param.type)
+                if (!value.type.isAssignableTo(param.type)) {
+                    throw FlangCompileException("Cannot pass ${value.type.sourceName} to parameter '${param.name}' of type ${param.type.sourceName}.")
+                }
+                blocks += value.prelude
+                items += DfSlot(index, value.item)
+            }
+        }
+        items += DfSlot(26, DfBlockTag(block = "start_process", action = "dynamic", tag = "Target Mode", option = "With no targets"))
+        items += DfSlot(25, DfBlockTag(block = "start_process", action = "dynamic", tag = "Local Variables", option = "Copy"))
+        blocks += DfBlock(block = "start_process", data = signature.fullIdentifier, args = DfArgs(items))
+        return blocks
+    }
+
     private fun lowerChainedFunctionCallAsStatement(
         postfix: FlangParser.PostfixContext,
         symbols: Map<String, Symbol>,
@@ -3658,6 +3893,43 @@ private class FunctionLowering(
             val argTypes = callArgumentTypes(call, symbols)
             val rendered = argTypes.joinToString(",") { it.sourceName }
             throw FlangCompileException("Ambiguous overload of '${call.renderedName}' for ($rendered).")
+        }
+        return matches.single()
+    }
+
+    private fun resolveProcessCall(
+        call: SimpleCall,
+        symbols: Map<String, Symbol>,
+    ): FunctionSignature {
+        if (call.baseName != null || call.baseType != null) {
+            throw FlangCompileException("Processes can only be started by name.")
+        }
+        val overloads = processOverloadsByName[call.name]
+            ?: throw FlangCompileException("Unknown process '${call.name}'.")
+        val sameArity = overloads.filter { it.params.size == call.args.size }
+        if (sameArity.isEmpty()) {
+            throw FlangCompileException("Process '${call.name}' has no overload with ${call.args.size} arguments.")
+        }
+        val matches = sameArity.mapNotNull { signature -> instantiateSignatureForCall(signature, call, symbols, expectedType = null) }
+        if (matches.isEmpty()) {
+            sameArity.forEach { signature ->
+                signature.params.zip(call.args).forEachIndexed { index, (param, arg) ->
+                    if (param.mutability == Mutability.MUTABLE && !arg.isMutableArgument) {
+                        throw FlangCompileException("Argument ${index + 1} for mutable parameter '${param.name}' of process '${call.name}' must be passed as var identifier or var *ref.")
+                    }
+                    if (param.mutability == Mutability.IMMUTABLE && arg.isMutableArgument) {
+                        throw FlangCompileException("Argument ${index + 1} for immutable parameter '${param.name}' of process '${call.name}' must not use var.")
+                    }
+                }
+            }
+            val argTypes = callArgumentTypes(call, symbols)
+            val rendered = argTypes.joinToString(",") { it.sourceName }
+            throw FlangCompileException("No overload of process '${call.name}' accepts ($rendered).")
+        }
+        if (matches.size > 1) {
+            val argTypes = callArgumentTypes(call, symbols)
+            val rendered = argTypes.joinToString(",") { it.sourceName }
+            throw FlangCompileException("Ambiguous overload of process '${call.name}' for ($rendered).")
         }
         return matches.single()
     }
@@ -4804,6 +5076,9 @@ private fun List<FlangParser.PostfixPartContext>.callSegmentsOrNull(): List<Post
 
 private fun FlangParser.TypeStaticCallContext.simpleCallArgs(): List<SimpleCallArg> =
     callArgList()?.callArg().orEmpty().map { it.toSimpleCallArg() }
+
+private fun FlangParser.CallArgListContext.simpleCallArgs(): List<SimpleCallArg> =
+    callArg().map { it.toSimpleCallArg() }
 
 private fun FlangParser.PostfixPartContext.simpleCallArgs(): List<SimpleCallArg> =
     callArgList()?.callArg().orEmpty().map { it.toSimpleCallArg() }

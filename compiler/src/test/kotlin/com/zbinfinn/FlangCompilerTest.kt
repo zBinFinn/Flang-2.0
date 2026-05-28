@@ -3343,6 +3343,141 @@ class FlangCompilerTest {
         assertTrue(cliOptions.compileOptions.panicOnBadAs)
     }
 
+    @Test
+    fun lowersProcessDeclarationWithoutHint() {
+        val result = FlangCompiler.compile(
+            """
+            pc worker(value: Num, var output: String) {
+              output = "done";
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        val process = blocks[0].jsonObject
+        assertBlock(process, "process")
+        assertEquals("worker(Num,String)", process["data"]!!.jsonPrimitive.content)
+        assertParameter(process, 0, "value", "num")
+        assertParameter(process, 1, "output", "var")
+        assertBlockTag(process, 26, "Is Hidden", "False")
+        val items = process["args"]!!.jsonObject["items"]!!.jsonArray
+        assertTrue(items.none { it.jsonObject["item"]!!.jsonObject["id"]!!.jsonPrimitive.content == "hint" })
+    }
+
+    @Test
+    fun lowersStartProcessWithFixedTags() {
+        val result = FlangCompiler.compile(
+            """
+            pc worker(value: Num) {
+            }
+
+            fn caller() {
+              start worker(5);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = result.templates.flatMap { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.map { it.jsonObject }
+        }
+        val start = blocks.first { it["block"]!!.jsonPrimitive.content == "start_process" }
+        assertEquals("worker(Num)", start["data"]!!.jsonPrimitive.content)
+        assertSlotItem(start, 0, "num", "5")
+        assertBlockTag(start, 26, "Target Mode", "With no targets")
+        assertBlockTag(start, 25, "Local Variables", "Copy")
+    }
+
+    @Test
+    fun keepsProcessAndFunctionNamespacesSeparate() {
+        val result = FlangCompiler.compile(
+            """
+            pc same(value: Num) {
+            }
+
+            fn same(value: String) {
+            }
+
+            fn caller() {
+              same("hi");
+              start same(1);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = result.templates.flatMap { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.map { it.jsonObject }
+        }
+        assertTrue(blocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]!!.jsonPrimitive.content == "same(String)" })
+        assertTrue(blocks.any { it["block"]?.jsonPrimitive?.content == "start_process" && it["data"]!!.jsonPrimitive.content == "same(Num)" })
+    }
+
+    @Test
+    fun rejectsInvalidProcessStarts() {
+        listOf(
+            """
+            fn caller() {
+              start missing();
+            }
+            """.trimIndent() to "Unknown process",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              start worker("nope");
+            }
+            """.trimIndent() to "No overload of process",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              start worker();
+            }
+            """.trimIndent() to "no overload with 0 arguments",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              var value = 1;
+              start worker(var value);
+            }
+            """.trimIndent() to "must not use var",
+            """
+            pc worker(var value: Num) {}
+            fn caller() {
+              val value = 1;
+              start worker(var value);
+            }
+            """.trimIndent() to "immutable val",
+        ).forEach { (source, expected) ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+            assertTrue(error.message!!.contains(expected), "Expected '${error.message}' to contain '$expected'.")
+        }
+    }
+
+    @Test
+    fun rejectsProcessReturnAndUnsupportedProcessForms() {
+        val returnError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                pc worker() {
+                  return;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(returnError.message!!.contains("cannot return"))
+
+        listOf(
+            "inline pc worker() {}",
+            "pc worker() -> Num {}",
+            "impl Thing { pc worker() {} }",
+            "fn caller() { val x = start worker(); }",
+        ).forEach { source ->
+            assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+        }
+    }
+
     private fun assertVariable(slot: kotlinx.serialization.json.JsonObject, name: String, scope: String) {
         val data = slot["item"]!!.jsonObject["data"]!!.jsonObject
         assertEquals(name, data["name"]!!.jsonPrimitive.content)

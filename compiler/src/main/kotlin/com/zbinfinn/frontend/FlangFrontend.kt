@@ -193,12 +193,16 @@ data class FlangFrontendModel(
     val structs: Map<String, FlangStructDefinition>,
     val enums: Map<String, FlangEnumDefinition>,
     val functions: List<FlangFunctionSignature>,
+    val processes: List<FlangFunctionSignature> = emptyList(),
     val objects: Set<String>,
     val interfaces: Map<String, FlangInterfaceDefinition>,
     val objectDefinitions: Map<String, FlangObjectDefinition> = emptyMap(),
 ) {
     val functionsByName: Map<String, List<FlangFunctionSignature>> =
         functions.filter { it.owner == null }.groupBy { it.name }
+
+    val processesByName: Map<String, List<FlangFunctionSignature>> =
+        processes.groupBy { it.name }
 
     val implFunctionsByOwnerAndName: Map<Pair<String, String>, List<FlangFunctionSignature>> =
         functions.filter { it.owner != null }.groupBy { it.owner!! to it.name }
@@ -232,7 +236,8 @@ object FlangFrontend {
         val objects = objectDefinitions.keys
         val interfaces = buildInterfaceTable(units, structs, enums, objects)
         val functions = buildFunctionSignatures(units, structs, enums, objects, interfaces.keys)
-        return FlangFrontendModel(units, structs, enums, functions, objects, interfaces, objectDefinitions)
+        val processes = buildProcessSignatures(units, structs, enums, objects, interfaces.keys)
+        return FlangFrontendModel(units, structs, enums, functions, processes, objects, interfaces, objectDefinitions)
     }
 
     fun completions(request: FlangCompletionRequest): List<FlangCompletion> {
@@ -579,10 +584,56 @@ object FlangFrontend {
             owner = owner,
             packageName = packageName,
             params = params,
-            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) },
+            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) ?: FlangType.STRUCT(it.text) },
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
             isPrivate = function.PRIVATE() != null,
+        )
+    }
+
+    private fun buildProcessSignatures(
+        units: List<FlangSourceUnit>,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+        interfaces: Set<String>,
+    ): List<FlangFunctionSignature> =
+        buildList {
+            units.filter { it.kind == FlangSourceKind.FL }.forEach { unit ->
+                unit.file.item().forEach { item ->
+                    item.processDecl()?.let { process ->
+                        add(processSignatureFor(process, unit.packageName, structs, enums, objects, interfaces))
+                    }
+                }
+            }
+        }
+
+    private fun processSignatureFor(
+        process: FlangParser.ProcessDeclContext,
+        packageName: String,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+        interfaces: Set<String>,
+    ): FlangFunctionSignature {
+        val params = process.paramList()?.param().orEmpty().mapNotNull { param ->
+            val type = param.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces) }
+                ?: return@mapNotNull null
+            FlangFunctionParameter(
+                param.Identifier().text,
+                if (param.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
+                type,
+            )
+        }
+        return FlangFunctionSignature(
+            name = process.Identifier().text,
+            owner = null,
+            packageName = packageName,
+            params = params,
+            returnType = null,
+            hasReceiver = false,
+            isInline = false,
+            isPrivate = false,
         )
     }
 
@@ -594,9 +645,12 @@ object FlangFrontend {
     ): LinkedHashMap<String, FlangSymbol> {
         val symbols = linkedMapOf<String, FlangSymbol>()
         val item = file.item().firstOrNull { it.containsOffset(offset) } ?: return symbols
-        val function = item.functionDecl() ?: item.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) } ?: return symbols
+        val process = item.processDecl()
+        val function = item.functionDecl() ?: item.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) }
+        if (function == null && process == null) return symbols
         val owner = item.implDecl()?.implementorName()
-        function.paramList()?.param().orEmpty().forEachIndexed { index, param ->
+        val params = function?.paramList()?.param().orEmpty() + process?.paramList()?.param().orEmpty()
+        params.forEachIndexed { index, param ->
             val type = if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
                 FlangType.STRUCT(owner)
             } else {
@@ -608,7 +662,7 @@ object FlangFrontend {
                 type,
             )
         }
-        collectBlockSymbols(function.block(), offset, symbols, model, packageName)
+        collectBlockSymbols(function?.block() ?: process!!.block(), offset, symbols, model, packageName)
         return symbols
     }
 
@@ -852,7 +906,7 @@ object FlangFrontend {
         model: FlangFrontendModel,
     ): Map<String, FlangSymbol> {
         val before = source.substring(0, offset)
-        val functionHeader = Regex("""fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)""")
+        val functionHeader = Regex("""(?:fn|pc)\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)""")
             .findAll(before)
             .lastOrNull()
         val symbols = linkedMapOf<String, FlangSymbol>()
@@ -952,6 +1006,7 @@ private fun FlangParser.FileContext.findVarDeclAt(offset: Int): FlangParser.VarD
     }
     item().forEach { item ->
         item.functionDecl()?.block()?.let { visitBlock(it)?.let { found -> return found } }
+        item.processDecl()?.block()?.let { visitBlock(it)?.let { found -> return found } }
         item.implDecl()?.functionDecl().orEmpty().forEach { visitBlock(it.block())?.let { found -> return found } }
     }
     return null

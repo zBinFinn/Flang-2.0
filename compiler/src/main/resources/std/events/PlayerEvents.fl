@@ -1,5 +1,6 @@
 package std.events;
 
+import std.Player;
 import std.helpers.GameActions;
 
 interface CancellableEvent {

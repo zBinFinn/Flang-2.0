@@ -18,12 +18,11 @@ class FlangCompletionContributor : CompletionContributor() {
         val offset = cleaned.offset
         val prefix = identifierPrefix(text, offset)
         val matcher = result.withPrefixMatcher(prefix)
-        val context = FlangCompletionContext(
+        val context = FlangCompletionRequest(
             source = text,
             offset = offset,
             filePath = file.virtualFile?.toPath(),
             projectRoots = listOfNotNull(file.project.basePath?.let { Path.of(it) }),
-            project = file.project,
         )
 
         FlangCompletionEngine.complete(context).forEach { completion ->
@@ -33,31 +32,42 @@ class FlangCompletionContributor : CompletionContributor() {
                 .withPresentableText(completion.lookup)
                 .withTailText(completion.tailText, true)
                 .withTypeText(completion.typeText, true)
-                .withBoldness(completion.kind == FlangIdeaCompletionKind.ENUM_ENTRY)
                 .withInsertHandler(insertHandler(completion))
             matcher.addElement(element)
         }
     }
 
-    private fun insertHandler(completion: FlangIdeaCompletion): InsertHandler<LookupElement>? =
+    private fun insertHandler(completion: FlangCompletionItem): InsertHandler<LookupElement>? =
         when (completion.kind) {
-            FlangIdeaCompletionKind.FUNCTION -> InsertHandler { context, _ ->
-                if (completion.insertText.endsWith("()") && completion.tailText != "()") {
-                    context.editor.caretModel.moveToOffset((context.tailOffset - 1).coerceAtLeast(context.startOffset))
-                }
-            }
-            FlangIdeaCompletionKind.IMPORT -> InsertHandler { context, _ ->
+            FlangCompletionKind.FUNCTION,
+            FlangCompletionKind.MEMBER_FUNCTION,
+            FlangCompletionKind.STATIC_FUNCTION,
+            -> InsertHandler { context, _ ->
                 val document = context.document
-                val tail = context.tailOffset
-                if (document.charsSequence.getOrNull(tail) == ';') {
-                    document.deleteString(tail, tail + 1)
+                var caretTarget = context.tailOffset
+                if (completion.insertText.endsWith("()")) {
+                    caretTarget = (context.tailOffset - 1).coerceAtLeast(context.startOffset)
                 }
-            }
-            FlangIdeaCompletionKind.EMIT_TAG -> InsertHandler { context, _ ->
-                context.editor.caretModel.moveToOffset(context.tailOffset)
+                val importText = completion.importToAdd?.let { module ->
+                    if (document.text.contains(Regex("""(?m)^\s*import\s+\Q$module\E\s*;"""))) null else "import $module;\n"
+                }
+                if (importText != null) {
+                    val insertOffset = document.importInsertOffset()
+                    document.insertString(insertOffset, importText)
+                    if (insertOffset <= caretTarget) caretTarget += importText.length
+                }
+                context.editor.caretModel.moveToOffset(caretTarget)
             }
             else -> null
         }
+
+    private fun com.intellij.openapi.editor.Document.importInsertOffset(): Int {
+        val text = charsSequence.toString()
+        val declarations = Regex("""(?m)^\s*(?:package|import)\s+[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*;\s*\R?""")
+            .findAll(text)
+            .toList()
+        return declarations.lastOrNull()?.range?.last?.plus(1) ?: 0
+    }
 
     private fun VirtualFile.toPath(): Path? =
         runCatching { Path.of(path) }.getOrNull()
@@ -65,7 +75,7 @@ class FlangCompletionContributor : CompletionContributor() {
     private fun identifierPrefix(text: String, offset: Int): String {
         var index = offset - 1
         while (index >= 0 && text[index].let { it == '_' || it.isLetterOrDigit() || it == '.' }) index--
-        return text.substring(index + 1, offset).removePrefix(".")
+        return text.substring(index + 1, offset).substringAfterLast('.')
     }
 
     private data class CleanedCompletionText(val text: String, val offset: Int)
