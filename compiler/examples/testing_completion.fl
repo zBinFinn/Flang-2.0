@@ -1,0 +1,42 @@
+package main;
+
+import std.prelude;
+
+struct Test {
+    test: Num,
+    test2: String
+}
+
+impl Test {
+    fn createTest(test: Num, test2: String) -> Test {
+        return Test {
+            test: test,
+            test2: test2
+        }
+    }
+
+    fn setTest2(var self, test2: String) {
+        self.test2 = test2;
+    }
+}
+
+object Test2;
+impl Test2 {
+    fn silly() {
+
+    }
+}
+
+fn Test.doTheFunny() {
+
+}
+
+@Event
+fn join() {
+    var test = Test {
+        test: 5,
+        test2: "Hello World"
+    }
+
+    Test2.
+}

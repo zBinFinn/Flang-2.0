@@ -10,12 +10,14 @@ import com.zbinfinn.frontend.FlangSymbol
 import com.zbinfinn.frontend.FlangType
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.io.path.exists
 import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.relativeTo
 
 enum class FlangIdeaCompletionKind {
+    ANNOTATION,
     KEYWORD,
     IMPORT,
     VARIABLE,
@@ -59,18 +61,17 @@ private sealed interface FlangReceiver {
 }
 
 object FlangCompletionEngine {
+    private val annotationNames = listOf("Event", "PlayerEventProvider", "EntityEventProvider", "GameEventProvider")
     private val builtinTypes = listOf("Any", "List", "Dict", "Num", "String", "Text", "Boolean", "Item", "Location", "Particle", "Vector", "Sound")
     private val topLevelKeywords = listOf("package", "import", "private", "inline", "fn", "struct", "interface", "enum", "impl", "object")
     private val statementKeywords = listOf("val", "var", "return", "if", "for", "while", "when", "emit")
     private val expressionKeywords = listOf("true", "false", "gval")
+    private const val IMPORT_DISCOVERY_MAX_DEPTH = 6
+    private const val IMPORT_DISCOVERY_MAX_FILES = 500
 
     fun complete(context: FlangCompletionContext): List<FlangIdeaCompletion> {
         val offset = context.offset.coerceIn(0, context.source.length)
         val safeContext = context.copy(offset = offset)
-        val model = runCatching {
-            FlangFrontend.loadModel(safeContext.source, safeContext.filePath, safeContext.projectRoots)
-        }.getOrNull()
-        val symbols = model?.let { FlangScope.visibleSymbols(safeContext.source, offset, it) }.orEmpty()
         val completions = linkedMapOf<String, FlangIdeaCompletion>()
 
         fun add(completion: FlangIdeaCompletion) {
@@ -95,6 +96,28 @@ object FlangCompletionEngine {
             return completions.sorted()
         }
 
+        if (safeContext.isAnnotationContext()) {
+            annotationNames.forEach { add(FlangIdeaCompletion(it, FlangIdeaCompletionKind.ANNOTATION, typeText = "annotation")) }
+            return completions.sorted()
+        }
+
+        safeContext.implTargetContext()?.let { context ->
+            implTargetCompletions(safeContext, context).forEach(::add)
+            return completions.sorted()
+        }
+
+        val model = runCatching {
+            FlangFrontend.loadModel(safeContext.source, safeContext.filePath, safeContext.projectRoots)
+        }.getOrNull()
+        val symbols = model?.let { FlangScope.visibleSymbols(safeContext.source, offset, it) }.orEmpty()
+
+        if (model != null) {
+            if (safeContext.isTopLevelExtensionOwnerContext()) {
+                typeCompletions(model).forEach { add(it.copy(insertText = "${it.lookup}.")) }
+                return completions.sorted()
+            }
+        }
+
         if (model != null) {
             val receiver = FlangReceiverResolver.receiverBeforeDot(safeContext, symbols, model)
             if (receiver != null) {
@@ -108,6 +131,24 @@ object FlangCompletionEngine {
             if (completions.isNotEmpty() && safeContext.before.substringAfterLast('{').contains(':')) return completions.sorted()
         }
 
+        if (model != null) {
+            expectedType(safeContext, symbols, model)?.let { expected ->
+                symbols.values
+                    .filter { it.type.isAssignableTo(expected) }
+                    .forEach { symbol ->
+                        add(
+                            FlangIdeaCompletion(
+                                symbol.name,
+                                FlangIdeaCompletionKind.VARIABLE,
+                                typeText = symbol.type.sourceName,
+                                tailText = if (symbol.mutability == FlangMutability.MUTABLE) " var" else " val",
+                            ),
+                        )
+                    }
+                if (completions.isNotEmpty()) return completions.sorted()
+            }
+        }
+
         if (safeContext.isTypeLikeContext()) {
             typeCompletions(model).forEach(::add)
             return completions.sorted()
@@ -119,7 +160,6 @@ object FlangCompletionEngine {
                     add(FlangIdeaCompletion(".${entry.name}", FlangIdeaCompletionKind.ENUM_ENTRY, ".${entry.name}", typeText = enumType.name))
                 }
             }
-
             symbols.values.forEach { symbol ->
                 add(
                     FlangIdeaCompletion(
@@ -250,6 +290,7 @@ object FlangCompletionEngine {
     private fun structLiteralFields(context: FlangCompletionContext, model: FlangFrontendModel): List<FlangIdeaCompletion> {
         val match = Regex("""([A-Za-z_][A-Za-z0-9_]*)\s*\{([^{}]*)$""").find(context.before) ?: return emptyList()
         val struct = model.structs[match.groupValues[1]] ?: return emptyList()
+        if (Regex("""[A-Za-z_][A-Za-z0-9_]*\s*:\s*[^,{}]*$""").containsMatchIn(match.groupValues[2])) return emptyList()
         val provided = Regex("""\b([A-Za-z_][A-Za-z0-9_]*)\s*:""").findAll(match.groupValues[2]).map { it.groupValues[1] }.toSet()
         return struct.fields
             .filter { it.name !in provided }
@@ -280,23 +321,26 @@ object FlangCompletionEngine {
 
     private fun importCompletions(context: FlangCompletionContext): List<FlangIdeaCompletion> {
         val cwd = Path.of("").toAbsolutePath().normalize()
+        val typedPath = context.importPathPrefix()
+        val searchPrefix = typedPath.substringBeforeLast('.', typedPath).takeIf { it.isNotBlank() }
+        val searchRelative = searchPrefix?.replace('.', java.io.File.separatorChar).orEmpty()
         val roots = (
             context.projectRoots +
                 listOfNotNull(context.filePath?.parent) +
                 listOf(
                     cwd,
-                    cwd.parent ?: cwd,
                     cwd.resolve("compiler/src/main/resources"),
-                    (cwd.parent ?: cwd).resolve("compiler/src/main/resources"),
                 )
             ).distinct()
         val discovered = roots.flatMap { root ->
+            val searchRoot = root.resolve(searchRelative).normalize()
+            if (!searchRoot.exists()) return@flatMap emptyList()
             runCatching {
-                Files.walk(root).use { stream ->
+                Files.walk(searchRoot, IMPORT_DISCOVERY_MAX_DEPTH).use { stream ->
                     stream.filter { it.isRegularFile() && it.extension in setOf("fl", "fli") }
+                        .limit(IMPORT_DISCOVERY_MAX_FILES.toLong())
                         .map { it.relativeTo(root).joinToString(".") }
                         .filter { it.isNotBlank() }
-                        .map { it.substringBeforeLast('.') }
                         .toList()
                 }
             }.getOrDefault(emptyList())
@@ -375,11 +419,46 @@ object FlangCompletionEngine {
 
     private fun FlangCompletionContext.packageName(model: FlangFrontendModel): String = model.units.firstOrNull()?.packageName.orEmpty()
 
+    private fun implTargetCompletions(context: FlangCompletionContext, targetContext: ImplTargetContext): List<FlangIdeaCompletion> {
+        val localNames = context.localTypeNames()
+        val concreteNames = localNames.structs + localNames.objects
+        val names = when (targetContext) {
+            ImplTargetContext.OWNER -> localNames.structs + localNames.objects + localNames.enums + localNames.interfaces
+            ImplTargetContext.INTERFACE_IMPLEMENTOR -> concreteNames
+        }
+        return names.distinct().map { name ->
+            val kind = when {
+                name in localNames.interfaces -> FlangIdeaCompletionKind.INTERFACE
+                name in localNames.enums -> FlangIdeaCompletionKind.ENUM_ENTRY
+                else -> FlangIdeaCompletionKind.STRUCT
+            }
+            FlangIdeaCompletion(name, kind, typeText = "local")
+        }
+    }
+
     private fun FlangCompletionContext.isImportPathContext(): Boolean =
         before.substringAfterLast('\n').matches(Regex("""\s*import\s+[A-Za-z_0-9.]*$"""))
 
+    private fun FlangCompletionContext.importPathPrefix(): String =
+        Regex("""\s*import\s+([A-Za-z_0-9.]*)$""").find(before.substringAfterLast('\n'))?.groupValues?.get(1).orEmpty()
+
     private fun FlangCompletionContext.isGameValueStringContext(): Boolean =
         before.matches(Regex("""(?s).*gval\(\s*"[^"]*$"""))
+
+    private fun FlangCompletionContext.isAnnotationContext(): Boolean =
+        before.substringAfterLast('\n').matches(Regex("""\s*@[A-Za-z_0-9]*$"""))
+
+    private fun FlangCompletionContext.implTargetContext(): ImplTargetContext? {
+        val line = before.substringAfterLast('\n')
+        if (line.matches(Regex("""\s*impl\s+[A-Za-z_0-9]*$"""))) return ImplTargetContext.OWNER
+        if (line.matches(Regex("""\s*impl\s+[A-Za-z_][A-Za-z_0-9]*\s+for\s+[A-Za-z_0-9]*$"""))) {
+            return ImplTargetContext.INTERFACE_IMPLEMENTOR
+        }
+        return null
+    }
+
+    private fun FlangCompletionContext.isTopLevelExtensionOwnerContext(): Boolean =
+        before.blockDepth() == 0 && before.substringAfterLast('\n').matches(Regex("""\s*(?:private\s+|inline\s+)*fn(?:\s*<[^>]+>)?\s+[A-Za-z_0-9]*$"""))
 
     private fun FlangCompletionContext.isTypeLikeContext(): Boolean =
         before.substringAfterLast('\n').matches(Regex(""".*(->|:|as|struct\s+|impl\s+|enum\s+|&|<|,)\s*&?[A-Za-z_0-9]*$"""))
@@ -399,6 +478,18 @@ object FlangCompletionEngine {
 
     private fun FlangFunctionSignature.canAccess(packageName: String): Boolean = !isPrivate || this.packageName == packageName
 }
+
+private enum class ImplTargetContext {
+    OWNER,
+    INTERFACE_IMPLEMENTOR,
+}
+
+private data class LocalTypeNames(
+    val structs: List<String>,
+    val objects: List<String>,
+    val enums: List<String>,
+    val interfaces: List<String>,
+)
 
 private object FlangReceiverResolver {
     fun receiverBeforeDot(
@@ -479,6 +570,7 @@ object FlangTypeResolver {
 
     fun infer(text: String, symbols: Map<String, FlangSymbol>, model: FlangFrontendModel): FlangType? {
         val trimmed = text.trim().removeSurrounding("(", ")").trim()
+        castTargetType(trimmed, model)?.let { return it }
         inferPostfixChain(trimmed, symbols, model)?.let { return it }
         if (trimmed.matches(Regex("\\d+"))) return FlangType.NUM
         if (trimmed.startsWith("s\"")) return FlangType.TEXT
@@ -504,6 +596,11 @@ object FlangTypeResolver {
             (symbols[base]?.type?.referentOrSelf() as? FlangType.STRUCT)?.let { return model.structs[it.name]?.fieldsByName?.get(member)?.type }
         }
         return null
+    }
+
+    private fun castTargetType(text: String, model: FlangFrontendModel): FlangType? {
+        val match = Regex("""(?s)^.+\s+as\s+(&?[A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?)$""").matchEntire(text) ?: return null
+        return parse(match.groupValues[1], model)
     }
 
     private fun inferPostfixChain(text: String, symbols: Map<String, FlangSymbol>, model: FlangFrontendModel): FlangType? {
@@ -589,6 +686,49 @@ object FlangTypeResolver {
 }
 
 private fun FlangType.referentOrSelf(): FlangType = (this as? FlangType.REF)?.referentType ?: this
+
+private fun FlangType.isAssignableTo(expected: FlangType): Boolean {
+    val actual = referentOrSelf()
+    val target = expected.referentOrSelf()
+    return target == FlangType.ANY || actual == target || actual.sourceName == target.sourceName
+}
+
+private fun expectedType(
+    context: FlangCompletionContext,
+    symbols: Map<String, FlangSymbol>,
+    model: FlangFrontendModel,
+): FlangType? {
+    context.source.structFieldExpectedType(context.offset, model)?.let { return it }
+    context.source.assignmentTargetBefore(context.offset)?.let { symbols[it]?.type?.let { type -> return type } }
+    context.source.callContextBefore(context.offset)?.let { (name, argIndex, base) ->
+        expectedCallArgumentType(name, argIndex, base, symbols, model)?.let { return it }
+    }
+    context.source.returnExpectedType(context.offset, model)?.let { return it }
+    return null
+}
+
+private fun expectedCallArgumentType(
+    name: String,
+    argIndex: Int,
+    base: String?,
+    symbols: Map<String, FlangSymbol>,
+    model: FlangFrontendModel,
+): FlangType? {
+    val overloads = if (base == null) {
+        model.functionsByName[name].orEmpty()
+    } else {
+        val receiverType = symbols[base]?.type?.referentOrSelf()
+        val ownerName = receiverType?.sourceName?.substringBefore("<")
+        if (ownerName != null) {
+            (model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty())
+                .filter { it.hasReceiver }
+                .map { it.copy(params = it.params.drop(1)) }
+        } else {
+            model.implFunctionsByOwnerAndName[base to name].orEmpty().filter { !it.hasReceiver }
+        }
+    }
+    return overloads.mapNotNull { it.params.getOrNull(argIndex)?.type }.distinct().singleOrNull()
+}
 
 private fun String.identifierPrefix(offset: Int): String {
     var index = offset - 1
@@ -718,6 +858,40 @@ private fun String.assignmentTargetBefore(offset: Int): String? {
     val eq = before.lastIndexOf('=')
     if (eq < 0 || before.getOrNull(eq - 1) == '=' || before.getOrNull(eq + 1) == '=') return null
     return Regex("""([A-Za-z_][A-Za-z0-9_]*)\s*$""").find(before.substring(0, eq))?.groupValues?.get(1)
+}
+
+private fun String.structFieldExpectedType(offset: Int, model: FlangFrontendModel): FlangType? {
+    val before = substring(0, offset.coerceIn(0, length))
+    val brace = before.lastIndexOf('{')
+    if (brace < 0 || before.substring(brace + 1).contains('}')) return null
+    val structName = Regex("""([A-Za-z_][A-Za-z0-9_]*)\s*$""").find(before.substring(0, brace))?.groupValues?.get(1) ?: return null
+    val fieldName = Regex("""([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^,{}]*$""").find(before.substring(brace + 1))?.groupValues?.get(1) ?: return null
+    return model.structs[structName]?.fieldsByName?.get(fieldName)?.type
+}
+
+private fun String.returnExpectedType(offset: Int, model: FlangFrontendModel): FlangType? {
+    val before = substring(0, offset.coerceIn(0, length))
+    if (!before.substringAfterLast('\n').matches(Regex(""".*\breturn\s+[A-Za-z_0-9.]*$"""))) return null
+    val match = Regex("""fn(?:\s*<[^>]+>)?\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*->\s*(&?[A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?)\s*\{""")
+        .findAll(before)
+        .lastOrNull() ?: return null
+    return FlangTypeResolver.parse(match.groupValues[1], model)
+}
+
+private fun FlangCompletionContext.localTypeNames(): LocalTypeNames {
+    val entrySource = source
+    fun namesFor(keyword: String): List<String> =
+        Regex("""(?m)(?:^|[;\n\r])\s*(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?\s*)*$keyword\s+([A-Za-z_][A-Za-z0-9_]*)""")
+            .findAll(entrySource)
+            .map { it.groupValues[1] }
+            .toList()
+
+    return LocalTypeNames(
+        structs = namesFor("struct"),
+        objects = namesFor("object"),
+        enums = namesFor("enum"),
+        interfaces = namesFor("interface"),
+    )
 }
 
 private fun String.isGvalSecondArgument(): Boolean {
