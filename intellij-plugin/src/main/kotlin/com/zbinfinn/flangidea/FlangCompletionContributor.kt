@@ -42,6 +42,7 @@ class FlangCompletionContributor : CompletionContributor() {
             FlangCompletionKind.FUNCTION,
             FlangCompletionKind.MEMBER_FUNCTION,
             FlangCompletionKind.STATIC_FUNCTION,
+            FlangCompletionKind.TYPE,
             -> InsertHandler { context, _ ->
                 val document = context.document
                 var caretTarget = context.tailOffset

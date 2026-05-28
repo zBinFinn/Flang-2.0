@@ -252,6 +252,132 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertContainsElements(completionLookups(), "append", "get", "set", "length")
     }
 
+    fun testInfersForeachVariableTypeFromStaticCallListReturn() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.prelude;
+
+            object Plot;
+            impl Plot {
+              fn getAllPlayers() -> List<Player> {
+                return List.of();
+              }
+            }
+
+            fn Main() {
+              val players = Plot.getAllPlayers();
+              for (var player in players) {
+                player.s<caret>
+              }
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "sendMessage", "sendActionBar", "setItemInSlot")
+    }
+
+    fun testCompletesNonImportedProjectTypesWithImportMetadata() {
+        val root = Files.createTempDirectory("flang-type-completion")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/types.fl"),
+            """
+            package lib;
+
+            struct ExternalThing { value: Num }
+            interface ExternalApi {
+              fn run(this);
+            }
+            enum ExternalChoice { One }
+            object ExternalObject;
+            """.trimIndent(),
+        )
+        val sourceWithCaret = """
+        package main;
+
+        fn Main(value: Ex<caret>) {
+        }
+        """.trimIndent()
+        val source = sourceWithCaret.replace("<caret>", "")
+
+        val completions = FlangCompletionEngine.complete(
+            FlangCompletionRequest(
+                source = source,
+                offset = sourceWithCaret.indexOf("<caret>"),
+                filePath = root.resolve("main.fl"),
+                projectRoots = listOf(root),
+            ),
+        )
+
+        assertContainsElements(completions.map { it.lookup }, "ExternalThing", "ExternalApi", "ExternalChoice", "ExternalObject")
+        assertEquals("lib.types", completions.first { it.lookup == "ExternalThing" }.importToAdd)
+    }
+
+    fun testSelectingNonImportedStdEventProviderTypeAddsImport() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            @Event
+            fn join(var event: PlayerJoin<caret>) {
+            }
+            """.trimIndent(),
+        )
+
+        myFixture.completeBasic()
+
+        myFixture.checkResult(
+            """
+            import std.events.PlayerEvents;
+            @Event
+            fn join(var event: PlayerJoinEvent<caret>) {
+            }
+            """.trimIndent(),
+        )
+    }
+
+    fun testEventFunctionParameterTypeOnlyCompletesEventProviders() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct LocalThing { value: Num }
+            interface LocalApi {
+              fn run(this);
+            }
+            enum LocalChoice { One }
+            object LocalObject;
+
+            @Event
+            fn join(var event: <caret>) {
+            }
+            """.trimIndent(),
+        )
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "PlayerJoinEvent", "PlayerRightClickEvent", "PlotStartupEvent")
+        assertDoesntContain(lookups, "Num")
+        assertDoesntContain(lookups, "LocalThing")
+        assertDoesntContain(lookups, "LocalApi")
+        assertDoesntContain(lookups, "LocalChoice")
+        assertDoesntContain(lookups, "LocalObject")
+    }
+
+    fun testNonEventFunctionParameterTypeCompletesOrdinaryTypes() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct LocalThing { value: Num }
+            object LocalObject;
+
+            fn Main(value: <caret>) {
+            }
+            """.trimIndent(),
+        )
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "Num", "LocalThing", "LocalObject")
+    }
+
     fun testDistinguishesStaticAndReceiverExtensionFunctionsInCurrentFile() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,

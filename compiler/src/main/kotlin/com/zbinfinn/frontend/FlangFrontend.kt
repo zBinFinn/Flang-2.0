@@ -165,10 +165,22 @@ data class FlangInterfaceDefinition(
     val methods: List<FlangFunctionSignature>,
 )
 
+enum class FlangEventProviderKind {
+    PLAYER,
+    ENTITY,
+    GAME,
+}
+
+data class FlangEventProviderDefinition(
+    val kind: FlangEventProviderKind,
+    val action: String,
+)
+
 data class FlangObjectDefinition(
     val name: String,
     val packageName: String,
     val variables: List<FlangObjectVariable>,
+    val eventProvider: FlangEventProviderDefinition? = null,
 ) {
     val variablesByName: Map<String, FlangObjectVariable> = variables.associateBy { it.name }
 }
@@ -439,6 +451,9 @@ object FlangFrontend {
                 unit.file.item().mapNotNull { item ->
                     val decl = item.objectDecl() ?: return@mapNotNull null
                     val objectName = decl.Identifier().text
+                    val eventProvider = item.annotation()
+                        .mapNotNull { it.eventProviderDefinition() }
+                        .singleOrNull()
                     val variables = decl.block()?.stmt().orEmpty().mapNotNull { stmt ->
                         val varDecl = stmt.varDecl() ?: return@mapNotNull null
                         val type = varDecl.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, names) }
@@ -451,10 +466,26 @@ object FlangFrontend {
                             packageName = unit.packageName,
                         )
                     }
-                    objectName to FlangObjectDefinition(objectName, unit.packageName, variables)
+                    objectName to FlangObjectDefinition(objectName, unit.packageName, variables, eventProvider)
                 }
             }
             .toMap()
+    }
+
+    private fun FlangParser.AnnotationContext.eventProviderDefinition(): FlangEventProviderDefinition? {
+        val kind = when (Identifier().text) {
+            "PlayerEventProvider" -> FlangEventProviderKind.PLAYER
+            "EntityEventProvider" -> FlangEventProviderKind.ENTITY
+            "GameEventProvider" -> FlangEventProviderKind.GAME
+            else -> return null
+        }
+        val action = annotationArgs()
+            ?.expr()
+            ?.singleOrNull()
+            ?.text
+            ?.removeSurrounding("\"")
+            .orEmpty()
+        return FlangEventProviderDefinition(kind, action)
     }
 
     private fun inferObjectInitializerType(
