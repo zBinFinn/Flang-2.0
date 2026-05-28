@@ -19,6 +19,14 @@ impl PlayerJoinEvent {
     }
 }
 
+@PlayerEventProvider("Leave")
+object PlayerLeaveEvent;
+impl PlayerLeaveEvent {
+    inline fn getPlayer(this) -> Player {
+        return Player.default();
+    }
+}
+
 @PlayerEventProvider("RightClick")
 object PlayerRightClickEvent;
 impl PlayerRightClickEvent {
@@ -27,6 +35,19 @@ impl PlayerRightClickEvent {
     }
 }
 impl CancellableEvent for PlayerRightClickEvent {}
+
+@PlayerEventProvider("Chat")
+object PlayerChatEvent;
+impl CancellableEvent for PlayerChatEvent {}
+impl PlayerChatEvent {
+    inline fn getMessage(this) -> String {
+        return gval("Event Message");
+    }
+
+    inline fn getPlayer(this) -> Player {
+        return Player.default();
+    }
+}
 
 // Game Events
 @GameEventProvider("PlotStartup")

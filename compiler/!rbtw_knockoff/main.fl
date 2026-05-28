@@ -1,0 +1,154 @@
+package rbtw;
+
+import std.prelude;
+
+object State {
+    var playerData: Dict<&PlayerData> = Dict.new();
+}
+impl State {
+    fn register(player: Player) {
+        var data: &PlayerData = malloc(PlayerData);
+        *data = PlayerData.load(player);
+        State.playerData.set(player.uuid, data);
+    }
+
+    fn unregister(player: Player) {
+        var data: &PlayerData = State.playerData.get(player.uuid);
+        for (var upgrade: &Upgrade in data.upgrades) {
+            free(upgrade);
+        }
+        free(data);
+        State.playerData.remove(player.uuid);
+    }
+
+    fn getData(player: Player) -> &PlayerData {
+        return State.playerData.get(player.uuid);
+    }
+}
+
+struct PlayerData {
+    upgrades: List<&Upgrade>
+}
+impl PlayerData {
+    private fn loadUpgrades(player: Player) -> List<&Upgrade> {
+        var upgrades: List<&Upgrade> = List.of();
+
+        // todo: have an upgrade registry to go through to load stuff
+        var upgrade = malloc(Upgrade);
+        *upgrade = Upgrade {
+            id: "test-id",
+            level: 5
+        };
+
+        upgrades.append(upgrade);
+
+        return upgrades;
+    }
+
+    fn load(player: Player) -> PlayerData {
+        val upgrades = PlayerData.loadUpgrades(player);
+        return PlayerData {
+            upgrades: upgrades
+        }
+    }
+}
+
+struct Upgrade {
+    id: String,
+    level: Num
+}
+
+@Event
+fn startup(var event: PlotStartupEvent) {
+    start gameLoop();
+}
+
+@Event
+fn join(var event: PlayerJoinEvent) {
+    var player = event.getPlayer();
+
+    State.register(player);
+}
+
+@Event
+fn leave(var event: PlayerLeaveEvent) {
+    var player = event.getPlayer();
+
+    State.unregister(player);
+}
+
+@Event
+fn onChat(var event: PlayerChatEvent) {
+    val message: String = event.getMessage();
+    var player = event.getPlayer();
+
+    if (message.startsWith("!")) {
+        if (message == "!Funny") {
+            player.sendMessage(s"Stuff: ".concat(State.getData(player).upgrades.get(0)));
+        }
+    }
+}
+
+pc gameLoop() {
+    while(true) {
+        val players = Plot.getAllPlayers();
+        for (var player in players) {
+            val swimSpeed = calculateSwimSpeed(player);
+            player.sendActionBar(s"<blue>Your Swim Speed is: <green>".concat(swimSpeed));
+
+            if (player.isSwimming() && player.isSprinting()) {
+                player.setForwardVelocity(swimSpeed, .PitchAndYaw);
+            }
+        }
+        wait(1);
+    }
+}
+
+fn calculateSwimSpeed(player: Player) -> Num {
+    return 10;
+}
+
+// should be stdlib
+
+object Plot;
+impl Plot {
+    fn getAllPlayers() -> List<Player> {
+        var players: List<Player> = List.of();
+        var uuids: List<String> = gval("Plot Player UUIDs");
+        for (val uuid in uuids) {
+            players.append(Player.fromUuid(uuid));
+        }
+
+        return players;
+    }
+}
+
+inline fn wait(ticks: Num) {
+    emit `control "Wait" args($ticks$) tags(..)`;
+}
+
+fn String.startsWith(this, other: String) -> Boolean {
+    if emit `if_variable "StartsWith" args($this$, $other$) tags("Ignore Case" = "False")` {
+        return true;
+    }
+    return false;
+}
+
+fn String.startsWithIgnoreCase(this, other: String) -> Boolean {
+    if emit `if_variable "StartsWith" args($this$, $other$) tags("Ignore Case" = "True")` {
+        return true;
+    }
+    return false;
+}
+
+fn String.concat(this, other: Any) -> String {
+    var out: String;
+    emit `set_variable "String" args($out$, $this$, $other$)`;
+    return out;
+}
+
+fn Text.concat(this, other: Any) -> Text {
+    var out: Text;
+    emit `set_variable "StyledText" args($out$, $this$, $other$) tags(..)`;
+    return out;
+}

@@ -45,6 +45,7 @@ data class CompiledTemplate(
     val ir: DfTemplate,
     val templateJson: String,
     val templateNbt: String,
+    val code: String
 )
 
 data class CompileResult(
@@ -250,11 +251,14 @@ object FlangCompiler {
             val template = DfTemplate(optimizedEntries)
             val templateJson = json.encodeToString(JsonElement.serializer(), template.toJson())
             val displayName = templateName(options, lowered.displayIdentifier, loweredFunctions.size)
+
+            val (code, nbt) = TemplateNbt.encode(templateJson, displayName)
             CompiledTemplate(
                 displayIdentifier = lowered.displayIdentifier,
                 ir = template,
                 templateJson = templateJson,
-                templateNbt = TemplateNbt.encode(templateJson, displayName),
+                templateNbt = nbt,
+                code = code
             )
         }
         return CompileResult(templates)
@@ -3699,7 +3703,7 @@ private class FunctionLowering(
         if (gameValue == null && requestedName != "Name") {
             throw FlangCompileException("Unknown game value '$requestedName'.")
         }
-        val isTargetless = gameValue?.category == "Plot Values"
+        val isTargetless = gameValue?.category == "Plot Values" || gameValue?.category == "Event Values"
         if (isTargetless && call.args.size == 2) {
             throw FlangCompileException("Game value '$requestedName' does not accept a SelectionType target.")
         }
@@ -5146,7 +5150,7 @@ private fun FlangParser.LogicalOrContext.singlePostfixOrNull(): FlangParser.Post
 }
 
 private object TemplateNbt {
-    fun encode(templateJson: String, templateName: String): String {
+    fun encode(templateJson: String, templateName: String): Pair<String, String> {
         val code = gzipBase64(templateJson)
         val metadata = buildJsonObject {
             put("author", "Flang 2.0")
@@ -5183,7 +5187,7 @@ private object TemplateNbt {
             )
         }.toString()
 
-        return buildString {
+        return Pair(code, buildString {
             append("minecraft:lime_concrete[")
             append("minecraft:custom_data={PublicBukkitValues:{\"hypercube:codetemplatedata\":'")
             append(metadata.escapeSnbtSingleQuoted())
@@ -5195,7 +5199,7 @@ private object TemplateNbt {
             append(loreLine.escapeSnbtSingleQuoted())
             append("']")
             append("] 1")
-        }
+        })
     }
 
     private fun gzipBase64(text: String): String {
