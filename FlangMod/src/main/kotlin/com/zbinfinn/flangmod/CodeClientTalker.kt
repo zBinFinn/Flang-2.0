@@ -12,7 +12,7 @@ object CodeClientTalker : WebSocket.Listener {
 
     private var waitingFuture = CompletableFuture<String>()
 
-    suspend fun placeFromClipboard(clipboard: String) {
+    fun placeFromClipboard(clipboard: String) {
         ws = HttpClient.newHttpClient()
             .newWebSocketBuilder()
             .buildAsync(URI.create("ws://localhost:31375"), CodeClientTalker)
