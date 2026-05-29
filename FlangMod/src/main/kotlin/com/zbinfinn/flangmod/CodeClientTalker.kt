@@ -7,7 +7,7 @@ import java.net.http.WebSocket
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionStage
 
-object CodeClientTalker : WebSocket.Listener {
+class CodeClientTalker : WebSocket.Listener {
     private var ws: WebSocket? = null
 
     private var waitingFuture = CompletableFuture<String>()
@@ -15,12 +15,13 @@ object CodeClientTalker : WebSocket.Listener {
     fun placeFromClipboard(clipboard: String) {
         ws = HttpClient.newHttpClient()
             .newWebSocketBuilder()
-            .buildAsync(URI.create("ws://localhost:31375"), CodeClientTalker)
+            .buildAsync(URI.create("ws://localhost:31375"), this)
             .join()
 
-        send("scopes write_code movement")?.join()
+        send("scopes clear_plot write_code read_plot movement")?.join()
 
         val auth = wait()
+        println("Auth Response: $auth")
 
         send("clear")?.join()
         send("place")?.join()
@@ -30,6 +31,7 @@ object CodeClientTalker : WebSocket.Listener {
         send("place go")?.join()
 
         val done = wait()
+        println("Place Response: $done")
     }
 
     fun wait(): String = waitingFuture.join()

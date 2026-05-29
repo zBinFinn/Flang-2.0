@@ -36,7 +36,7 @@ class FlangMod : ClientModInitializer {
                         return@executes 1;
                     }
                     Thread.startVirtualThread {
-                        CodeClientTalker.placeFromClipboard(clipboard)
+                        CodeClientTalker().placeFromClipboard(clipboard)
                     }
                     return@executes 0
                 })
