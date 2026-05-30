@@ -21,20 +21,69 @@ class FlangSyntaxHighlighter : SyntaxHighlighter {
 
     override fun getTokenHighlights(tokenType: IElementType?): Array<TextAttributesKey> =
         when (tokenType) {
-            FlangTokenTypes.KEYWORD -> KEYWORD_KEYS
+            FlangTokenTypes.KEYWORD,
+            FlangTokenTypes.INLINE,
+            FlangTokenTypes.PACKAGE,
+            FlangTokenTypes.IMPORT,
+            FlangTokenTypes.PRIVATE,
+            FlangTokenTypes.PC,
+            FlangTokenTypes.FN,
+            FlangTokenTypes.EMIT,
+            FlangTokenTypes.VAL,
+            FlangTokenTypes.VAR,
+            FlangTokenTypes.TRUE,
+            FlangTokenTypes.FALSE,
+            FlangTokenTypes.RETURN,
+            FlangTokenTypes.START,
+            FlangTokenTypes.IF,
+            FlangTokenTypes.ELSE,
+            FlangTokenTypes.FOR,
+            FlangTokenTypes.IN,
+            FlangTokenTypes.WHILE,
+            FlangTokenTypes.WHEN,
+            FlangTokenTypes.AS,
+            FlangTokenTypes.STRUCT,
+            FlangTokenTypes.INTERFACE,
+            FlangTokenTypes.ENUM,
+            FlangTokenTypes.IMPL,
+            FlangTokenTypes.OBJECT,
+            FlangTokenTypes.ARGS,
+            FlangTokenTypes.TAGS -> KEYWORD_KEYS
             FlangTokenTypes.IDENTIFIER -> IDENTIFIER_KEYS
             FlangTokenTypes.NUMBER -> NUMBER_KEYS
             FlangTokenTypes.STRING, FlangTokenTypes.STYLED_STRING -> STRING_KEYS
             FlangTokenTypes.LINE_COMMENT, FlangTokenTypes.BLOCK_COMMENT -> COMMENT_KEYS
-            FlangTokenTypes.OPERATOR -> OPERATOR_KEYS
-            FlangTokenTypes.PUNCTUATION -> PUNCTUATION_KEYS
+            FlangTokenTypes.OPERATOR,
+            FlangTokenTypes.ARROW,
+            FlangTokenTypes.EQ,
+            FlangTokenTypes.EQ_EQ,
+            FlangTokenTypes.NOT_EQ,
+            FlangTokenTypes.LT_EQ,
+            FlangTokenTypes.GT_EQ,
+            FlangTokenTypes.AND_AND,
+            FlangTokenTypes.OR_OR,
+            FlangTokenTypes.DOT_DOT,
+            FlangTokenTypes.AMP,
+            FlangTokenTypes.PLUS,
+            FlangTokenTypes.MINUS,
+            FlangTokenTypes.STAR,
+            FlangTokenTypes.SLASH,
+            FlangTokenTypes.PERCENT,
+            FlangTokenTypes.DOT,
+            FlangTokenTypes.LT,
+            FlangTokenTypes.GT,
+            FlangTokenTypes.DOLLAR -> OPERATOR_KEYS
+            FlangTokenTypes.PUNCTUATION,
+            FlangTokenTypes.COMMA,
+            FlangTokenTypes.COLON,
+            FlangTokenTypes.SEMI -> PUNCTUATION_KEYS
             FlangTokenTypes.LBRACE,
             FlangTokenTypes.RBRACE,
             FlangTokenTypes.LPAREN,
             FlangTokenTypes.RPAREN,
             FlangTokenTypes.LBRACKET,
             FlangTokenTypes.RBRACKET -> BRACES_KEYS
-            FlangTokenTypes.ANNOTATION -> ANNOTATION_KEYS
+            FlangTokenTypes.ANNOTATION, FlangTokenTypes.AT -> ANNOTATION_KEYS
             FlangTokenTypes.ENUM_SHORTHAND -> ENUM_KEYS
             FlangTokenTypes.EMIT_CONTENT -> EMIT_KEYS
             TokenType.BAD_CHARACTER -> BAD_KEYS

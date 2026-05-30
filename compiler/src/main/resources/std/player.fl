@@ -4,7 +4,18 @@ struct Player {
     uuid: String
 }
 
+enum ForwardVelocityType {
+    PitchAndYaw,
+    Yaw,
+}
+
 impl Player {
+    fn fromUuid(uuid: String) -> Player {
+        return Player {
+            uuid: uuid
+        }
+    }
+
     inline fn default() -> Player {
         return Player {
             uuid: gval("UUID", .Default)
@@ -32,9 +43,15 @@ impl Player {
         return name;
     }
 
-    inline fn sendMessage(this, message: Text) {
+    inline fn sendMessage(var this, message: Text) {
         this.select();
         emit `player_action "SendMessage" args($message$) tags(..)`;
+        this.deselect();
+    }
+
+    inline fn sendActionBar(var this, message: Text) {
+        this.select();
+        emit `player_action "ActionBar" args($message$) tags(..)`;
         this.deselect();
     }
 
@@ -42,5 +59,51 @@ impl Player {
         this.select();
         emit `player_action "GiveItems" args($item$)`;
         this.deselect();
+    }
+
+    inline fn setItemInSlot(var this, item: Item, slot: Num) {
+        this.select();
+        emit `player_action "SetSlotItem" args($item$, $slot$)`;
+        this.deselect();
+    }
+
+    fn addForwardVelocity(var this, power: Num, type: ForwardVelocityType) {
+        this.select();
+        if (type == ForwardVelocityType.PitchAndYaw) {
+            emit `player_action "LaunchFwd" args($power$) tags("Add to Current Velocity" = "True", "Launch Axis" = "Pitch and Yaw")`;
+        } else {
+            emit `player_action "LaunchFwd" args($power$) tags("Add to Current Velocity" = "True", "Launch Axis" = "Yaw Only")`;
+        }
+        this.deselect();
+    }
+
+    fn setForwardVelocity(var this, power: Num, type: ForwardVelocityType) {
+        this.select();
+        if (type == ForwardVelocityType.PitchAndYaw) {
+            emit `player_action "LaunchFwd" args($power$) tags("Add to Current Velocity" = "False", "Launch Axis" = "Pitch and Yaw")`;
+        } else {
+            emit `player_action "LaunchFwd" args($power$) tags("Add to Current Velocity" = "False", "Launch Axis" = "Yaw Only")`;
+        }
+        this.deselect();
+    }
+
+    fn isSprinting(this) -> Boolean {
+        this.select();
+        if emit `if_player "IsSprinting"` {
+            this.deselect();
+            return true;
+        }
+        this.deselect();
+        return false;
+    }
+
+    fn isSwimming(this) -> Boolean {
+        this.select();
+        if emit `if_player "IsSwimming"` {
+            this.deselect();
+            return true;
+        }
+        this.deselect();
+        return false;
     }
 }

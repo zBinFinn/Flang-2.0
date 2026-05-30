@@ -28,7 +28,7 @@ fn sum(a: Num, b: Num) -> Num {
 fn test3() {
     val num1 = 5;
     var num2 = 3;
-    increment(&num2); // only works for var not val and requires '&' to make it clear that it is being mutated
+    increment(var num2); // only works for var not val and requires 'var' to make it clear that it is being mutated
 
     print(sum(num1, num2));
 }

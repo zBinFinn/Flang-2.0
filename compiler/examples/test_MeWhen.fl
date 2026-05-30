@@ -30,7 +30,7 @@ fn join(var event: PlayerJoinEvent) {
 
     var item = newItem("stone");
 
-    itemSetTag(&item, "hello", "World");
+    itemSetTag(var item, "hello", "World");
     player.giveItem(item);
 
     if (itemHasTag(item, "hello")) {

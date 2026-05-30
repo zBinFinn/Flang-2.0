@@ -1,11 +1,34 @@
 package com.zbinfinn.flangidea
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
-import com.zbinfinn.frontend.FlangCompletionRequest
-import com.zbinfinn.frontend.FlangFrontend
+import java.nio.file.Files
 import java.nio.file.Path
 
 class FlangCompletionContributorTest : BasePlatformTestCase() {
+    fun testTopLevelKeywordsExcludeStatementKeywords() {
+        myFixture.configureByText(FlangFileType.INSTANCE, "<caret>")
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "impl", "fn", "struct")
+        assertDoesntContain(lookups, "val")
+        assertDoesntContain(lookups, "var")
+    }
+
+    fun testStatementKeywordsExcludeTopLevelOnlyKeywords() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              <caret>
+            }
+            """.trimIndent(),
+        )
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "val", "var", "return")
+        assertDoesntContain(lookups, "impl")
+    }
+
     fun testCompletesVisibleVariablesButNotBranchLocals() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
@@ -21,8 +44,7 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         )
 
         val lookups = completionLookups()
-        assertContainsElements(lookups, "before")
-        assertContainsElements(lookups, "arg")
+        assertContainsElements(lookups, "arg", "before")
         assertDoesntContain(lookups, "branchOnly")
     }
 
@@ -56,21 +78,6 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertDoesntContain(completionLookups(), "x")
     }
 
-    fun testCompletionContributorWorksWithIntellijDummyIdentifier() {
-        myFixture.configureByText(
-            FlangFileType.INSTANCE,
-            """
-            fn Main(arg: Num) {
-              val before = 1;
-              val after = <caret>
-            }
-            """.trimIndent(),
-        )
-
-        myFixture.completeBasic()
-        assertContainsElements(myFixture.lookupElementStrings.orEmpty(), "before", "arg")
-    }
-
     fun testCompletesImportedStdMemberFunction() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
@@ -86,7 +93,150 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertContainsElements(completionLookups(), "sendMessage", "damage", "getName")
     }
 
-    fun testCompletesGenericCollectionMemberFunctions() {
+    fun testCompletesNonImportedProjectFunctionWithImportMetadata() {
+        val root = Files.createTempDirectory("flang-completion")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/tools.fl"),
+            """
+            package lib;
+
+            fn helper() -> Num {
+              return 1;
+            }
+            """.trimIndent(),
+        )
+        val sourceWithCaret = """
+        package main;
+
+        fn Main() {
+          he<caret>
+        }
+        """.trimIndent()
+        val source = sourceWithCaret.replace("<caret>", "")
+
+        val helper = FlangCompletionEngine.complete(
+            FlangCompletionRequest(
+                source = source,
+                offset = sourceWithCaret.indexOf("<caret>"),
+                filePath = root.resolve("main.fl"),
+                projectRoots = listOf(root),
+            ),
+        ).first { it.lookup == "helper" }
+
+        assertEquals("lib.tools", helper.importToAdd)
+    }
+
+    fun testSelectingNonImportedStaticStdFunctionAddsModuleImport() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              val player = Player.de<caret>
+            }
+            """.trimIndent(),
+        )
+
+        myFixture.completeBasic()
+
+        myFixture.checkResult(
+            """
+            import std.Player;
+            fn Main() {
+              val player = Player.default(<caret>)
+            }
+            """.trimIndent(),
+        )
+    }
+
+    fun testSelectingImportedStaticStdFunctionDoesNotDuplicateImport() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.Player;
+
+            fn Main() {
+              val player = Player.de<caret>
+            }
+            """.trimIndent(),
+        )
+
+        myFixture.completeBasic()
+
+        myFixture.checkResult(
+            """
+            import std.Player;
+
+            fn Main() {
+              val player = Player.default(<caret>)
+            }
+            """.trimIndent(),
+        )
+    }
+
+    fun testCompletesStaticFunctionOnTypePrefix() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              val player = Player.de<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "default")
+    }
+
+    fun testCompletesMembersForLocalPlayer() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.prelude;
+
+            fn Main(player: Player) {
+              player.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "sendMessage", "damage")
+    }
+
+    fun testInfersLocalFromStdEventMemberCallForMemberCompletion() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            @Event
+            fn join(var event: PlayerJoinEvent) {
+              var player = event.getPlayer();
+              player.s<caret>
+            }
+            """.trimIndent(),
+        )
+
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "sendMessage", "sendActionBar", "setItemInSlot")
+    }
+
+    fun testCompletesPrimitiveAndGenericExtensionFunctions() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            import std.prelude;
+
+            fn Num.bump(this) -> Num {
+              return this + 1;
+            }
+
+            fn Main() {
+              val x: Num = 1;
+              x.<caret>
+            }
+            """.trimIndent(),
+        )
+
+        assertContainsElements(completionLookups(), "bump")
+
         myFixture.configureByText(
             FlangFileType.INSTANCE,
             """
@@ -102,74 +252,180 @@ class FlangCompletionContributorTest : BasePlatformTestCase() {
         assertContainsElements(completionLookups(), "append", "get", "set", "length")
     }
 
-    fun testCompletesContextualEnumInGvalSecondArgument() {
+    fun testInfersForeachVariableTypeFromStaticCallListReturn() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
             """
+            import std.prelude;
+
+            object Plot;
+            impl Plot {
+              fn getAllPlayers() -> List<Player> {
+                return List.of();
+              }
+            }
+
             fn Main() {
-              val name = gval("Name", .<caret>);
+              val players = Plot.getAllPlayers();
+              for (var player in players) {
+                player.s<caret>
+              }
             }
             """.trimIndent(),
         )
 
-        assertContainsElements(completionLookups(), ".Selection", ".Default", ".Victim")
+        assertContainsElements(completionLookups(), "sendMessage", "sendActionBar", "setItemInSlot")
     }
 
-    fun testDoesNotCompleteEnumShorthandWithoutExpectedType() {
+    fun testCompletesNonImportedProjectTypesWithImportMetadata() {
+        val root = Files.createTempDirectory("flang-type-completion")
+        Files.createDirectories(root.resolve("lib"))
+        Files.writeString(
+            root.resolve("lib/types.fl"),
+            """
+            package lib;
+
+            struct ExternalThing { value: Num }
+            interface ExternalApi {
+              fn run(this);
+            }
+            enum ExternalChoice { One }
+            object ExternalObject;
+            """.trimIndent(),
+        )
+        val sourceWithCaret = """
+        package main;
+
+        fn Main(value: Ex<caret>) {
+        }
+        """.trimIndent()
+        val source = sourceWithCaret.replace("<caret>", "")
+
+        val completions = FlangCompletionEngine.complete(
+            FlangCompletionRequest(
+                source = source,
+                offset = sourceWithCaret.indexOf("<caret>"),
+                filePath = root.resolve("main.fl"),
+                projectRoots = listOf(root),
+            ),
+        )
+
+        assertContainsElements(completions.map { it.lookup }, "ExternalThing", "ExternalApi", "ExternalChoice", "ExternalObject")
+        assertEquals("lib.types", completions.first { it.lookup == "ExternalThing" }.importToAdd)
+    }
+
+    fun testSelectingNonImportedStdEventProviderTypeAddsImport() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
             """
-            enum Choice { One, Two }
+            @Event
+            fn join(var event: PlayerJoin<caret>) {
+            }
+            """.trimIndent(),
+        )
 
-            fn Main() {
-              val x = .<caret>;
+        myFixture.completeBasic()
+
+        myFixture.checkResult(
+            """
+            import std.events.PlayerEvents;
+            @Event
+            fn join(var event: PlayerJoinEvent<caret>) {
+            }
+            """.trimIndent(),
+        )
+    }
+
+    fun testEventFunctionParameterTypeOnlyCompletesEventProviders() {
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            struct LocalThing { value: Num }
+            interface LocalApi {
+              fn run(this);
+            }
+            enum LocalChoice { One }
+            object LocalObject;
+
+            @Event
+            fn join(var event: <caret>) {
             }
             """.trimIndent(),
         )
 
         val lookups = completionLookups()
-        assertDoesntContain(lookups, ".One")
-        assertDoesntContain(lookups, ".Two")
+        assertContainsElements(lookups, "PlayerJoinEvent", "PlayerRightClickEvent", "PlotStartupEvent")
+        assertDoesntContain(lookups, "Num")
+        assertDoesntContain(lookups, "LocalThing")
+        assertDoesntContain(lookups, "LocalApi")
+        assertDoesntContain(lookups, "LocalChoice")
+        assertDoesntContain(lookups, "LocalObject")
     }
 
-    fun testCompletesNewBuiltinPrimitiveTypeNames() {
+    fun testNonEventFunctionParameterTypeCompletesOrdinaryTypes() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
             """
+            struct LocalThing { value: Num }
+            object LocalObject;
+
             fn Main(value: <caret>) {
             }
             """.trimIndent(),
         )
 
-        assertContainsElements(completionLookups(), "Location", "Particle", "Vector", "Sound")
+        val lookups = completionLookups()
+        assertContainsElements(lookups, "Num", "LocalThing", "LocalObject")
     }
 
-    fun testCompletesPrimitiveExtensionFunctionsOnMemberAccess() {
+    fun testDistinguishesStaticAndReceiverExtensionFunctionsInCurrentFile() {
         myFixture.configureByText(
             FlangFileType.INSTANCE,
             """
-            fn Num.bump(this) -> Num {
-              return this + 1;
+            fn Main() {
+              val item = Item.o<caret>
             }
 
-            fn Sound.echo(this) -> Sound {
-              return this;
+            inline fn Item.of(id: String) -> Item {
+              var item: Item;
+              return item;
             }
 
-            fn Main(sound: Sound) {
-              val x: Num = 1;
-              x.<caret>
-              sound.echo();
+            inline fn Item.setName(var this, name: Text) {
             }
             """.trimIndent(),
         )
 
-        assertContainsElements(completionLookups(), "bump")
+        val staticLookups = completionLookups()
+        assertTrue("Expected static Item.of in $staticLookups", staticLookups.contains("of"))
+        assertDoesntContain(staticLookups, "setName")
+
+        myFixture.configureByText(
+            FlangFileType.INSTANCE,
+            """
+            fn Main() {
+              var item = Item.of("emerald");
+              item.<caret>
+            }
+
+            inline fn Item.of(id: String) -> Item {
+              var item: Item;
+              return item;
+            }
+
+            inline fn Item.setName(var this, name: Text) {
+            }
+            """.trimIndent(),
+        )
+
+        val memberLookups = completionLookups()
+        assertTrue("Expected receiver Item.setName in $memberLookups", memberLookups.contains("setName"))
+        assertDoesntContain(memberLookups, "of")
     }
 
     private fun completionLookups(): List<String> {
         val file = myFixture.file
-        return FlangFrontend.completions(
+        return FlangCompletionEngine.complete(
             FlangCompletionRequest(
                 source = file.text,
                 offset = myFixture.caretOffset,

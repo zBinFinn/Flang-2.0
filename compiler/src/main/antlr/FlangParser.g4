@@ -20,6 +20,7 @@ qualifiedName
 
 item
   : annotation* functionDecl
+  | processDecl
   | annotation* structDecl
   | annotation* interfaceDecl
   | annotation* enumDecl
@@ -37,6 +38,10 @@ annotationArgs
 
 functionDecl
   : PRIVATE? INLINE? FN genericParamList? functionName LPAREN paramList? RPAREN (ARROW typeRef)? block
+  ;
+
+processDecl
+  : PC Identifier LPAREN paramList? RPAREN block
   ;
 
 genericParamList
@@ -61,6 +66,7 @@ block
 
 stmt
   : emitStmt SEMI
+  | startProcessStmt SEMI
   | varDecl SEMI?
   | returnStmt SEMI?
   | ifEmitStmt
@@ -81,6 +87,10 @@ returnStmt
 
 exprStmt
   : expr
+  ;
+
+startProcessStmt
+  : START Identifier LPAREN callArgList? RPAREN
   ;
 
 emitStmt
@@ -200,7 +210,8 @@ whenCondition
   ;
 
 typeRef
-  : tupleType
+  : AMP typeRef
+  | tupleType
   | simpleType
   ;
 
@@ -260,12 +271,13 @@ callArgList
   ;
 
 callArg
-  : AMP expr
+  : VAR expr
   | expr
   ;
 
 primary
-  : IntegerLiteral
+  : STAR Identifier
+  | IntegerLiteral
   | StringLiteral
   | StyledStringLiteral
   | TRUE

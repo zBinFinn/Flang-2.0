@@ -45,6 +45,7 @@ sealed class FlangType(open val sourceName: String) {
     data class TYPE_PARAMETER(val name: String) : FlangType(name)
     data class LIST(val elementType: FlangType) : FlangType("List<${elementType.sourceName}>")
     data class DICT(val valueType: FlangType) : FlangType("Dict<${valueType.sourceName}>")
+    data class REF(val referentType: FlangType) : FlangType("&${referentType.sourceName}")
     data class STRUCT(val name: String) : FlangType(name)
     data class OBJECT(val name: String) : FlangType(name)
     data class ENUM(val name: String) : FlangType(name)
@@ -61,6 +62,9 @@ sealed class FlangType(open val sourceName: String) {
         ): FlangType? {
             fun parse(text: String): FlangType? {
                 val trimmed = text.trim()
+                if (trimmed.startsWith("&")) {
+                    return parse(trimmed.drop(1))?.let { REF(it) }
+                }
                 val genericStart = trimmed.indexOf('<')
                 if (genericStart > 0 && trimmed.endsWith(">")) {
                     val base = trimmed.substring(0, genericStart)
@@ -161,6 +165,33 @@ data class FlangInterfaceDefinition(
     val methods: List<FlangFunctionSignature>,
 )
 
+enum class FlangEventProviderKind {
+    PLAYER,
+    ENTITY,
+    GAME,
+}
+
+data class FlangEventProviderDefinition(
+    val kind: FlangEventProviderKind,
+    val action: String,
+)
+
+data class FlangObjectDefinition(
+    val name: String,
+    val packageName: String,
+    val variables: List<FlangObjectVariable>,
+    val eventProvider: FlangEventProviderDefinition? = null,
+) {
+    val variablesByName: Map<String, FlangObjectVariable> = variables.associateBy { it.name }
+}
+
+data class FlangObjectVariable(
+    val name: String,
+    val type: FlangType,
+    val mutability: FlangMutability,
+    val packageName: String,
+)
+
 data class FlangCompletion(
     val lookup: String,
     val kind: FlangCompletionKind,
@@ -174,11 +205,16 @@ data class FlangFrontendModel(
     val structs: Map<String, FlangStructDefinition>,
     val enums: Map<String, FlangEnumDefinition>,
     val functions: List<FlangFunctionSignature>,
+    val processes: List<FlangFunctionSignature> = emptyList(),
     val objects: Set<String>,
     val interfaces: Map<String, FlangInterfaceDefinition>,
+    val objectDefinitions: Map<String, FlangObjectDefinition> = emptyMap(),
 ) {
     val functionsByName: Map<String, List<FlangFunctionSignature>> =
         functions.filter { it.owner == null }.groupBy { it.name }
+
+    val processesByName: Map<String, List<FlangFunctionSignature>> =
+        processes.groupBy { it.name }
 
     val implFunctionsByOwnerAndName: Map<Pair<String, String>, List<FlangFunctionSignature>> =
         functions.filter { it.owner != null }.groupBy { it.owner!! to it.name }
@@ -208,12 +244,12 @@ object FlangFrontend {
         val units = loadSourceGraph(source, filePath, projectRoots)
         val enums = buildEnumTable(units)
         val structs = buildStructTable(units, enums)
-        val objects = units.filter { it.kind == FlangSourceKind.FL }
-            .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
-            .toSet()
+        val objectDefinitions = buildObjectTable(units, structs, enums)
+        val objects = objectDefinitions.keys
         val interfaces = buildInterfaceTable(units, structs, enums, objects)
         val functions = buildFunctionSignatures(units, structs, enums, objects, interfaces.keys)
-        return FlangFrontendModel(units, structs, enums, functions, objects, interfaces)
+        val processes = buildProcessSignatures(units, structs, enums, objects, interfaces.keys)
+        return FlangFrontendModel(units, structs, enums, functions, processes, objects, interfaces, objectDefinitions)
     }
 
     fun completions(request: FlangCompletionRequest): List<FlangCompletion> {
@@ -402,6 +438,84 @@ object FlangFrontend {
         }
     }
 
+    private fun buildObjectTable(
+        units: List<FlangSourceUnit>,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+    ): Map<String, FlangObjectDefinition> {
+        val names = units.filter { it.kind == FlangSourceKind.FL }
+            .flatMap { unit -> unit.file.item().mapNotNull { it.objectDecl()?.Identifier()?.text } }
+            .toSet()
+        return units.filter { it.kind == FlangSourceKind.FL }
+            .flatMap { unit ->
+                unit.file.item().mapNotNull { item ->
+                    val decl = item.objectDecl() ?: return@mapNotNull null
+                    val objectName = decl.Identifier().text
+                    val eventProvider = item.annotation()
+                        .mapNotNull { it.eventProviderDefinition() }
+                        .singleOrNull()
+                    val variables = decl.block()?.stmt().orEmpty().mapNotNull { stmt ->
+                        val varDecl = stmt.varDecl() ?: return@mapNotNull null
+                        val type = varDecl.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, names) }
+                            ?: varDecl.expr()?.let { inferObjectInitializerType(it.text, structs, enums, names) }
+                            ?: return@mapNotNull null
+                        FlangObjectVariable(
+                            name = varDecl.Identifier().text,
+                            type = type,
+                            mutability = if (varDecl.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
+                            packageName = unit.packageName,
+                        )
+                    }
+                    objectName to FlangObjectDefinition(objectName, unit.packageName, variables, eventProvider)
+                }
+            }
+            .toMap()
+    }
+
+    private fun FlangParser.AnnotationContext.eventProviderDefinition(): FlangEventProviderDefinition? {
+        val kind = when (Identifier().text) {
+            "PlayerEventProvider" -> FlangEventProviderKind.PLAYER
+            "EntityEventProvider" -> FlangEventProviderKind.ENTITY
+            "GameEventProvider" -> FlangEventProviderKind.GAME
+            else -> return null
+        }
+        val action = annotationArgs()
+            ?.expr()
+            ?.singleOrNull()
+            ?.text
+            ?.removeSurrounding("\"")
+            .orEmpty()
+        return FlangEventProviderDefinition(kind, action)
+    }
+
+    private fun inferObjectInitializerType(
+        text: String,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+    ): FlangType? {
+        val trimmed = text.trim()
+        if (trimmed.matches(Regex("\\d+"))) return FlangType.NUM
+        if (trimmed.startsWith("s\"")) return FlangType.TEXT
+        if (trimmed.startsWith("\"")) return FlangType.STRING
+        if (trimmed == "true" || trimmed == "false") return FlangType.BOOLEAN
+        if (trimmed in objects) return FlangType.OBJECT(trimmed)
+        Regex("""^List(?:<([^>]+)>)?\.of\(""").find(trimmed)?.let { match ->
+            return FlangType.LIST(match.groupValues[1].takeIf { it.isNotBlank() }?.let { FlangType.fromSourceName(it, structs, enums, objects) } ?: FlangType.ANY)
+        }
+        Regex("""^Dict(?:<([^>]+)>)?\.new\(""").find(trimmed)?.let { match ->
+            return FlangType.DICT(match.groupValues[1].takeIf { it.isNotBlank() }?.let { FlangType.fromSourceName(it, structs, enums, objects) } ?: FlangType.ANY)
+        }
+        structs.keys.firstOrNull { trimmed.startsWith("$it {") || trimmed.startsWith("$it{") }?.let { return FlangType.STRUCT(it) }
+        Regex("""^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$""").matchEntire(trimmed)?.let { match ->
+            modelEnumEntryType(match.groupValues[1], match.groupValues[2], enums)?.let { return it }
+        }
+        return null
+    }
+
+    private fun modelEnumEntryType(base: String, member: String, enums: Map<String, FlangEnumDefinition>): FlangType? =
+        if (enums[base]?.entriesByName?.containsKey(member) == true) FlangType.ENUM(base) else null
+
     private fun buildInterfaceTable(
         units: List<FlangSourceUnit>,
         structs: Map<String, FlangStructDefinition>,
@@ -501,10 +615,56 @@ object FlangFrontend {
             owner = owner,
             packageName = packageName,
             params = params,
-            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) },
+            returnType = function.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces, typeParams) ?: FlangType.STRUCT(it.text) },
             hasReceiver = owner != null && params.firstOrNull()?.name == "this",
             isInline = function.INLINE() != null,
             isPrivate = function.PRIVATE() != null,
+        )
+    }
+
+    private fun buildProcessSignatures(
+        units: List<FlangSourceUnit>,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+        interfaces: Set<String>,
+    ): List<FlangFunctionSignature> =
+        buildList {
+            units.filter { it.kind == FlangSourceKind.FL }.forEach { unit ->
+                unit.file.item().forEach { item ->
+                    item.processDecl()?.let { process ->
+                        add(processSignatureFor(process, unit.packageName, structs, enums, objects, interfaces))
+                    }
+                }
+            }
+        }
+
+    private fun processSignatureFor(
+        process: FlangParser.ProcessDeclContext,
+        packageName: String,
+        structs: Map<String, FlangStructDefinition>,
+        enums: Map<String, FlangEnumDefinition>,
+        objects: Set<String>,
+        interfaces: Set<String>,
+    ): FlangFunctionSignature {
+        val params = process.paramList()?.param().orEmpty().mapNotNull { param ->
+            val type = param.typeRef()?.let { FlangType.fromSourceName(it.text, structs, enums, objects, interfaces) }
+                ?: return@mapNotNull null
+            FlangFunctionParameter(
+                param.Identifier().text,
+                if (param.VAR() != null) FlangMutability.MUTABLE else FlangMutability.IMMUTABLE,
+                type,
+            )
+        }
+        return FlangFunctionSignature(
+            name = process.Identifier().text,
+            owner = null,
+            packageName = packageName,
+            params = params,
+            returnType = null,
+            hasReceiver = false,
+            isInline = false,
+            isPrivate = false,
         )
     }
 
@@ -516,9 +676,12 @@ object FlangFrontend {
     ): LinkedHashMap<String, FlangSymbol> {
         val symbols = linkedMapOf<String, FlangSymbol>()
         val item = file.item().firstOrNull { it.containsOffset(offset) } ?: return symbols
-        val function = item.functionDecl() ?: item.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) } ?: return symbols
+        val process = item.processDecl()
+        val function = item.functionDecl() ?: item.implDecl()?.functionDecl()?.firstOrNull { it.containsOffset(offset) }
+        if (function == null && process == null) return symbols
         val owner = item.implDecl()?.implementorName()
-        function.paramList()?.param().orEmpty().forEachIndexed { index, param ->
+        val params = function?.paramList()?.param().orEmpty() + process?.paramList()?.param().orEmpty()
+        params.forEachIndexed { index, param ->
             val type = if (owner != null && index == 0 && param.Identifier().text == "this" && param.typeRef() == null) {
                 FlangType.STRUCT(owner)
             } else {
@@ -530,7 +693,7 @@ object FlangFrontend {
                 type,
             )
         }
-        collectBlockSymbols(function.block(), offset, symbols, model, packageName)
+        collectBlockSymbols(function?.block() ?: process!!.block(), offset, symbols, model, packageName)
         return symbols
     }
 
@@ -623,8 +786,9 @@ object FlangFrontend {
         packageName: String,
     ): List<FlangCompletion> {
         val symbol = symbols[base]
-        if (symbol?.type is FlangType.INTERFACE) {
-            return model.interfaces[symbol.type.name]?.methods.orEmpty()
+        val receiverType = symbol?.type?.referentOrSelf()
+        if (receiverType is FlangType.INTERFACE) {
+            return model.interfaces[receiverType.name]?.methods.orEmpty()
                 .filter { it.hasReceiver && canAccess(it, packageName) }
                 .map {
                     FlangCompletion(
@@ -636,14 +800,14 @@ object FlangFrontend {
                     )
                 }
         }
-        if (symbol?.type != null && symbol.type !is FlangType.ENUM && symbol.type !is FlangType.INTERFACE) {
-            val structName = (symbol.type as? FlangType.STRUCT)?.name
+        if (receiverType != null && receiverType !is FlangType.ENUM && receiverType !is FlangType.INTERFACE) {
+            val structName = (receiverType as? FlangType.STRUCT)?.name
             val fields = structName?.let { name ->
                 model.structs[name]?.fields.orEmpty()
                     .filter { !it.isPrivate || model.structs[name]?.packageName == packageName }
                     .map { FlangCompletion(it.name, FlangCompletionKind.FIELD, typeText = it.type.sourceName) }
             }.orEmpty()
-            val receiverBase = symbol.type.sourceName.substringBefore("<")
+            val receiverBase = receiverType.sourceName.substringBefore("<")
             val methods = model.implFunctionsByOwnerAndName
                 .filterKeys { it.first.substringBefore("<") == receiverBase }
                 .values.flatten()
@@ -659,7 +823,7 @@ object FlangFrontend {
                 }
             return fields + methods
         }
-        if (symbol?.type is FlangType.ENUM) {
+        if (receiverType is FlangType.ENUM) {
             return listOf(
                 FlangCompletion("ordinal", FlangCompletionKind.ENUM_HELPER, "ordinal()", typeText = "Num"),
                 FlangCompletion("name", FlangCompletionKind.ENUM_HELPER, "name()", typeText = "String"),
@@ -711,7 +875,7 @@ object FlangFrontend {
             val overloads = if (base == null) {
                 model.functionsByName[name].orEmpty()
             } else {
-                val receiverType = symbols[base]?.type
+                val receiverType = symbols[base]?.type?.referentOrSelf()
                 val ownerName = receiverType?.sourceName
                 if (ownerName != null) {
                     (model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty())
@@ -747,14 +911,14 @@ object FlangFrontend {
             val member = match.groupValues[2]
             model.enums[base]?.entriesByName?.get(member)?.let { return FlangType.ENUM(base) }
             val symbol = symbols[base]
-            val structType = symbol?.type as? FlangType.STRUCT
+            val structType = symbol?.type?.referentOrSelf() as? FlangType.STRUCT
             if (structType != null) return model.structs[structType.name]?.fieldsByName?.get(member)?.type
         }
         sourceCall(text)?.let { (name, base) ->
             val overloads = if (base == null) {
                 model.functionsByName[name].orEmpty()
             } else {
-                val receiverType = symbols[base]?.type
+                val receiverType = symbols[base]?.type?.referentOrSelf()
                 val ownerName = receiverType?.sourceName
                 if (ownerName != null) {
                     model.implFunctionsByOwnerAndName[ownerName to name].orEmpty() + model.interfaceFunctionsByOwnerAndName[ownerName to name].orEmpty()
@@ -773,7 +937,7 @@ object FlangFrontend {
         model: FlangFrontendModel,
     ): Map<String, FlangSymbol> {
         val before = source.substring(0, offset)
-        val functionHeader = Regex("""fn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)""")
+        val functionHeader = Regex("""(?:fn|pc)\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)""")
             .findAll(before)
             .lastOrNull()
         val symbols = linkedMapOf<String, FlangSymbol>()
@@ -782,7 +946,7 @@ object FlangFrontend {
             ?.map(String::trim)
             ?.filter(String::isNotEmpty)
             ?.forEach { param ->
-                val match = Regex("""(var\s+)?([A-Za-z_][A-Za-z0-9_]*)(?::\s*([A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?))?""").matchEntire(param)
+                val match = Regex("""(var\s+)?([A-Za-z_][A-Za-z0-9_]*)(?::\s*(&?[A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?))?""").matchEntire(param)
                     ?: return@forEach
                 val typeName = match.groupValues.getOrNull(3).orEmpty()
                 val type = FlangType.fromSourceName(typeName, model.structs, model.enums, interfaces = model.interfaces.keys) ?: return@forEach
@@ -792,7 +956,7 @@ object FlangFrontend {
                     type,
                 )
             }
-        Regex("""\b(val|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?::\s*([A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?))?\s*=\s*([^;\n]*)""")
+        Regex("""\b(val|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?::\s*(&?[A-Za-z_][A-Za-z0-9_]*(?:<[^>]+>)?))?\s*=\s*([^;\n]*)""")
             .findAll(before)
             .forEach { match ->
                 val explicitType = match.groupValues[3].takeIf { it.isNotBlank() }
@@ -873,6 +1037,7 @@ private fun FlangParser.FileContext.findVarDeclAt(offset: Int): FlangParser.VarD
     }
     item().forEach { item ->
         item.functionDecl()?.block()?.let { visitBlock(it)?.let { found -> return found } }
+        item.processDecl()?.block()?.let { visitBlock(it)?.let { found -> return found } }
         item.implDecl()?.functionDecl().orEmpty().forEach { visitBlock(it.block())?.let { found -> return found } }
     }
     return null
@@ -880,6 +1045,9 @@ private fun FlangParser.FileContext.findVarDeclAt(offset: Int): FlangParser.VarD
 
 private fun canAccess(signature: FlangFunctionSignature, packageName: String): Boolean =
     !signature.isPrivate || signature.packageName == packageName
+
+private fun FlangType.referentOrSelf(): FlangType =
+    (this as? FlangType.REF)?.referentType ?: this
 
 private fun String.identifierPrefix(offset: Int): String {
     var index = offset - 1
@@ -901,8 +1069,8 @@ private fun String.memberBaseBefore(offset: Int): String? {
 }
 
 private fun isTypeLikeContext(source: String, offset: Int): Boolean {
-    val before = source.substring(0, offset)
-    return before.takeLast(40).matches(Regex(""".*(->|:|struct\s+|impl\s+|enum\s+)\s*[A-Za-z_0-9]*$"""))
+    val before = source.substring(0, offset).substringAfterLast('\n')
+    return before.matches(Regex(""".*(->|:|struct\s+|impl\s+|enum\s+)\s*&?[A-Za-z_0-9]*$"""))
 }
 
 private fun String.assignmentTargetBefore(offset: Int): String? {

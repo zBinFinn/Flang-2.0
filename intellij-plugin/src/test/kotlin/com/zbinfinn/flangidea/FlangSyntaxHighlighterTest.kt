@@ -17,11 +17,29 @@ class FlangSyntaxHighlighterTest {
             }
         }
 
-        assertTrue(FlangTokenTypes.ANNOTATION in tokenTypes)
-        assertTrue(FlangTokenTypes.KEYWORD in tokenTypes)
+        assertTrue(FlangTokenTypes.AT in tokenTypes)
+        assertTrue(FlangTokenTypes.FN in tokenTypes)
+        assertTrue(FlangTokenTypes.PC !in tokenTypes)
+        assertTrue(FlangTokenTypes.VAL in tokenTypes)
         assertTrue(FlangTokenTypes.STYLED_STRING in tokenTypes)
         assertTrue(FlangTokenTypes.LINE_COMMENT in tokenTypes)
         assertTrue(FlangTokenTypes.ENUM_SHORTHAND in tokenTypes)
+        assertTrue(TokenType.BAD_CHARACTER !in tokenTypes)
+    }
+
+    @Test
+    fun tokenizesProcessKeywords() {
+        val lexer = FlangLexerAdapter()
+        lexer.start("pc Worker() { start Worker(); }")
+        val tokenTypes = buildList {
+            while (lexer.tokenType != null) {
+                add(lexer.tokenType)
+                lexer.advance()
+            }
+        }
+
+        assertTrue(FlangTokenTypes.PC in tokenTypes)
+        assertTrue(FlangTokenTypes.START in tokenTypes)
         assertTrue(TokenType.BAD_CHARACTER !in tokenTypes)
     }
 

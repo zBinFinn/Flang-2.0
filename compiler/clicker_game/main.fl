@@ -2,7 +2,105 @@ package game;
 
 import std.prelude;
 
+object GameState {
+    var playerData: Dict<&PlayerData> = Dict.new();
+}
+
+impl GameState {
+    fn registerPlayer(player: Player) {
+        val data = malloc(PlayerData);
+        *data = PlayerData.load(player);
+        GameState.playerData.set(player.uuid, data);
+    }
+
+    fn unregisterPlayer(player: Player) {
+        val data = GameState.playerData.get(player.uuid);
+        free(data);
+        GameState.playerData.remove(player.uuid);
+    }
+
+    fn getData(player: Player) -> &PlayerData {
+        return GameState.playerData.get(player.uuid);
+    }
+}
+
+struct PlayerData {
+    clicks: Num
+}
+
+impl PlayerData {
+    fn load(player: Player) -> PlayerData {
+        // todo: load from saved variables
+        return PlayerData {
+            clicks: 5
+        }
+    }
+
+    fn save(this, player: Player) {
+        val uuid = player.uuid;
+        SavedVars.save(uuid.concat(" clicks"), this.clicks); // %uuid clicks = clicks;
+    }
+}
+
+pc test(money: Num) {
+    val x = money;
+}
+
+@Event
+fn startup(var event: PlotStartupEvent) {
+    start test(5);
+}
+
 @Event
 fn join(var event: PlayerJoinEvent) {
+    var player = event.getPlayer();
+    player.damage(5);
+    GameState.registerPlayer(player);
+    var item = Item.of("emerald");
+    item.setName(s"<green>Click Me");
+    player.setItemInSlot(item, 5);
+}
 
+@Event
+fn rightClick(var event: PlayerRightClickEvent) {
+    var player = event.getPlayer();
+    val data = GameState.getData(player);
+    data.clicks = data.clicks + 1;
+    player.sendActionBar(s"<green>Your Clicks: ".concat(data.clicks));
+}
+
+// Should be Stdlib
+
+object SavedVars;
+
+impl SavedVars {
+    fn save(key: String, value: Any) {
+
+    }
+
+    fn load(key: String) -> Any {
+        return "Hello";
+    }
+}
+
+inline fn Item.of(id: String) -> Item {
+    var item: Item;
+    emit `set_variable "SetItemType" args($item$, $id$)`;
+    return item;
+}
+
+inline fn Item.setName(var this, name: Text) {
+    emit `set_variable " SetItemName " args($this$, $name$)`;
+}
+
+fn String.concat(this, other: String) -> String {
+    var out: String;
+    emit `set_variable "String" args($out$, $this$, $other$)`;
+    return out;
+}
+
+fn Text.concat(this, other: Any) -> Text {
+    var out: Text;
+    emit `set_variable "StyledText" args($out$, $this$, $other$) tags(..)`;
+    return out;
 }

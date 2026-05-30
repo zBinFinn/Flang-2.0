@@ -601,7 +601,7 @@ class FlangCompilerTest {
 
             fn Main() {
               var value = 4;
-              val result = test(1, &value);
+              val result = test(1, var value);
             }
             """.trimIndent(),
         )
@@ -712,7 +712,7 @@ class FlangCompilerTest {
 
             fn Main() {
               var number = 4;
-              increment(&number);
+              increment(var number);
               var box = Box { value: 5 };
               box.add(3);
             }
@@ -1179,6 +1179,104 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersChainedCallsAndMemberAccessAsExpressionValues() {
+        val result = FlangCompiler.compile(
+            """
+            struct Box { value: Num }
+
+            fn makeBox() -> Box {
+              return Box { value: 7 };
+            }
+
+            impl Box {
+              fn copy(this) -> Box {
+                return this;
+              }
+
+              fn valueOf(this) -> Num {
+                return this.value;
+              }
+            }
+
+            fn Main() {
+              val direct = makeBox().value;
+              val viaCall = makeBox().copy().valueOf();
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.last().templateJson).jsonObject["blocks"]!!.jsonArray
+        val callIdentifiers = mainBlocks.mapNotNull { block ->
+            block.jsonObject.takeIf { it["block"]?.jsonPrimitive?.content == "call_func" }
+                ?.get("data")
+                ?.jsonPrimitive
+                ?.content
+        }
+        assertEquals(listOf("makeBox()", "makeBox()", "Box.copy(Box)", "Box.valueOf(Box)"), callIdentifiers)
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "direct"
+        })
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "viaCall"
+        })
+    }
+
+    @Test
+    fun lowersGenericReferenceCallResultsAsMemberExpressionReceivers() {
+        FlangCompiler.compileFile(writeTempSource(
+            """
+            package main;
+            import std.prelude;
+
+            object GameState {
+              var playerData: Dict<&PlayerData> = Dict.new();
+            }
+
+            impl GameState {
+              fn getData(player: Player) -> &PlayerData {
+                return GameState.playerData.get(player.uuid);
+              }
+            }
+
+            struct PlayerData {
+              clicks: Num
+            }
+
+            fn String.concat(this, other: String) -> String {
+              var out: String;
+              emit `set_variable "String" args(${ '$' }out${ '$' }, ${ '$' }this${ '$' }, ${ '$' }other${ '$' })`;
+              return out;
+            }
+
+            fn Text.concat(this, other: Any) -> Text {
+              var out: Text;
+              emit `set_variable "StyledText" args(${ '$' }out${ '$' }, ${ '$' }this${ '$' }, ${ '$' }other${ '$' }) tags(..)`;
+              return out;
+            }
+
+            @Event
+            fn rightClick(var event: PlayerRightClickEvent) {
+              var player = event.getPlayer();
+              val data = GameState.getData(player);
+              data.clicks = data.clicks + 1;
+              player.sendActionBar(s"<green>Your Clicks: ".concat(data.clicks));
+            }
+
+            fn Main() {
+              val player = Player.default();
+              val data = GameState.getData(player);
+              data.clicks = data.clicks + 1;
+              val clicks = GameState.getData(player).clicks;
+              val directData = GameState.playerData.get(player.uuid);
+              directData.clicks = directData.clicks + 1;
+            }
+            """.trimIndent(),
+        ))
+    }
+
+    @Test
     fun checksMutableImplReceiverCalls() {
         FlangCompiler.compile(
             """
@@ -1613,7 +1711,7 @@ class FlangCompilerTest {
     }
 
     @Test
-    fun rejectsMutableReferencesToMembers() {
+    fun rejectsMutableArgumentsToMembers() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -1624,13 +1722,13 @@ class FlangCompilerTest {
 
                 fn Main() {
                   var data = PlayerData { money: 5 };
-                  takesVar(&data.money);
+                  takesVar(var data.money);
                 }
                 """.trimIndent(),
             )
         }
 
-        assertTrue(error.message!!.contains("plain &identifier"))
+        assertTrue(error.message!!.contains("var identifier or var *ref"))
     }
 
     @Test
@@ -2199,6 +2297,208 @@ class FlangCompilerTest {
     }
 
     @Test
+    fun lowersGameEventFromProviderObjectAnnotation() {
+        val result = FlangCompiler.compile(
+            """
+            @GameEventProvider("PlotStartup")
+            object PlotStartupEvent;
+
+            @Event
+            fn Startup(event: PlotStartupEvent) {}
+            """.trimIndent(),
+        )
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("game_event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("PlotStartup", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun lowersObjectVariablesToGameVariables() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+
+            fn bump(var value: Num) {
+              value = value + 1;
+            }
+
+            fn Main() {
+              val local = GameState.count;
+              GameState.count = local + 2;
+              bump(var GameState.count);
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "Main()" }.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["slot"]!!.jsonPrimitive.content == "0" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.count" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "call_func" &&
+                block.jsonObject["data"]?.jsonPrimitive?.content == "bump(Num)" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.count" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+    }
+
+    @Test
+    fun lowersObjectVariableMemberCalls() {
+        val result = FlangCompiler.compile(
+            """
+            struct Box { value: Num }
+
+            object GameState {
+              var box: Box = Box { value: 1 };
+            }
+
+            impl Box {
+              fn inc(var this) {
+                this.value = this.value + 1;
+              }
+            }
+
+            fn Main() {
+              GameState.box.inc();
+            }
+            """.trimIndent(),
+        )
+
+        val mainBlocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "Main()" }.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertTrue(mainBlocks.any { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "call_func" &&
+                block.jsonObject["data"]?.jsonPrimitive?.content == "Box.inc(Box)" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "GameState.box" &&
+                        slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]!!.jsonPrimitive.content == "unsaved"
+                }
+        })
+    }
+
+    @Test
+    fun generatesObjectInitializerAndStartupEvent() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(result.templates.any { it.displayIdentifier == "${ '$' }initObjects()" })
+        val startup = result.templates.single { it.displayIdentifier == "${ '$' }objectStartup" }
+        val blocks = Json.parseToJsonElement(startup.templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("game_event", blocks[0].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("PlotStartup", blocks[0].jsonObject["action"]!!.jsonPrimitive.content)
+        assertEquals("call_func", blocks[1].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("${ '$' }initObjects()", blocks[1].jsonObject["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun insertsObjectInitializerIntoExistingStartupEvent() {
+        val result = FlangCompiler.compile(
+            """
+            object GameState {
+              var count: Num = 1;
+            }
+
+            @GameEventProvider("PlotStartup")
+            object PlotStartupEvent;
+
+            @Event
+            fn startup(event: PlotStartupEvent) {
+              emit `control "Wait" args(1)`;
+            }
+            """.trimIndent(),
+        )
+
+        val startupTemplates = result.templates.filter { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.first().jsonObject["block"]!!.jsonPrimitive.content == "game_event"
+        }
+        assertEquals(1, startupTemplates.size)
+        val blocks = Json.parseToJsonElement(startupTemplates.single().templateJson).jsonObject["blocks"]!!.jsonArray
+        assertEquals("call_func", blocks[1].jsonObject["block"]!!.jsonPrimitive.content)
+        assertEquals("${ '$' }initObjects()", blocks[1].jsonObject["data"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun rejectsInvalidObjectVariableBodies() {
+        val valError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  val count: Num = 1;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(valError.message!!.contains("mutable var declarations"))
+
+        val stmtError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  emit `control "Wait" args(1)`;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(stmtError.message!!.contains("only supports variable declarations"))
+
+        val duplicateError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                  var count: Num = 2;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(duplicateError.message!!.contains("Duplicate object variable"))
+    }
+
+    @Test
+    fun rejectsInvalidObjectVariableReferences() {
+        val unknownField = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                }
+                fn Main() {
+                  val local = GameState.missing;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(unknownField.message!!.contains("Object 'GameState' has no variable 'missing'"))
+
+        val typeMismatch = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                object GameState {
+                  var count: Num = 1;
+                }
+                fn Main() {
+                  GameState.count = "bad";
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(typeMismatch.message!!.contains("Cannot assign String"))
+    }
+
+    @Test
     fun rejectsEventWithoutProviderTypedFirstParameter() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
@@ -2297,14 +2597,14 @@ class FlangCompilerTest {
 
             fn Test() {
               var mutable = 1;
-              takesVar(&mutable);
+              takesVar(var mutable);
             }
             """.trimIndent(),
         )
     }
 
     @Test
-    fun rejectsMutableFunctionArgumentsWithoutAmpersand() {
+    fun rejectsMutableFunctionArgumentsWithoutVar() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -2319,11 +2619,11 @@ class FlangCompilerTest {
             )
         }
 
-        assertTrue(error.message!!.contains("must be passed as &"))
+        assertTrue(error.message!!.contains("No overload") || error.message!!.contains("must be passed as var identifier or var *ref"))
     }
 
     @Test
-    fun rejectsAmpersandOnValsForMutableFunctionArguments() {
+    fun rejectsValsForMutableFunctionArguments() {
         val error = assertFailsWith<FlangCompileException> {
             FlangCompiler.compile(
                 """
@@ -2332,13 +2632,118 @@ class FlangCompilerTest {
 
                 fn Test() {
                   val immutable = 1;
-                  takesVar(&immutable);
+                  takesVar(var immutable);
                 }
                 """.trimIndent(),
             )
         }
 
         assertTrue(error.message!!.contains("immutable val 'immutable'"))
+    }
+
+    @Test
+    fun lowersReferenceAllocationDereferenceAssignmentMutableArgsAndFree() {
+        val result = FlangCompiler.compile(
+            """
+            struct Point { x: Num }
+
+            fn takesPoint(var point: Point) {
+              point.x = 7;
+            }
+
+            fn Main() {
+              var point: &Point = malloc(Point, Point { x: 1 });
+              val first = point.x;
+              point.x = 3;
+              *point = Point { x: 2 };
+              takesPoint(var *point);
+              free(point);
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(result.templates.any { it.displayIdentifier == "${ '$' }malloc(var)" })
+        val mainBlocks = result.templates.first { it.displayIdentifier == "Main()" }.templateJson
+            .let { Json.parseToJsonElement(it).jsonObject["blocks"]!!.jsonArray.map { block -> block.jsonObject } }
+
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]?.jsonPrimitive?.content == "${ '$' }malloc(var)" })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["action"]?.jsonPrimitive?.content == "CreateList" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "Point"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["action"]?.jsonPrimitive?.content == "GetListValue" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.any { slot ->
+                    slot.jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content == "2"
+                }
+        })
+        assertTrue(mainBlocks.any { block ->
+            block["block"]?.jsonPrimitive?.content == "set_var" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.first().jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["scope"]?.jsonPrimitive?.content == "unsaved" &&
+                block["args"]!!.jsonObject["items"]!!.jsonArray.first().jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]?.jsonPrimitive?.content?.startsWith("%var(") == true
+        })
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]?.jsonPrimitive?.content == "takesPoint(Point)" })
+        assertTrue(mainBlocks.any { it["block"]?.jsonPrimitive?.content == "set_var" && it["action"]?.jsonPrimitive?.content == "PurgeVars" })
+    }
+
+    @Test
+    fun validatesReferenceTypeErrorsAndNewMutableArgSyntax() {
+        listOf(
+            """
+            fn Test() {
+              val bad = malloc(Missing);
+            }
+            """.trimIndent() to "unknown type 'Missing'",
+            """
+            struct Point { x: Num }
+            fn Test() {
+              var point: &Point = malloc(Point, "nope");
+            }
+            """.trimIndent() to "Cannot initialize &Point with String",
+            """
+            fn Test() {
+              val value = 1;
+              free(value);
+            }
+            """.trimIndent() to "expects &Type",
+            """
+            fn Test() {
+              val value = 1;
+              *value = 2;
+            }
+            """.trimIndent() to "Cannot dereference non-reference",
+            """
+            struct A { x: Num }
+            struct B { x: Num }
+            fn Test() {
+              var a: &A = malloc(A);
+              var b: &B = a;
+            }
+            """.trimIndent() to "Cannot assign &A",
+            """
+            struct Point { x: Num }
+            fn Test() {
+              var point: &Point = malloc(Point);
+              val missing = point.y;
+            }
+            """.trimIndent() to "has no field 'y'",
+            """
+            fn takesVar(var x: Num) {}
+            fn Test() {
+              var x = 1;
+              takesVar(&x);
+            }
+            """.trimIndent() to "Syntax error",
+        ).forEach { (source, expectedMessage) ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+            assertTrue(error.message!!.contains(expectedMessage), "Expected '$expectedMessage' in '${error.message}'")
+        }
     }
 
     @Test
@@ -2584,6 +2989,43 @@ class FlangCompilerTest {
         assertTrue(blocks.any {
             it.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
                 it.jsonObject["action"]?.jsonPrimitive?.content == "CreateList"
+        })
+    }
+
+    @Test
+    fun elidesInlineGenericDictReturnToFunctionOutput() {
+        val result = FlangCompiler.compileFile(
+            writeTempSource(
+                """
+                package main;
+                import std.prelude;
+
+                struct PlayerData {
+                  clicks: Num
+                }
+
+                object GameState {
+                  var playerData: Dict<&PlayerData> = Dict.new();
+                }
+
+                impl GameState {
+                  fn getData(player: Player) -> &PlayerData {
+                    return GameState.playerData.get(player.uuid);
+                  }
+                }
+                """.trimIndent(),
+            ),
+            CompileOptions(optimizations = setOf(Optimization.ELIDE_REDUNDANT_VAR_HANDOFF)),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templates.single { it.displayIdentifier == "main.GameState.getData(Player)" }.templateJson)
+            .jsonObject["blocks"]!!.jsonArray
+        val getDict = blocks.single { it.jsonObject["action"]?.jsonPrimitive?.content == "GetDictValue" }.jsonObject
+        assertSlotItem(getDict, 0, "var", "${ '$' }out")
+        assertTrue(blocks.none { block ->
+            block.jsonObject["block"]?.jsonPrimitive?.content == "set_var" &&
+                block.jsonObject["action"]?.jsonPrimitive?.content == "=" &&
+                block.jsonObject["args"]!!.jsonObject["items"]!!.jsonArray[0].jsonObject["item"]!!.jsonObject["data"]!!.jsonObject["name"]!!.jsonPrimitive.content == "${ '$' }out"
         })
     }
 
@@ -2899,6 +3341,141 @@ class FlangCompilerTest {
     fun parsesPanicOnBadAsCliFlag() {
         val cliOptions = parseCliArgs(arrayOf("--panic-on-bad-as", "source.fl"))
         assertTrue(cliOptions.compileOptions.panicOnBadAs)
+    }
+
+    @Test
+    fun lowersProcessDeclarationWithoutHint() {
+        val result = FlangCompiler.compile(
+            """
+            pc worker(value: Num, var output: String) {
+              output = "done";
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = Json.parseToJsonElement(result.templateJson).jsonObject["blocks"]!!.jsonArray
+        val process = blocks[0].jsonObject
+        assertBlock(process, "process")
+        assertEquals("worker(Num,String)", process["data"]!!.jsonPrimitive.content)
+        assertParameter(process, 0, "value", "num")
+        assertParameter(process, 1, "output", "var")
+        assertBlockTag(process, 26, "Is Hidden", "False")
+        val items = process["args"]!!.jsonObject["items"]!!.jsonArray
+        assertTrue(items.none { it.jsonObject["item"]!!.jsonObject["id"]!!.jsonPrimitive.content == "hint" })
+    }
+
+    @Test
+    fun lowersStartProcessWithFixedTags() {
+        val result = FlangCompiler.compile(
+            """
+            pc worker(value: Num) {
+            }
+
+            fn caller() {
+              start worker(5);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = result.templates.flatMap { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.map { it.jsonObject }
+        }
+        val start = blocks.first { it["block"]!!.jsonPrimitive.content == "start_process" }
+        assertEquals("worker(Num)", start["data"]!!.jsonPrimitive.content)
+        assertSlotItem(start, 0, "num", "5")
+        assertBlockTag(start, 26, "Target Mode", "With no targets")
+        assertBlockTag(start, 25, "Local Variables", "Copy")
+    }
+
+    @Test
+    fun keepsProcessAndFunctionNamespacesSeparate() {
+        val result = FlangCompiler.compile(
+            """
+            pc same(value: Num) {
+            }
+
+            fn same(value: String) {
+            }
+
+            fn caller() {
+              same("hi");
+              start same(1);
+            }
+            """.trimIndent(),
+        )
+
+        val blocks = result.templates.flatMap { template ->
+            Json.parseToJsonElement(template.templateJson).jsonObject["blocks"]!!.jsonArray.map { it.jsonObject }
+        }
+        assertTrue(blocks.any { it["block"]?.jsonPrimitive?.content == "call_func" && it["data"]!!.jsonPrimitive.content == "same(String)" })
+        assertTrue(blocks.any { it["block"]?.jsonPrimitive?.content == "start_process" && it["data"]!!.jsonPrimitive.content == "same(Num)" })
+    }
+
+    @Test
+    fun rejectsInvalidProcessStarts() {
+        listOf(
+            """
+            fn caller() {
+              start missing();
+            }
+            """.trimIndent() to "Unknown process",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              start worker("nope");
+            }
+            """.trimIndent() to "No overload of process",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              start worker();
+            }
+            """.trimIndent() to "no overload with 0 arguments",
+            """
+            pc worker(value: Num) {}
+            fn caller() {
+              var value = 1;
+              start worker(var value);
+            }
+            """.trimIndent() to "must not use var",
+            """
+            pc worker(var value: Num) {}
+            fn caller() {
+              val value = 1;
+              start worker(var value);
+            }
+            """.trimIndent() to "immutable val",
+        ).forEach { (source, expected) ->
+            val error = assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+            assertTrue(error.message!!.contains(expected), "Expected '${error.message}' to contain '$expected'.")
+        }
+    }
+
+    @Test
+    fun rejectsProcessReturnAndUnsupportedProcessForms() {
+        val returnError = assertFailsWith<FlangCompileException> {
+            FlangCompiler.compile(
+                """
+                pc worker() {
+                  return;
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(returnError.message!!.contains("cannot return"))
+
+        listOf(
+            "inline pc worker() {}",
+            "pc worker() -> Num {}",
+            "impl Thing { pc worker() {} }",
+            "fn caller() { val x = start worker(); }",
+        ).forEach { source ->
+            assertFailsWith<FlangCompileException> {
+                FlangCompiler.compile(source)
+            }
+        }
     }
 
     private fun assertVariable(slot: kotlinx.serialization.json.JsonObject, name: String, scope: String) {

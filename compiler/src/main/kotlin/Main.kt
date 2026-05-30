@@ -11,7 +11,7 @@ internal data class CliOptions(
 
 fun main(args: Array<String>) {
     val cliOptions = parseCliArgs(args)
-    print(FlangCompiler.compileFile(Path.of(cliOptions.sourcePath), cliOptions.compileOptions).templates.joinToString(System.lineSeparator()) { "/dfgive " + it.templateNbt })
+    print(FlangCompiler.compileFile(Path.of(cliOptions.sourcePath), cliOptions.compileOptions).templates.joinToString(System.lineSeparator()) { it.code })
 }
 
 internal fun parseCliArgs(args: Array<String>): CliOptions {
