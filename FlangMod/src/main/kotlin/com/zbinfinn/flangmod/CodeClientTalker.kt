@@ -18,17 +18,23 @@ class CodeClientTalker : WebSocket.Listener {
             .buildAsync(URI.create("ws://localhost:31375"), this)
             .join()
 
-        send("scopes clear_plot write_code read_plot movement")?.join()
+        send("scopes clear_plot write_code read_plot movement").join()
 
         val auth = wait()
         println("Auth Response: $auth")
 
-        send("clear")?.join()
-        send("place")?.join()
-        for (str in clipboard.split("\n")) {
-            send("place ${str.trim()}")?.join()
+        send("clear").thenCompose {
+            send("place")
+        }.thenCompose {
+            CompletableFuture.allOf(
+                *clipboard.split("\n")
+                    .filter { it.trim().isNotEmpty() }
+                    .map { send("place ${it.trim()}") }
+                    .toTypedArray()
+            )
+        }.thenCompose {
+            send("place go")
         }
-        send("place go")?.join()
 
         val done = wait()
         println("Place Response: $done")
@@ -37,9 +43,9 @@ class CodeClientTalker : WebSocket.Listener {
     fun wait(): String = waitingFuture.join()
 
 
-    private fun send(msg: String): CompletableFuture<WebSocket?>? {
+    private fun send(msg: String): CompletableFuture<WebSocket?> {
         println("OUT: $msg")
-        return ws?.sendText(msg, true)
+        return ws?.sendText(msg, true) ?: CompletableFuture.failedFuture(IllegalStateException("WebSocket is null"))
     }
 
     override fun onOpen(webSocket: WebSocket?) {
